@@ -1,0 +1,4 @@
+Finished product v035:
+- Overview_v6.pdf
+- Grok_Interaction_11.md
+- New copy in folder catan_game_v037
