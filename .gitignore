@@ -1,0 +1,35 @@
+# Data and Cache
+.mypy_cache/
+.pytest_cache/
+
+# Saved games
+Saved_Game_*
+Playboard_30*
+Playboard_31*
+
+# Test files
+tests/
+
+# Temporary files
+tmp/
+_tmp_*
+_tmp_*.py
+
+# Documents
+docs/tests/
+docs/grok/
+docs/info/
+docs/screenshots/
+
+# Grok (both spellings)
+Grok_Interaction_*
+Gork_Interaction_*
+
+# Logfiles
+Phase0_*
+Catan01Aug*
+Catan16Mar*
+
+# Python
+__pycache__/
+_ref_Catan_Gen2_v045/
