@@ -343,7 +343,23 @@ class ExecutionPhaseManager:
         return decision.as_dict()
 
     def print_current_choices(self) -> None:
-        """Print compact Slice A/B diagnostics for terminal/debug runs."""
+        """Print compact Slice A/B diagnostics for terminal/debug runs.
+
+        Under ``NO_GUI_AT_ALL_TF`` this is routed to ``core.console`` dig-in
+        (DEBUG header, TRACE body) so default headless INFO stays quiet.
+        """
+
+        try:
+            from core.console import digin, DEBUG, TRACE
+        except Exception:
+            digin = None  # type: ignore
+            DEBUG = TRACE = None  # type: ignore
+
+        def _out(msg: str, *, level: int = 10) -> None:
+            if digin is not None:
+                digin(msg, level=level)
+            else:
+                print(msg)
 
         scan = self.last_scan
         player_id = getattr(scan, "player_id", None)
@@ -358,30 +374,40 @@ class ExecutionPhaseManager:
         )
         if forced:
             header += f" forced={forced}"
-        print(header)
+        _out(header, level=DEBUG if DEBUG is not None else 10)
 
-        print("  Slice A viable buy/build:")
+        body = DEBUG if DEBUG is not None else 10
+        # Multi-line detail: TRACE under headless; digin still prints when GUI mode.
+        detail = TRACE if TRACE is not None else body
+        _out("  Slice A viable buy/build:", level=detail)
         for choice in self.current_choices:
-            print(
+            _out(
                 "   - "
                 f"{choice.action}: {choice.viable} "
-                f"candidates={choice.candidate_count}"
+                f"candidates={choice.candidate_count}",
+                level=detail,
             )
             if not choice.viable and choice.blockers:
-                print(f"     blocker: {choice.blockers[0]}")
+                _out(f"     blocker: {choice.blockers[0]}", level=detail)
 
         if self.current_strategic_needs:
-            print("  Slice B strategic needs:")
+            _out("  Slice B strategic needs:", level=detail)
             for need in self.current_strategic_needs:
                 suffix = ""
                 if need.get("remaining_key"):
                     suffix = f" ({need.get('remaining_key')}={need.get('remaining_value')})"
-                print(f"   - {need.get('action')}{suffix}")
+                _out(f"   - {need.get('action')}{suffix}", level=detail)
         else:
-            print("  Slice B strategic needs: none found on player.strategic_direction")
+            _out(
+                "  Slice B strategic needs: none found on player.strategic_direction",
+                level=detail,
+            )
 
         actionable = [choice.action for choice in self.current_actionable_choices]
-        print(f"  Slice B actionable: {actionable if actionable else 'none'}")
+        _out(
+            f"  Slice B actionable: {actionable if actionable else 'none'}",
+            level=detail,
+        )
 
     # ──────────────────────────────────────────────────────────────────────
     # Internals

@@ -1,0 +1,296 @@
+PS C:\Users\avtnl\Documents\Projecten\Python\Catan_Gen3\catan_game_v037> py -3.13 scripts/analyze_la_lr_players_view.py --batch-dir "batch_runs/product_apr08_l5_n100"
+L4 players_view  freeze=L4_PLAYERS_VIEW_SPEC_v0  samples=8580  annotated=8580
+probe=C:\Users\avtnl\Documents\Projecten\Python\Catan_Gen3\catan_game_v037\batch_runs\product_apr08_l5_n100\la_lr_probe.jsonl  exists=True
+  LA: hist={'none': 7152, 'L': 805, 'M': 246, 'H': 377}  chase_vs_needs P=0.8587 R=0.3143 F1=0.4602  tp/fp/tn/fn=535/88/6790/1167
+  LR: hist={'none': 4667, 'L': 1838, 'M': 431, 'H': 1644}  chase_vs_needs P=0.7523 R=0.4566 F1=0.5683  tp/fp/tn/fn=1561/514/4647/1858
+D typology  freeze=L5_D_TYPOLOGY_v0  n=8580
+  hist: {'la_only': 472, 'lr_only': 2189, 'both': 1230, 'neither': 4689}
+  type          n   t_fire   p_give chase_la chase_lr
+  la_only     472     None     None   0.3453   0.0593
+  lr_only    2189     None     None   0.0078   0.5464
+  both       1230     None     None   0.3024   0.2967
+  neither    4689     None     None   0.0151   0.1036
+wrote=batch_runs\product_apr08_l5_n100\players_view_report.json
+
+This is L4 players_view (public ambition), not L5 public give-up and not god-view θ fit.
+Key Question: From public board features only, how often does the seat look like it is chasing LA/LR (ambition M/H), and how well does that match god-view needs_*?
+
+Line 1 — Command | py -3.13 scripts/analyze_la_lr_players_view.py --batch-dir "batch_runs/product_apr08_l5_n100"
+
+Piece				Meaning
+Script				L4 offline analyzer
+Batch				Product Apr 08 n=100
+(no --special)			Default: both LA and LR blocks
+Offline only: rebuilds public features + ambition labels from probe samples.
+
+Line 2 — Run header | L4 players_view  freeze=L4_PLAYERS_VIEW_SPEC_v0  samples=8580  annotated=8580
+Field								Meaning
+L4 players_view						Public ambition dig (L4), not give-up fire
+freeze=L4_PLAYERS_VIEW_SPEC_v0	Locked L4 rules/constants
+samples=8580						Probe rows loaded (same batch as L5/godview)
+annotated=8580						All rows got ambition + chase labels
+
+Line 3 — Probe path | probe=…\product_apr08_l5_n100\la_lr_probe.jsonl  exists=True
+Field				Meaning
+probe=…			Input JSONL path
+exists=True			File found
+
+Line 4 — LA ambition + chase vs needs 
+Label		n		Meaning
+None		7152	No visible LA chase (most product samples)
+L			  805	Low ambition (some army / threats / growth, weak)
+M			  246	Medium (competitive army + gap band)
+H			  377	High (holds LA or claim-bar army + small
+Check: 7152+805+246+377 = 8580.
+Public chase LA = ambition ∈ {M, H} only (L is not chase). So chase count = 246+377 = 623 (= tp+fp = 535+88).
+
+chase_vs_needs agreement (binary)
+Side			Positive means
+Prediction	public_chase_la (M or H)
+Teacher		god needs_LA (sticky way needs Largest Army)
+
+┌──────┬───────┬──────────────────────────────────────────────┐
+│ Cell │ Count │ Meaning                                      │
+├──────┼───────┼──────────────────────────────────────────────┤
+│ tp   │   535 │ Public chase and needs LA — true chase       │
+├──────┼───────┼──────────────────────────────────────────────┤
+│ fp   │    88 │ Public chase but does not need LA — false “  │
+│      │       │ looks like chasing”                          │
+├──────┼───────┼──────────────────────────────────────────────┤
+│ tn   │  6790 │ No chase, no needs — correct quiet           │
+├──────┼───────┼──────────────────────────────────────────────┤
+│ fn   │  1167 │ Needs LA but public only none/L — missed     │
+│      │       │ needs as chase                               │
+└──────┴───────┴──────────────────────────────────────────────┘
+
+┌────────┬────────┬───────────────────────────────────────────┐
+│ Metric │  Value │ Formula / meaning                         │
+├────────┼────────┼───────────────────────────────────────────┤
+│ P      │ 0.8587 │ 535/(535+88) — when public says chase,    │
+│        │        │ ~86% really need LA                       │
+├────────┼────────┼───────────────────────────────────────────┤
+│ R      │ 0.3143 │ 535/(535+1167) — only ~31% of needs-LA    │
+│        │        │ samples look like M/H chase               │
+├────────┼────────┼───────────────────────────────────────────┤
+│ F1     │ 0.4602 │ Balance of P and R                        │
+└────────┴────────┴───────────────────────────────────────────┘
+
+Story (LA): Public chase is precise but incomplete. Many needs-LA seats still look “none/L” (army not yet competitive). Good positive signal; not a full needs detector. Matches L4 dig pattern (high P, mid/low R).
+
+───
+
+Line 5 — LR ambition + chase vs needs
+
+LR: hist={'none': 4667, 'L': 1838, 'M': 431, 'H': 1644}
+    chase_vs_needs P=0.7523 R=0.4566 F1=0.5683
+    tp/fp/tn/fn=1561/514/4647/1858
+
+Ambition histogram (public LR)
+
+┌───────┬──────┬──────────────────────────────────────────┐
+│ Label │    n │ Meaning (simplified)                     │
+├───────┼──────┼──────────────────────────────────────────┤
+│ none  │ 4667 │ No / weak public LR path story           │
+├───────┼──────┼──────────────────────────────────────────┤
+│ L     │ 1838 │ Low path ambition                        │
+├───────┼──────┼──────────────────────────────────────────┤
+│ M     │  431 │ Medium path + gap band                   │
+├───────┼──────┼──────────────────────────────────────────┤
+│ H     │ 1644 │ High (holds LR or long path + small gap) │
+└───────┴──────┴──────────────────────────────────────────┘
+
+Check: 4667+1838+431+1644 = 8580.
+LR shows much more L/M/H than LA (roads more often “look like a race” on product).
+
+Public chase LR = M∪H = 431+1644 = 2075 (= 1561+514).
+
+Confusion vs needs_LR
+
+┌──────┬───────┬───────────────────────────┐
+│ Cell │ Count │ Meaning                   │
+├──────┼───────┼───────────────────────────┤
+│ tp   │  1561 │ Chase + needs LR          │
+├──────┼───────┼───────────────────────────┤
+│ fp   │   514 │ Chase without needs LR    │
+├──────┼───────┼───────────────────────────┤
+│ tn   │  4647 │ Quiet + no needs          │
+├──────┼───────┼───────────────────────────┤
+│ fn   │  1858 │ Needs LR but no M/H chase │
+└──────┴───────┴───────────────────────────┘
+
+┌────────┬────────┬───────────────────────────────────────────┐
+│ Metric │  Value │ Meaning                                   │
+├────────┼────────┼───────────────────────────────────────────┤
+│ P      │ 0.7523 │ ~75% of LR chases truly need LR (solid,   │
+│        │        │ lower than LA’s 86%)                      │
+├────────┼────────┼───────────────────────────────────────────┤
+│ R      │ 0.4566 │ ~46% of needs-LR samples are labeled      │
+│        │        │ chase (better recall than LA)             │
+├────────┼────────┼───────────────────────────────────────────┤
+│ F1     │ 0.5683 │ Stronger overall chase↔needs link than LA │
+│        │        │ on product                                │
+└────────┴────────┴───────────────────────────────────────────┘
+
+Story (LR): More public “road ambition” activity; chase still reasonably precise, better recall than LA, more fp (514) than LA (people look like LR racers without sticky needing LR).
+
+───
+
+Line 6 — D typology header
+
+D typology  freeze=L5_D_TYPOLOGY_v0  n=8580
+
+Same needs-based path typology block as in the L5 report (sample-time: la_only / lr_only / both / neither).
+Attached here as a context cut on the same 8580 samples.
+
+───
+
+Line 7 — Typology counts
+
+hist: {'la_only': 472, 'lr_only': 2189, 'both': 1230, 'neither': 4689}
+
+┌─────────┬──────┬───────────────┐
+│ Type    │    n │ Meaning       │
+├─────────┼──────┼───────────────┤
+│ la_only │  472 │ needs_LA only │
+├─────────┼──────┼───────────────┤
+│ lr_only │ 2189 │ needs_LR only │
+├─────────┼──────┼───────────────┤
+│ both    │ 1230 │ needs both    │
+├─────────┼──────┼───────────────┤
+│ neither │ 4689 │ needs neither │
+└─────────┴──────┴───────────────┘
+
+Same histogram as in LALRreport_13Aug_1500.txt (same batch).
+
+───
+
+Line 8 — Typology table headers
+
+type          n   t_fire   p_give chase_la chase_lr
+
+┌──────────────────┬──────────────────────────────────────────┐
+│ Column           │ Meaning                                  │
+├──────────────────┼──────────────────────────────────────────┤
+│ type             │ Typology bucket                          │
+├──────────────────┼──────────────────────────────────────────┤
+│ n                │ Samples in bucket                        │
+├──────────────────┼──────────────────────────────────────────┤
+│ t_fire           │ Teacher give-up fire rate (god) — when   │
+│                  │ available                                │
+├──────────────────┼──────────────────────────────────────────┤
+│ p_give           │ Public give-up fire rate — when          │
+│                  │ available                                │
+├──────────────────┼──────────────────────────────────────────┤
+│ chase_la / chase │ Fraction with public chase M/H           │
+│ _lr              │                                          │
+└──────────────────┴──────────────────────────────────────────┘
+
+───
+
+Lines 9–12 — Per-typology rates
+
+  la_only     472     None     None   0.3453   0.0593
+  lr_only    2189     None     None   0.0078   0.5464
+  both       1230     None     None   0.3024   0.2967
+  neither    4689     None     None   0.0151   0.1036
+
+Why t_fire and p_give are None
+
+This run is L4 only. Samples are annotated with ambition/chase, not with L5 teacher fire / public give-up flags.
+Typology helper therefore cannot compute fire rates → None.
+(In the L5 public_giveup console, those columns were filled with real rates.)
+
+What the chase columns mean (same numbers as L5 typology chase side)
+
+┌─────────┬────────┬────────┬─────────────────────────────────┐
+│ type    │  chase │  chase │ Reading                         │
+│         │    _la │    _lr │                                 │
+├─────────┼────────┼────────┼─────────────────────────────────┤
+│ la_only │ 0.3453 │ 0.0593 │ ~35% of pure-LA-need samples    │
+│         │        │        │ look like chasing LA (M/H);     │
+│         │        │        │ almost no LR chase              │
+├─────────┼────────┼────────┼─────────────────────────────────┤
+│ lr_only │ 0.0078 │ 0.5464 │ ~55% of pure-LR-need samples    │
+│         │        │        │ look like chasing LR; almost no │
+│         │        │        │ LA chase                        │
+├─────────┼────────┼────────┼─────────────────────────────────┤
+│ both    │ 0.3024 │ 0.2967 │ Dual-need: ~30% chase each      │
+│         │        │        │ special publicly                │
+├─────────┼────────┼────────┼─────────────────────────────────┤
+│ neither │ 0.0151 │ 0.1036 │ No needs: rare LA chase; ~10%   │
+│         │        │        │ still look like LR chase (      │
+│         │        │        │ public path features without    │
+│         │        │        │ sticky need)                    │
+└─────────┴────────┴────────┴─────────────────────────────────┘
+
+Story: Chase labels align with needs typology (high chase_la on la_only, high chase_lr on lr_only). Residual LR chase on neither is a known public false-positive flavor.
+
+───
+
+Line 13 — Output file
+
+wrote=batch_runs\product_apr08_l5_n100\players_view_report.json
+
+Full L4 report JSON (hists, confusion, constants, typology). Console is the digest.
+
+───
+
+Metrics cheat-sheet (lines 4–5)
+
+┌──────────────┬──────────────────────────────────────────────┐
+│ Term         │ Definition                                   │
+├──────────────┼──────────────────────────────────────────────┤
+│ Ambition     │ none / L / M / H from public army/path/gap/  │
+│              │ holds rules                                  │
+├──────────────┼──────────────────────────────────────────────┤
+│ Public chase │ Ambition is M or H (not L)                   │
+├──────────────┼──────────────────────────────────────────────┤
+│ Teacher for  │ God needs_* (not fire@θ)                     │
+│ L4           │                                              │
+├──────────────┼──────────────────────────────────────────────┤
+│ P            │ P(needs | chase) — “chase ⇒ need?”           │
+├──────────────┼──────────────────────────────────────────────┤
+│ R            │ P(chase | needs) — “need ⇒ chase?”           │
+└──────────────┴──────────────────────────────────────────────┘
+
+L4 gate intent was: is public ambition useful for later proxies?
+Yes as a conservative chase signal (high P), not as a complete needs detector (mid R).
+
+───
+
+How r2 fits next to the other reports
+
+┌─────────────┬──────────────────┬────────────────────────────┐
+│ Report      │ Script           │ Question                   │
+├─────────────┼──────────────────┼────────────────────────────┤
+│ r2 (this)   │ players_view     │ Public chase vs needs      │
+├─────────────┼──────────────────┼────────────────────────────┤
+│ r1 L5       │ public_giveup    │ Public give-up vs teacher  │
+│ public      │                  │ fire@θ                     │
+├─────────────┼──────────────────┼────────────────────────────┤
+│ r3 godview  │ godview --       │ Episode labels + fit θ_LA  │
+│ LA          │ special la       │                            │
+└─────────────┴──────────────────┴────────────────────────────┘
+
+Same batch (product_apr08_l5_n100, 8580 samples); three different questions.
+
+───
+
+One-screen takeaway
+
+┌──────────┬──────────────────────────────────────────────────┐
+│ Topic    │ Takeaway                                         │
+├──────────┼──────────────────────────────────────────────────┤
+│ LA chase │ High precision (~0.86), low recall (~0.31) vs    │
+│          │ needs                                            │
+├──────────┼──────────────────────────────────────────────────┤
+│ LR chase │ Precision ~0.75, recall ~0.46; more activity     │
+│          │ than LA                                          │
+├──────────┼──────────────────────────────────────────────────┤
+│ Ambition │ Most samples none; LR has more L/H than LA       │
+├──────────┼──────────────────────────────────────────────────┤
+│ Typology │ Chase concentrates on the special you need; t_   │
+│          │ fire/p_give blank in pure L4 run                 │
+├──────────┼──────────────────────────────────────────────────┤
+│ Role     │ Dig instrumentation for L4/L5 — not live SE fire │
+└──────────┴──────────────────────────────────────────────────┘

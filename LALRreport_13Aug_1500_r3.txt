@@ -1,0 +1,106 @@
+PS C:\Users\avtnl\Documents\Projecten\Python\Catan_Gen3\catan_game_v037> py -3.13 scripts/analyze_la_lr_godview.py --batch-dir batch_runs/product_apr08_l5_n100 --special la
+=== Phase L WP-L2a: LA god-view labels + θ_LA ===
+batch=batch_runs\product_apr08_l5_n100  probe_exists=True
+rows=8580  episodes=400  labels={'should_hold': 66, 'unlabeled': 290, 'should_give_up': 44}
+label_params={'min_needs': 2, 'gap_floor': 2, 'sustain_k': 2, 'hold_max_gap': 1}
+score_distributions={'should_hold': {'n': 66, 'mean': 0.2867, 'min': 0.0, 'max': 0.6737, 'p50': 0.27}, 'unlabeled': {'n': 120, 'mean': 0.4132, 'min': 0.09, 'max': 1.0, 'p50': 0.3712}, 'should_give_up': {'n': 44, 'mean': 0.8106, 'min': 0.5725, 'max': 1.0, 'p50': 0.8987}}
+separation (give_up mean − hold mean)=0.5239
+θ_LA (primary, max_score)=0.4  metrics={'theta': 0.4, 'tp': 44, 'fp': 2, 'tn': 64, 'fn': 0, 'precision': 0.9565, 'recall': 1.0, 'f1': 0.9778, 'accuracy': 0.9818, 'n_labeled': 110}
+baseline S5.5 kill_recommended={'name': 's55_kill_recommended_any', 'tp': 30, 'fp': 0, 'tn': 66, 'fn': 14, 'precision': 1.0, 'recall': 0.6818, 'n_labeled': 110}
+product LA_GAP_KILL const=3
+note: L2a: global θ on hopeless_score; stage early/mid/end deferred (Q2).
+================================================
+wrote: C:\Users\avtnl\Documents\Projecten\Python\Catan_Gen3\catan_game_v037\batch_runs\product_apr08_l5_n100\la_lr_godview_la_report.json
+
+Unit of analysis: mostly episodes (one seat’s LA race within one game), not single CS samples.
+Goal: build offline oracle labels (should_give_up / should_hold) and fit a global θ on hopeless_score_la for this batch.
+Domain note: product map = Domain B. The locked live freeze is θ_LA = 0.6 (safe) on Domain A lab. Numbers here are a product holdout dig, not a re-freeze of lab θ.
+───
+Line 2 — Banner | === Phase L WP-L2a: LA god-view labels + θ_LA ===
+Piece					Meaning
+WP-L2a					Work package: LA god-view labels + global θ fit 
+god_view				Uses full probe race features / scores (not public-only L4/L5)
+ θ_LA					Threshold on hopeless_score_la for “predict give up"
+
+Line 3 — Batch identity | batch=batch_runs\product_apr08_l5_n100  probe_exists=True
+Field					Meaning
+batch=					Input folder
+probe_exists=True		la_lr_probe.jsonl found
+
+Line 4 — Scale and label histogram | rows=8580  episodes=400  labels={'should_hold': 66, 'unlabeled': 290, 'should_give_up': 44}
+Field			Value	Meaning
+rows			8580	Probe samples (same batch as L5 report)
+episodes		  400	100 games × 4 seats — one LA episode stream per seat per game
+should_hold		    66	Oracle: seat ever held LA in the episode → “should not have given up” success path)			|  Ever held LA in episode
+should_give_up	    44	Oracle: never held LA, race looked dead enough (gap sustained / weak) → “should give up"	|  Never held + last K needs samples all have + Never held, not close, max gap high enough
+unlabeled		  290	Too little needs data, ambiguous mid-race, etc. → excluded from θ metrics					|  Fewer than min_needs needs-LA samples +  Never held but still close (last gap ≤ hold_max_gap) + Other
+66 + 290 + 44 = 400.
+Only 110 labeled episodes (66+44) train/score the θ metrics below.
+
+Line 5 — Label hyperparameters | label_params={'min_needs': 2, 'gap_floor': 2, 'sustain_k': 2, 'hold_max_gap': 1}
+Param			Value	Meaning
+min_needs		2		Need ≥2 needs-LA samples to label an episode
+gap_floor		2		“Bad race” if army gap ≥ 2
+sustain_k		2		Last 2 needs samples must all be bad for sustained give-up
+hold_max_gap	1		If never held but still within gap ≤1, don’t force give-up (ambiguous → unlabeled)
+Same freeze family as Domain A L2a labels (product is just a different board).
+
+Line 6 — Score distributions by label
+  'should_hold':		n:  66	mean:0.2867	min:0.0		max:0.6737	p50:0.27								| Low hopelessness (mean ~0.29, p50 0.27) - races that eventually got LA
+  'unlabeled': 		n:120	mean:0.4132	min:0.09	max:1.0		p50:0.3712								| High hopelessness (mean ~0.81, p50 ~0.90) - dead races that never held
+  'should_give_up':	n:44	mean:0.8106	min:0.5725	max:1.0		p50:0.8987								| Middle band (mean ~0.41) — gray zone (note: dist table may only use episodes with a score; n=120 vs 290 unlabeled is “scored unlabeled
+																											   subset” style reporting)
+Score = episode max_score of hopeless_score_la over needs samples (higher = more hopeless).
+Story: Oracle classes separate well in score space on product: holds low, give-ups high.
+
+Line 7 — Separation | separation (give_up mean − hold mean)=0.5239
+Param					Meaning
+Separation				mean(max_score | should_give_up) − mean(max_score | should_hold)
+0.5239					 ~0.52 points apart on [0,1] scale
+Higher separation ⇒ easier to pick a θ that splits the two labeled classes.
+~0.52 is strong (lab Domain A was similar order ~0.51).
+
+Line 8 — Fitted primary θ + confusion metrics | θ_LA (primary, max_score)=0.4
+Metrics
+theta: 0.4 | tp: 44 | fp: 2 | tn: 64 | fn: 0		| tp: Predicted give-up, oracle should_give_up - all give-up episodes caught | fp: Predicted give-up, but oracle should_hold - false abandon (2 seats that did get LA had max_score ≥ 0.4) | tn:  Predicted hold, oracle 											   should_hold | fn: No missed give-ups
+precision: 0.9565 | recall: 1.0 | f1: 0.9778	| precision: 44/(44+2) - when score says give up, usually right | recall: 44/(44+0) — never misses a labeled dead race | f1: Blend of P and R
+accuracy: 0.9818 | n_labeled: 110			| accuracy: (tp+tn)/110 | n_labeled: 66+44 only
+What “primary θ” means here: Grid-search on labeled episodes only + Predict give up if max_score ≥ θ + Primary choice = best by F1 (then recall), using score key max_score + On this product batch, that fitted θ is 0.4 (aggressive profile territory).
+This is not automatically the live SE θ. Live product/lab default remains freeze safe 0.6 unless you deliberately retune Domain B | Confusion at θ = 0.4 (episode-level)
+Story: On product labeled episodes, a low θ (0.4) fits episode max-score classification almost perfectly. That is not the same as sample-time L6 FGU at 0.6; safe 0.6 is more conservative live (fewer early fires).
+
+Line 9 — Baseline: S5.5 kill_recommended | baseline S5.5 kill_recommended=
+name: s55_kill_recommended_any,
+tp: 30 | fp: 0 | tn: 66 | fn: 14,					| tp: Kill| fp: flag saw 30 of 44 true dead races | fp"Never flagged a should_hold as kill - perfect precision | tn: All holders not flagged | fn: Missed 14 dead races
+precision: 1.0 | recall: 0.6818 | n_labeled: 110	| precision: When S5.5 says kill, always a true give-up case | recall: Only ~68% of dead races get the flag
+Compare the existing SE “kill recommended” flag (any time in episode) vs the same oracle labels — no θ score.
+Story: S5.5 kill is safer but less complete than score@0.4. Hopeless-score θ catches more dead races than kill_recommended alone.
+
+Line 10 — Product constant reference | product LA_GAP_KILL const=3
+Field					Meaning
+LA_GAP_KILL				Related product/constants gap threshold used in SE / dig context (e.g. hard gap kill style)
+const=3					Value read for this run (informational baseline, not the fitted θ) 
+Useful to compare: oracle uses gap_floor=2; product kill const may be stricter (3).
+
+Line 11 — Method note | note: L2a: global θ on hopeless_score; stage early/mid/end deferred (Q2).
+Piece					Meaning
+global θ					One threshold for whole game, not early/mid/late stages
+stage … deferred			Stage-specific θ (FT4 Q2) not used here
+
+How this differs from LALRreport_13Aug_1500.txt (public L5)
+Param		r3 (this file)						r1
+Script		analyze_la_lr_godview			analyze_la_lr_public_giveup
+Question	Fit god θ / labels for LA			Public proxy vs teacher fire@frozen θ
+Unit			Episodes (400)					Samples needs-conditioned
+LA result		Fitted θ≈0.4, strong separation		Teacher θ fixed 0.6, public gate=pass
+LR			Not in this run					gate=fail
+So r3 is “how well does hopeless_score separate LA dead races on product?”, not “is public LA give-up OK?” (that was already Pass at θ=0.6).
+
+One-screen takeaway
+Point				Takeaway
+Data				8580 samples → 400 seat-episodes; 110 labeled (66 hold / 44 give-up)
+Separation			Strong (~0.52) between hold and give-up scores
+Fitted θ on product	0.4 (high F1, recall 1.0, 2 false give-ups)
+S5.5 kill				Perfect precision, lower recall (~0.68)
+Live policy			Still safe θ=0.6 from Domain A freeze unless you open Domain B θ science
+File					la_lr_godview_la_report.json

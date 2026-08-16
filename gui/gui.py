@@ -23,6 +23,7 @@ from gui.gui_constants import (
     RESOURCE_PRODUCTION_HIGHLIGHT_DELAY_MS,
     ROBBER_TILE_HIGHLIGHT_RADIUS, VICTIM_STEAL_HIGHLIGHT_RADIUS,
     ROBBER_AVAILABLE_TILE_HIGHLIGHT_RADIUS, ROBBER_AVAILABLE_STEAL_TARGET_RADIUS,
+    DCARD_HEADER_PLAY_PULSE_RADIUS, DCARD_HEADER_ICON_CENTER_Y,
 )
 from gui.gui_guidance import HumanGuidance
 from core.board import Board
@@ -67,6 +68,8 @@ class GUI:
         self.animate_queue_elements: List[Tuple[Tuple[int,int], Tuple[int,int,int], int, str]] = []
         self.animations_enabled: bool = True
         self.last_dice_roll: Optional[Tuple[int, int]] = None
+        # D1: shared DCard header play pulse (full seat-turn; independent of board queue)
+        self.dcard_header_play_fx: Optional[Dict[str, Any]] = None
 
         # Lightweight v045-inspired event feed in the top-right pane.
         # Entries are kept as dicts, but add_tweet also accepts the old
@@ -577,6 +580,8 @@ class GUI:
         Use this when the Execution-phase Play button is clicked so the
         InitialPlacement pulse/highlight does not keep running during dice roll
         and normal execution.
+
+        Does **not** clear ``dcard_header_play_fx`` (full seat-turn one-play cue).
         """
         self.animations_enabled = False
         self.animate_queue_elements.clear()
@@ -598,11 +603,11 @@ class GUI:
         self.animations_enabled = True
 
     def play_dice_roll_sound(self) -> None:
-        """Play dice-roll sound if the asset was loaded."""
+        """Play dice-roll sound if the asset was loaded (no-op when headless)."""
         try:
-            sound = SOUNDS.get("DICEROLL")
-            if sound is not None:
-                pygame.mixer.Sound.play(sound)
+            from gui.gui_constants import play_sound
+
+            play_sound("DICEROLL")
         except Exception:
             pass
 
@@ -1044,9 +1049,9 @@ class GUI:
     def play_robber_sound(self) -> None:
         """Play the special 7/robber sound. Uses DANGER, matching existing assets."""
         try:
-            sound = SOUNDS.get("DANGER") or SOUNDS.get("ERROR")
-            if sound is not None:
-                pygame.mixer.Sound.play(sound)
+            from gui.gui_constants import play_sound
+
+            play_sound("DANGER", fallback="ERROR")
         except Exception:
             pass
 
@@ -1102,7 +1107,15 @@ class GUI:
         - Disabled completely during InitialPlacement
         - Only animates newest-looking items
         - Auto-clears queue when suspicious
+        - Always redraws DCard header play pulse when armed (full seat-turn)
         """
+        # Header play pulse is independent of board queue / animations_enabled
+        # so robber/build clears never kill the one-play-per-turn cue.
+        try:
+            self.draw_dcard_header_play_pulse()
+        except Exception:
+            pass
+
         if not self.animations_enabled:
             return
         if not self.animate_queue_elements:
@@ -1529,11 +1542,16 @@ class GUI:
         """
         Update the round and turn display in the GUI.
         Also syncs internal round/turn values used for animation filtering.
+
+        F3: for reverse IP (round == -1), the **displayed** turn is
+        ``(n_players+1) - mglog_turn`` so sequence order reads 1..n left-to-right
+        while MGlog still stores turn=player_id (chrono T4→…→T1). Color follows
+        the acting seat (player_id), not the remapped display turn.
         """
-        # Critical: sync GUI's round & turn with game state
+        # Critical: sync GUI's round & turn with game state (raw MGlog / engine)
         # This makes sure update_board's "this turn only" filter works correctly
         self.round = game.round
-        self.turn  = game.turn
+        self.turn = game.turn
 
         if FNFREQ == "Y":
             with open(FILENAME_FREQ, "a") as f:
@@ -1542,11 +1560,40 @@ class GUI:
         # Clear only the Round/Turn band (do not wipe guidance or Resource Potential)
         pygame.draw.rect(WIN, COLORS["LGRAY"], ROUND_TURN_RECT)
 
-        # Use local variables for display (your original pattern)
         help_round = game.round
         help_turn = game.turn
+        try:
+            n_players = len(list(getattr(game, "players", None) or [])) or 4
+        except Exception:
+            n_players = 4
+        try:
+            from core.mglog_replay import reverse_ip_display_turn
 
-        color = {1: "BLUE", 2: "RED", 3: "WHITE", 4: "ORANGE"}.get(help_turn, "BLACK")
+            disp_turn = reverse_ip_display_turn(
+                help_round, help_turn, n_players=n_players
+            )
+            if disp_turn is not None:
+                help_turn = disp_turn
+        except Exception:
+            pass
+
+        # Color by acting player (structure seat), not by remapped display turn
+        seat_for_color = None
+        try:
+            cur = game.get_current_player()
+            if cur is not None:
+                seat_for_color = int(getattr(cur, "id", 0) or 0) or None
+        except Exception:
+            seat_for_color = None
+        if seat_for_color is None:
+            try:
+                # MGlog: turn field is player_id even in reverse IP
+                seat_for_color = int(game.turn)
+            except Exception:
+                seat_for_color = None
+        color = {1: "BLUE", 2: "RED", 3: "WHITE", 4: "ORANGE"}.get(
+            seat_for_color, "BLACK"
+        )
         font = Font.LARGE.value["regular"]
         turn_text = font.render(f"Turn: {help_turn}", True, COLORS[color])
         round_text = font.render(f"Round: {help_round}", True, COLORS[color])
@@ -1556,8 +1603,10 @@ class GUI:
 
         if MG:
             with open(FILENAME_MG, "a") as f:
-                f.write(f"gui.py | update_round_turn | Actual: {self.round}, {self.turn} | "
-                        f"Display: {help_round}, {help_turn}, Color: {color}, Special: {special}\n")
+                f.write(
+                    f"gui.py | update_round_turn | Actual: {self.round}, {self.turn} | "
+                    f"Display: {help_round}, {help_turn}, Color: {color}, Special: {special}\n"
+                )
 
     def _block_adjacent_in_gui(self, board: Board, intersection_id: int, block_visual: bool = False) -> None:
         """
@@ -1809,6 +1858,134 @@ class GUI:
             if temp_queue:
                 self._animate_elements(board)
 
+    # DCard header types (shared strip order) — must match update_scoreboard icons
+    DCARD_HEADER_TYPES: Tuple[str, ...] = (
+        "victory_point",
+        "knight",
+        "two_free_roads",
+        "year_of_plenty",
+        "monopoly",
+    )
+
+    def arm_dcard_header_play_fx(
+        self,
+        card_type: str,
+        player: Any = None,
+        *,
+        player_id: Optional[int] = None,
+        color_name: Optional[str] = None,
+    ) -> bool:
+        """Arm full seat-turn pulse on the shared header icon for ``card_type``.
+
+        Color = structure seat color (same as roads/settles/cities).
+        """
+        ctype = str(card_type or "").strip().lower().replace(" ", "_")
+        aliases = {
+            "vp": "victory_point",
+            "victorypoint": "victory_point",
+            "road_building": "two_free_roads",
+            "roads": "two_free_roads",
+            "yop": "year_of_plenty",
+            "yearofplenty": "year_of_plenty",
+        }
+        ctype = aliases.get(ctype, ctype)
+        if ctype not in self.DCARD_HEADER_TYPES:
+            return False
+
+        pid = player_id
+        cname = (color_name or "").strip().upper() if color_name else ""
+        if player is not None:
+            try:
+                if pid is None:
+                    pid = int(getattr(player, "id", 0) or 0) or None
+            except Exception:
+                pass
+            if not cname:
+                cname = str(getattr(player, "color", "") or "").upper()
+        if not cname and pid:
+            cname = {1: "BLUE", 2: "RED", 3: "WHITE", 4: "ORANGE"}.get(int(pid), "")
+        # F5: same structure colors as roads/settles/cities (include WHITE; no DGRAY remap)
+        rgb = COLORS.get(cname, COLORS.get("GREEN", (0, 180, 0)))
+        try:
+            diameter = int(DCARD_HEADER_PLAY_PULSE_RADIUS)
+        except Exception:
+            diameter = 24
+        self.dcard_header_play_fx = {
+            "card_type": ctype,
+            "player_id": int(pid) if pid else None,
+            "color": tuple(int(x) for x in rgb[:3]),
+            "diameter": diameter,
+            "active": True,
+        }
+        return True
+
+    def clear_dcard_header_play_fx(self) -> None:
+        """Clear header play pulse (seat-turn boundary only)."""
+        self.dcard_header_play_fx = None
+
+    def dcard_header_icon_center(self, card_type_or_index: Any) -> Optional[Tuple[int, int]]:
+        """Center of a shared DCard header icon."""
+        idx = -1
+        if isinstance(card_type_or_index, int):
+            idx = int(card_type_or_index)
+        else:
+            ctype = str(card_type_or_index or "").strip().lower().replace(" ", "_")
+            try:
+                idx = list(self.DCARD_HEADER_TYPES).index(ctype)
+            except ValueError:
+                return None
+        if idx < 0 or idx >= len(DCARD_X_POSITIONS):
+            return None
+        try:
+            cy = int(DCARD_HEADER_ICON_CENTER_Y)
+        except Exception:
+            cy = 560
+        return (int(DCARD_X_POSITIONS[idx]) + 15, cy)
+
+    def draw_dcard_header_play_pulse(self) -> None:
+        """Draw one pulse frame on the armed shared header DCard icon."""
+        fx = getattr(self, "dcard_header_play_fx", None)
+        if not isinstance(fx, dict) or not fx.get("active"):
+            return
+        center = self.dcard_header_icon_center(fx.get("card_type"))
+        if not center:
+            return
+        color = fx.get("color") or COLORS.get("GREEN", (0, 180, 0))
+        try:
+            diameter = int(fx.get("diameter") or DCARD_HEADER_PLAY_PULSE_RADIUS)
+        except Exception:
+            diameter = 24
+        try:
+            step = (pygame.time.get_ticks() // 100) % 4
+        except Exception:
+            step = 0
+        quadrants = [
+            (True, True, True, False),
+            (True, False, True, True),
+            (False, True, True, True),
+            (True, True, False, True),
+        ]
+        draw_tr, draw_tl, draw_br, draw_bl = quadrants[step]
+        try:
+            pygame.draw.circle(
+                WIN,
+                color,
+                center,
+                int(diameter),
+                2,
+                draw_top_right=draw_tr,
+                draw_top_left=draw_tl,
+                draw_bottom_right=draw_br,
+                draw_bottom_left=draw_bl,
+            )
+        except TypeError:
+            try:
+                pygame.draw.circle(WIN, color, center, int(diameter), 2)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def update_scoreboard(self, game: Game) -> None:
         """Render the entire scoreboard with headers and player statistics.
 
@@ -1903,7 +2080,9 @@ class GUI:
             try:
                 image = IMAGES[img_key]["30x30"]
                 if image is not None:
-                    img_rect = image.get_rect(center=(dc_x_positions[i] + 15, 560)) # Center for 30x30
+                    img_rect = image.get_rect(
+                        center=(dc_x_positions[i] + 15, int(DCARD_HEADER_ICON_CENTER_Y))
+                    )  # Center for 30x30
                     WIN.blit(image, img_rect)
                     card_type = dc_types[i] if i < len(dc_types) else ""
                     playable = False
@@ -1950,6 +2129,12 @@ class GUI:
 
         if self.turn_detail_expanded_player_id is not None:
             self._draw_turn_detail_panel(game, self.turn_detail_expanded_player_id)
+
+        # Full seat-turn header play pulse (after static icons / borders)
+        try:
+            self.draw_dcard_header_play_pulse()
+        except Exception:
+            pass
        
         if MG:
             with open(FILENAME_MG, "a") as f:
@@ -2887,6 +3072,10 @@ class GUI:
 
         When a DCard was played this turn, the three-number triplet for that type
         is drawn in RED only on the scoreboard row of the player who played it.
+
+        Live + re-play: play feedback pulse is on the **shared header icon**
+        (``dcard_header_play_fx``), not on type-cell numbers. Type-cell red text
+        still marks the actor's played type this turn.
         """
         if not self._show_dcard_detail_for_player(player):
             return
@@ -2908,6 +3097,16 @@ class GUI:
             )
         )
 
+        # Re-play may stamp play types for empty-label edge cases (no cell ring).
+        try:
+            buy_types = set(getattr(player, "replay_dcard_buy_types", None) or set())
+        except Exception:
+            buy_types = set()
+        try:
+            play_types = set(getattr(player, "replay_dcard_play_types", None) or set())
+        except Exception:
+            play_types = set()
+
         try:
             dcard_triplets = self._normalise_dcard_scoreboard_triplets(player)
         except Exception:
@@ -2922,29 +3121,37 @@ class GUI:
         except Exception:
             full_triplets = True
 
-        for index, (_card_name, triplet) in enumerate(dcard_triplets[:5]):
+        for index, (card_name, triplet) in enumerate(dcard_triplets[:5]):
             try:
                 values = [max(0, int(v or 0)) for v in list(triplet)[:3]]
                 while len(values) < 3:
                     values.append(0)
+                cname = str(card_name or "")
                 if full_triplets:
-                    if not any(values):
+                    if not any(values) and cname not in buy_types and cname not in play_types:
                         continue
-                    label = f"{values[0]}/{values[1]}/{values[2]}"
+                    if not any(values) and (cname in buy_types or cname in play_types):
+                        label = "0/0/0"
+                    else:
+                        label = f"{values[0]}/{values[1]}/{values[2]}"
                 else:
                     # Opponent, normal play: only played/revealed (z).
                     played = int(values[2] or 0)
-                    if played <= 0:
+                    if played <= 0 and cname not in buy_types and cname not in play_types:
                         continue
-                    label = str(played)
+                    label = str(played) if played > 0 else "0"
+                buy_red = cname in buy_types
+                play_red = bool(highlight_this_row and index == played_index)
                 text_color = (
                     COLORS["RED"]
-                    if highlight_this_row and index == played_index
+                    if (buy_red or play_red)
                     else COLORS["BLACK"]
                 )
                 value_text = font.render(label, True, text_color)
-                value_rect = value_text.get_rect(center=(DCARD_X_POSITIONS[index] + 15, stats_y))
+                cx = DCARD_X_POSITIONS[index] + 15
+                value_rect = value_text.get_rect(center=(cx, stats_y))
                 WIN.blit(value_text, value_rect)
+                # No type-cell ring: play pulse is on shared header only (D1–D4).
             except Exception:
                 pass
 

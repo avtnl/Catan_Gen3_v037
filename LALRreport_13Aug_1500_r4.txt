@@ -1,0 +1,317 @@
+PS C:\Users\avtnl\Documents\Projecten\Python\Catan_Gen3\catan_game_v037> py -3.13 scripts/analyze_la_lr_godview.py --batch-dir batch_runs/product_apr08_l5_n100 --special lr
+=== Phase L WP-L2b: LR god-view labels + θ_LR ===
+batch=batch_runs\product_apr08_l5_n100 labels={'should_hold': 125, 'unlabeled': 163, 'should_give_up': 112}
+θ_LR=0.55 primary={'theta': 0.55, 'tp': 102, 'fp': 22, 'tn': 103, 'fn': 10, 'precision': 0.8226, 'recall': 0.9107, 'f1': 0.8644, 'accuracy': 0.865, 'n_labeled': 237}
+separation=0.266
+baseline S5.5={'name': 's55_kill_recommended_any', 'tp': 30, 'fp': 9, 'tn': 116, 'fn': 82, 'precision': 0.7692, 'recall': 0.2679, 'n_labeled': 237}
+================================================
+wrote: C:\Users\avtnl\Documents\Projecten\Python\Catan_Gen3\catan_game_v037\batch_runs\product_apr08_l5_n100\la_lr_godview_lr_report.json
+
+Unit: episodes (one seat’s LR race per game), not single samples.
+Score: hopeless_score_lr (higher = more hopeless).
+Domain: product = Domain B. Live freeze stays θ_LR = 0.75 (safe) on Domain C lab — this run is product dig / holdout, not a re-freeze.
+
+The LR console is a shorter formatter than LA (script comment: “minimal until dedicated formatter”), so fewer rows than r3.
+
+───
+
+Line 1 — Command
+
+py -3.13 scripts/analyze_la_lr_godview.py --batch-dir batch_runs/product_apr08_l5_n100 --special lr
+
+┌──────────────┬────────────────────────────────┐
+│ Piece        │ Meaning                        │
+├──────────────┼────────────────────────────────┤
+│ Script       │ God-view labels + global θ fit │
+├──────────────┼────────────────────────────────┤
+│ Batch        │ Product Apr 08 n=100           │
+├──────────────┼────────────────────────────────┤
+│ --special lr │ Longest Road only (L2b)        │
+└──────────────┴────────────────────────────────┘
+
+Offline: la_lr_probe.jsonl (+ holders from results as needed).
+
+───
+
+Line 2 — Banner
+
+=== Phase L WP-L2b: LR god-view labels + θ_LR ===
+
+┌─────────┬───────────────────────────────────────────────────┐
+│ Piece   │ Meaning                                           │
+├─────────┼───────────────────────────────────────────────────┤
+│ WP-L2b  │ LR god-view labels + θ_LR (parallel to L2a for    │
+│         │ LA)                                               │
+├─────────┼───────────────────────────────────────────────────┤
+│ god-    │ Full probe race features / scores, not public     │
+│ view    │ -only                                             │
+├─────────┼───────────────────────────────────────────────────┤
+│ θ_LR    │ Threshold: predict give-up if episode max         │
+│         │ hopeless score ≥ θ                                │
+└─────────┴───────────────────────────────────────────────────┘
+
+───
+
+Line 3 — Batch + label counts
+
+batch=batch_runs\product_apr08_l5_n100 labels={'should_hold': 125, 'unlabeled': 163, 'should_give_up': 112}
+
+┌────────────┬───────────┬────────────────────────────────────┐
+│ Field      │     Value │ Meaning                            │
+├────────────┼───────────┼────────────────────────────────────┤
+│ batch      │   product │ Input folder                       │
+│            │   _apr08… │                                    │
+├────────────┼───────────┼────────────────────────────────────┤
+│ should     │       125 │ Oracle: seat ever held LR in the   │
+│ _hold      │           │ episode → “should keep fighting /  │
+│            │           │ not give up”                       │
+├────────────┼───────────┼────────────────────────────────────┤
+│ should     │       112 │ Oracle: never held LR, race dead   │
+│ _give_up   │           │ enough (gap sustained / weak) → “  │
+│            │           │ should give up”                    │
+├────────────┼───────────┼────────────────────────────────────┤
+│ unlabeled  │       163 │ Too few needs samples, still       │
+│            │           │ close, ambiguous → out of θ        │
+│            │           │ metrics                            │
+└────────────┴───────────┴────────────────────────────────────┘
+
+125 + 163 + 112 = 400 = 100 games × 4 seats (same episode grid as LA).
+
+Compared with r3 LA on the same batch:
+
+┌─────────────────────┬─────────┬─────────┐
+│ Label               │ LA (r3) │ LR (r4) │
+├─────────────────────┼─────────┼─────────┤
+│ should_hold         │      66 │     125 │
+├─────────────────────┼─────────┼─────────┤
+│ should_give_up      │      44 │     112 │
+├─────────────────────┼─────────┼─────────┤
+│ unlabeled           │     290 │     163 │
+├─────────────────────┼─────────┼─────────┤
+│ labeled (hold+give) │     110 │     237 │
+└─────────────────────┴─────────┴─────────┘
+
+Story: Product has much more LR signal than LA (more holders, more dead races, fewer unlabeled). LR races are common; LA needs are rarer.
+
+Oracle rules (same structure as LA)
+
+┌─────────────────────────────────────────────┬───────────────┐
+│ Condition                                   │ Label         │
+├─────────────────────────────────────────────┼───────────────┤
+│ < min_needs needs-LR samples                │ unlabeled     │
+├─────────────────────────────────────────────┼───────────────┤
+│ Ever held LR                                │ should_hold   │
+├─────────────────────────────────────────────┼───────────────┤
+│ Never held + last K samples gap ≥ gap_floor │ should_give   │
+│                                             │ _up           │
+├─────────────────────────────────────────────┼───────────────┤
+│ Never held but last gap ≤ hold_max_gap      │ unlabeled     │
+├─────────────────────────────────────────────┼───────────────┤
+│ Never held, not close, max gap high         │ should_give   │
+│                                             │ _up           │
+├─────────────────────────────────────────────┼───────────────┤
+│ Else                                        │ unlabeled     │
+└─────────────────────────────────────────────┴───────────────┘
+
+(Defaults still min_needs=2, gap_floor=2, sustain_k=2, hold_max_gap=1 — not printed on the short LR console.)
+
+───
+
+Line 4 — Fitted θ_LR + confusion metrics
+
+θ_LR=0.55 primary={
+  'theta': 0.55, 'tp': 102, 'fp': 22, 'tn': 103, 'fn': 10,
+  'precision': 0.8226, 'recall': 0.9107, 'f1': 0.8644,
+  'accuracy': 0.865, 'n_labeled': 237
+}
+
+What θ = 0.55 means
+
+• Grid-search on labeled episodes only.
+• Predict give up if max_score of hopeless_score_lr ≥ θ.
+• Primary = best F1 (then recall) on this batch.
+• Fitted value 0.55 = named aggressive profile territory (Domain C freeze table: aggressive 0.55, balanced 0.65, safe 0.75).
+
+Not the live default. Live SE uses safe 0.75 unless you retune Domain B.
+
+Confusion at θ = 0.55 (episode-level)
+
+┌──────┬───────┬──────────────────────────────────────────────┐
+│ Cell │ Count │ Meaning                                      │
+├──────┼───────┼──────────────────────────────────────────────┤
+│ tp   │   102 │ Score ≥ 0.55 and oracle should_give_up       │
+├──────┼───────┼──────────────────────────────────────────────┤
+│ fp   │    22 │ Score ≥ 0.55 but seat did hold LR sometime — │
+│      │       │ false abandon risk                           │
+├──────┼───────┼──────────────────────────────────────────────┤
+│ tn   │   103 │ Score < 0.55 and should_hold                 │
+├──────┼───────┼──────────────────────────────────────────────┤
+│ fn   │    10 │ Score < 0.55 but oracle should_give_up —     │
+│      │       │ missed dead race                             │
+└──────┴───────┴──────────────────────────────────────────────┘
+
+Check: 102+22+103+10 = 237 = n_labeled.
+
+┌───────────┬────────┬────────────────────────────────────────┐
+│ Metric    │  Value │ Meaning                                │
+├───────────┼────────┼────────────────────────────────────────┤
+│ precision │ 0.8226 │ 102/(102+22) — ~82% of “give up”       │
+│           │        │ predictions are true dead races        │
+├───────────┼────────┼────────────────────────────────────────┤
+│ recall    │ 0.9107 │ 102/(102+10) — catches ~91% of labeled │
+│           │        │ dead races                             │
+├───────────┼────────┼────────────────────────────────────────┤
+│ f1        │ 0.8644 │ Strong blend                           │
+├───────────┼────────┼────────────────────────────────────────┤
+│ accuracy  │  0.865 │ (tp+tn)/237                            │
+├───────────┼────────┼────────────────────────────────────────┤
+│ n_labeled │    237 │ hold+give only                         │
+└───────────┴────────┴────────────────────────────────────────┘
+
+vs LA r3 on product
+
+┌────────────┬─────────┬──────────────────┐
+│            │ LA (r3) │          LR (r4) │
+├────────────┼─────────┼──────────────────┤
+│ Fitted θ   │     0.4 │             0.55 │
+├────────────┼─────────┼──────────────────┤
+│ P          │    0.96 │             0.82 │
+├────────────┼─────────┼──────────────────┤
+│ R          │     1.0 │             0.91 │
+├────────────┼─────────┼──────────────────┤
+│ F1         │    0.98 │             0.86 │
+├────────────┼─────────┼──────────────────┤
+│ fp         │       2 │               22 │
+├────────────┼─────────┼──────────────────┤
+│ Separation │    0.52 │ 0.27 (next line) │
+└────────────┴─────────┴──────────────────┘
+
+Story: LR is harder to separate on product than LA: more false give-ups at the F1-optimal θ, weaker class separation. Still a usable offline fit, but not as clean as LA’s 0.4 fit.
+
+───
+
+Line 5 — Separation
+
+separation=0.266
+
+┌────────────┬────────────────────────────────────────────────┐
+│ Field      │ Meaning                                        │
+├────────────┼────────────────────────────────────────────────┤
+│ Separation │ mean(max_score | should_give_up) − mean(max_   │
+│            │ score | should_hold)                           │
+├────────────┼────────────────────────────────────────────────┤
+│ 0.266      │ Only ~0.27 on [0,1]                            │
+└────────────┴────────────────────────────────────────────────┘
+
+┌─────────┬───────────────────────┐
+│ Special │ Separation on product │
+├─────────┼───────────────────────┤
+│ LA (r3) │                 ~0.52 │
+├─────────┼───────────────────────┤
+│ LR (r4) │                 ~0.27 │
+└─────────┴───────────────────────┘
+
+Story: Hold vs give-up score clouds overlap more for LR. That drives more fp/fn tradeoffs and is why public LR proxies also struggle (board “looks hopeless” early vs rare high scores / rare teacher fires at 0.75).
+
+───
+
+Line 6 — Baseline S5.5 kill_recommended
+
+baseline S5.5={
+  'name': 's55_kill_recommended_any',
+  'tp': 30, 'fp': 9, 'tn': 116, 'fn': 82,
+  'precision': 0.7692, 'recall': 0.2679, 'n_labeled': 237
+}
+
+Compare existing SE kill_recommended (any sample in episode) to the same oracle — no score θ.
+
+┌──────┬───────┬──────────────────────────────────────────────┐
+│ Cell │ Count │ Meaning                                      │
+├──────┼───────┼──────────────────────────────────────────────┤
+│ tp   │    30 │ Flagged 30 of 112 true dead races            │
+├──────┼───────┼──────────────────────────────────────────────┤
+│ fp   │     9 │ Flagged 9 seats that should_hold (false      │
+│      │       │ kill)                                        │
+├──────┼───────┼──────────────────────────────────────────────┤
+│ tn   │   116 │ Holders not flagged                          │
+├──────┼───────┼──────────────────────────────────────────────┤
+│ fn   │    82 │ Missed most dead races                       │
+└──────┴───────┴──────────────────────────────────────────────┘
+
+┌───────────┬────────┬────────────────────────────────────────┐
+│ Metric    │  Value │ Reading                                │
+├───────────┼────────┼────────────────────────────────────────┤
+│ precision │ 0.7692 │ 30/(30+9) — decent when it fires       │
+├───────────┼────────┼────────────────────────────────────────┤
+│ recall    │ 0.2679 │ Only ~27% of dead LR races get kill    │
+│           │        │ flag                                   │
+└───────────┴────────┴────────────────────────────────────────┘
+
+Story: On product LR, S5.5 kill is conservative and incomplete — much lower recall than score@0.55 (R≈0.91).
+Compare LA r3: S5.5 had P=1.0, R≈0.68 — LR kill baseline is worse on both dimensions than LA’s kill baseline.
+
+───
+
+Line 7 — Banner close
+
+================================================
+
+End of short L2b console block.
+
+───
+
+Line 8 — Written report
+
+wrote: …\batch_runs\product_apr08_l5_n100\la_lr_godview_lr_report.json
+
+Full JSON (episodes, score dists if stored, fits). Console is only the compact digest.
+
+(Rows/probe_exists/score_distributions are in the JSON; the minimal LR printer simply omits them.)
+
+───
+
+How r4 connects to other reports
+
+┌───────────┬─────────────────────────────────────────────────┐
+│ Report    │ Question                                        │
+├───────────┼─────────────────────────────────────────────────┤
+│ r4 (this) │ Can god score separate LR hold vs give-up on    │
+│           │ product? Fitted θ≈0.55                          │
+├───────────┼─────────────────────────────────────────────────┤
+│ r3        │ Same for LA → cleaner fit θ≈0.4                 │
+├───────────┼─────────────────────────────────────────────────┤
+│ r1 L5     │ Public give-up vs teacher at frozen θ_LR=0.75 → │
+│ public    │ gate=fail                                       │
+├───────────┼─────────────────────────────────────────────────┤
+│ Live L6   │ Uses safe θ=0.75 (Domain C freeze), not this    │
+│           │ product-fitted 0.55                             │
+└───────────┴─────────────────────────────────────────────────┘
+
+Product-fitted 0.55 would fire more often than live 0.75 (more recall, more FGU risk). L5 public failure is about matching the strict teacher at 0.75, not this aggressive fit.
+
+───
+
+One-screen takeaway
+
+┌──────────────┬──────────────────────────────────────────────┐
+│ Point        │ Takeaway                                     │
+├──────────────┼──────────────────────────────────────────────┤
+│ Episodes     │ 400 seats; 237 labeled (125 hold / 112 give- │
+│              │ up) — richer than LA                         │
+├──────────────┼──────────────────────────────────────────────┤
+│ Separation   │ Weak–moderate (0.27) — harder than LA (0.52) │
+├──────────────┼──────────────────────────────────────────────┤
+│ Product-     │ 0.55 (aggressive), F1≈0.86, P≈0.82, R≈0.91   │
+│ fitted θ     │                                              │
+├──────────────┼──────────────────────────────────────────────┤
+│ S5.5 kill    │ Low recall (~0.27); incomplete dead-race     │
+│              │ detector                                     │
+├──────────────┼──────────────────────────────────────────────┤
+│ Live policy  │ Still θ_LR=0.75 safe unless Domain B re-fit  │
+│              │ is opened                                    │
+├──────────────┼──────────────────────────────────────────────┤
+│ Link to L5   │ Harder LR score separation helps explain     │
+│              │ public LR over-fire vs rare high-θ teacher   │
+└──────────────┴──────────────────────────────────────────────┘
+
+File: la_lr_godview_lr_report.json

@@ -29,7 +29,7 @@ from datetime import datetime
 import random
 from core.board import Board
 from core.player import Player
-from core.constants import HUMAN_PLAYER, HP_ID, FNFREQ, FILENAME_FREQ, MG, FILENAME_MG, FILENAME_MGLOG, SAVE_PATH, PlayerColor, ResourceCard, TERRAIN_TO_RESOURCE
+from core.constants import HUMAN_PLAYER, HP_ID, FNFREQ, FILENAME_FREQ, MG, FILENAME_MG, FILENAME_MGLOG, SAVE_PATH, SAVED_GAMES_DIR, PlayerColor, ResourceCard, TERRAIN_TO_RESOURCE
 from core.markov_evaluator import MarkovEvaluator
 try:
     from core.turn_event_ledger import (
@@ -331,7 +331,8 @@ class Game:
         state_1: str,
         state_2: str,
         myplayers: List[Player],
-        board_name: str
+        board_name: str,
+        seed: Optional[int] = None,
     ) -> None:
         """Initialize a Game.
 
@@ -344,6 +345,9 @@ class Game:
             state_2: Additional state information (e.g., '0').
             myplayers: List of players or None to initialize new players.
             board_name: Name of the board (e.g., 'Base_Random').
+            seed: Optional RNG seed (Phase C2 WP-R1). None = unseeded residual RNG.
+                When set, ``random.seed(seed)`` is applied and ``game.seed`` /
+                ``game.game_seed`` are stored for TwP Stage D and dig-in.
         """
         self.manager = None # Placeholder for game manager
         self.sequence_number = sequence_number
@@ -355,6 +359,10 @@ class Game:
         self.state_2 = state_2
         self.round: int = -2
         self.turn: int = 1
+        # Phase C2 WP-R1: master seed for residual RNG / experiment arms
+        self.seed: Optional[int] = None
+        self.game_seed: Optional[int] = None  # alias used by Stage D / hand-risk
+        self.apply_seed(seed)
         self.players = myplayers or self._initialize_players()
         self.board = Board(board_name)
 
@@ -401,6 +409,10 @@ class Game:
         self.dice_roll: Optional[Tuple[int, int]] = None
         self.dice_rolls: List[Tuple[int, int]] = []
         self.dice_roll_history = [0] * 13 # Indices 0-12
+        # Phase C2 WP-R2: optional ordered dice script for replay (same playboard + dice)
+        self.dice_script: Optional[List[Tuple[int, int]]] = None
+        self.dice_script_index: int = 0
+        self.dice_rolls_used: int = 0  # rolls actually consumed this game
 
         # Structured event ledger. This is the source of truth for
         # current-turn deltas; legacy player.turn_details_* fields are mirrors
@@ -628,6 +640,29 @@ class Game:
             question_mark_button=[0, 0, 0, 0, 0, 0]
         )
 
+    def apply_seed(self, seed: Optional[int] = None) -> Optional[int]:
+        """Set ``game.seed`` / ``game.game_seed`` and seed Python ``random`` (WP-R1).
+
+        Returns the applied integer seed, or None if unseeded.
+        """
+        if seed is None or seed == "":
+            self.seed = None
+            self.game_seed = None
+            return None
+        try:
+            s = int(seed)
+        except Exception:
+            self.seed = None
+            self.game_seed = None
+            return None
+        self.seed = s
+        self.game_seed = s
+        try:
+            random.seed(s)
+        except Exception:
+            pass
+        return s
+
     def _initialize_players(self) -> List[Player]:
         """
         Initialize players for the game.
@@ -648,7 +683,7 @@ class Game:
                 color=PlayerColor.BLUE.color_name,
                 sequence=1,
                 is_human=(HUMAN_PLAYER and 1 in HP_ID),
-                initial_placement_algorithm=1,
+                initial_placement_algorithm=2,
                 human_like_placement=False           # human-like (recommended)
             ),
             Player(
@@ -656,7 +691,7 @@ class Game:
                 color=PlayerColor.RED.color_name,
                 sequence=2,
                 is_human=(HUMAN_PLAYER and 2 in HP_ID),
-                initial_placement_algorithm=3,
+                initial_placement_algorithm=2,
                 human_like_placement=False           # human-like (recommended)
             ),
             Player(
@@ -664,7 +699,7 @@ class Game:
                 color=PlayerColor.WHITE.color_name,
                 sequence=3,
                 is_human=(HUMAN_PLAYER and 3 in HP_ID),
-                initial_placement_algorithm=4,
+                initial_placement_algorithm=2,
                 human_like_placement=False          # doesn't matter for human
             ),
             Player(
@@ -672,7 +707,7 @@ class Game:
                 color=PlayerColor.ORANGE.color_name,
                 sequence=4,
                 is_human=(HUMAN_PLAYER and 4 in HP_ID),
-                initial_placement_algorithm=5,
+                initial_placement_algorithm=2,
                 human_like_placement=False           # human-like (recommended)
             ),
         ]
@@ -680,6 +715,14 @@ class Game:
         # Link each Player back to this Game instance
         for player in players:
             player.game = self
+
+        # Phase C2 WP-R0: per-seat explicit_142_recalc from constants map
+        try:
+            from core.explicit_142_recalc import apply_seat_map_to_players
+
+            apply_seat_map_to_players(players, warn=False)
+        except Exception:
+            pass
 
         return players
 
@@ -770,16 +813,88 @@ class Game:
             # 4:1 bank is always available by default in apply_trading_layer
         return ports_dict
 
-    def roll_dice(self) -> Tuple[int, int]:
-        """Simulate rolling two dice.
+    def set_dice_script(
+        self,
+        rolls: Optional[Any] = None,
+        *,
+        reset_index: bool = True,
+    ) -> int:
+        """Install an ordered dice script for replay (WP-R2).
 
-        Args:
-            None
-
-        Returns:
-            Tuple[int, int]: Tuple of two dice values (1-6).
+        Returns number of valid pairs installed. Empty/None clears the script.
         """
+        try:
+            from core.dice_script import normalize_dice_list
+
+            pairs = normalize_dice_list(rolls)
+        except Exception:
+            pairs = []
+        if not pairs:
+            self.dice_script = None
+            if reset_index:
+                self.dice_script_index = 0
+            return 0
+        self.dice_script = list(pairs)
+        if reset_index:
+            self.dice_script_index = 0
+        return len(self.dice_script)
+
+    def roll_dice(self) -> Tuple[int, int]:
+        """Roll two dice: consume ``dice_script`` when available, else true random.
+
+        WP-R2: If a script is set and the next index is in range, return that
+        pair and advance the index. Past the end of the script (or with no
+        script), roll truly with ``random`` and return the new pair.
+        Callers (``execute_roll_dice_action``) append to ``dice_rolls``.
+        """
+        script = getattr(self, "dice_script", None)
+        idx = int(getattr(self, "dice_script_index", 0) or 0)
+        if isinstance(script, list) and 0 <= idx < len(script):
+            try:
+                pair = script[idx]
+                d1, d2 = int(pair[0]), int(pair[1])
+                if 1 <= d1 <= 6 and 1 <= d2 <= 6:
+                    self.dice_script_index = idx + 1
+                    return (d1, d2)
+            except Exception:
+                pass
+            # bad entry — fall through to true roll but still advance to avoid loop
+            self.dice_script_index = idx + 1
         return (random.randint(1, 6), random.randint(1, 6))
+
+    def finalize_dice_rolls(self) -> List[Tuple[int, int]]:
+        """Keep only dice rolls actually used this game (WP-R2).
+
+        Truncates ``dice_rolls`` to ``dice_rolls_used`` (or len if counter unset).
+        Safe to call at game end / before export. Returns the kept list.
+        """
+        used = int(getattr(self, "dice_rolls_used", 0) or 0)
+        rolls = list(getattr(self, "dice_rolls", None) or [])
+        if used <= 0:
+            used = len(rolls)
+        if used < len(rolls):
+            self.dice_rolls = rolls[:used]
+        else:
+            self.dice_rolls = rolls
+        return list(self.dice_rolls)
+
+    def export_dice_payload(self) -> Dict[str, Any]:
+        """Dice + seed fragment for result.json (after finalize when possible)."""
+        try:
+            from core.dice_script import dice_export_dict
+
+            return dice_export_dict(
+                getattr(self, "dice_rolls", None) or [],
+                seed=getattr(self, "seed", None),
+            )
+        except Exception:
+            rolls = list(getattr(self, "dice_rolls", None) or [])
+            return {
+                "dice_rolls": [list(x) if isinstance(x, (list, tuple)) else x for x in rolls],
+                "dice_count": len(rolls),
+                "dice_hash": None,
+                "seed": getattr(self, "seed", None),
+            }
 
     def _turn_delta_category_to_attr(self) -> Dict[str, str]:
         """Return event-ledger category → legacy player vector mapping."""
@@ -1416,6 +1531,69 @@ class Game:
             or (isinstance(pending_7, dict) and bool(pending_7.get("active")))
         )
 
+        # Phase L S5/S6: expansion geometry death + fair VP-DCard death
+        if not in_forced_flow or allow_during_forced_flow:
+            try:
+                from core.partial_way_salvage import (
+                    update_player_expansion_dead,
+                    update_player_vp_dcards_dead,
+                )
+
+                if str(getattr(self, "phase", "") or "") == "Execution":
+                    exp = update_player_expansion_dead(self, player)
+                    status["expansion_dead"] = {
+                        "roads_expand": exp.get("roads_expand"),
+                        "settles_expand": exp.get("settles_expand"),
+                        "roads_reason": exp.get("roads_reason"),
+                        "settles_reason": exp.get("settles_reason"),
+                    }
+                    vp_d = update_player_vp_dcards_dead(self, player)
+                    status["vp_dcards_dead"] = {
+                        "vp_dcards": vp_d.get("vp_dcards"),
+                        "reason": vp_d.get("reason"),
+                        "deck_remaining": vp_d.get("deck_remaining"),
+                        "held_vp_cards": vp_d.get("held_vp_cards"),
+                        "way_vp_need": vp_d.get("way_vp_need"),
+                    }
+            except Exception as exp_exc:
+                status["expansion_dead"] = {"error": str(exp_exc)}
+
+        # Phase L L6: LA/LR give-up before mode resolve so force_strategy_recalc
+        # upgrades this refresh to L2 explore (flag-gated Domain A / C freezes).
+        if not in_forced_flow or allow_during_forced_flow:
+            try:
+                from core.la_giveup_l2 import maybe_la_giveup_l2
+
+                gu = maybe_la_giveup_l2(
+                    self, player, reason=str(reason or "refresh_strategy_context")
+                )
+                status["la_giveup"] = gu
+                if isinstance(gu, dict) and gu.get("fired"):
+                    force = True
+                    status["la_giveup_force_explore"] = True
+            except Exception as gu_exc:
+                status["la_giveup"] = {
+                    "enabled": None,
+                    "fired": False,
+                    "error": str(gu_exc),
+                }
+            try:
+                from core.lr_giveup_l2 import maybe_lr_giveup_l2
+
+                gu_lr = maybe_lr_giveup_l2(
+                    self, player, reason=str(reason or "refresh_strategy_context")
+                )
+                status["lr_giveup"] = gu_lr
+                if isinstance(gu_lr, dict) and gu_lr.get("fired"):
+                    force = True
+                    status["lr_giveup_force_explore"] = True
+            except Exception as gu_lr_exc:
+                status["lr_giveup"] = {
+                    "enabled": None,
+                    "fired": False,
+                    "error": str(gu_lr_exc),
+                }
+
         # Before dice / during robber-discard: skip heavy planner in normal play.
         # Phase0 capture may pass allow_during_forced_flow=True to still snapshot.
         if in_forced_flow and not allow_during_forced_flow:
@@ -1511,59 +1689,171 @@ class Game:
         )
 
         with busy_cm, span_cm as _span_bag:
-            try:
-                from inspect import signature
-                from core.action_planner import build_action_timing_report
-            except Exception as exc:
-                status["error"] = f"planner_import_failed: {exc}"
-                self.last_strategy_context_error = status["error"]
-                self.last_strategy_context_status = status
+            report: Any = None
+            # P1 true-light L0: skip full Stage1–4 / 142 planner when only hand changed.
+            if resolved_mode == "hand_only":
                 try:
-                    self._strategy_refresh_mode = None
-                except Exception:
-                    pass
-                return status
+                    from core.ai_way_portfolio import build_l0_hand_strategy_report
 
-            # Only pass keyword arguments that the installed action_planner accepts.
-            # This keeps the bridge stable if you temporarily test with an older
-            # planner file.
-            desired_kwargs: Dict[str, Any] = {
-                "top_n_actions": 3,
-                "include_all": True,
-                "include_debug": False,
-                "enable_player_trades": True,
-                "enable_action_projections": True,
-                "enable_continuation_strategies": True,
-                "continuation_top_n": 3,
-                "stage3_player_scope": "current",
-                "enable_risk_assessment": True,
-                "stage4_risk_player_scope": "current",
-                "enable_strategy_preference": True,
-                # Persist manually below for the current player only.  The report has
-                # by_player rows for all players, while Stage 3/4 is current-player
-                # scoped; automatic persistence could overwrite opponents with
-                # "No strategy candidate".
-                "persist_strategy_preference_to_player": False,
-            }
+                    report = build_l0_hand_strategy_report(
+                        self,
+                        player,
+                        reason=str(reason or ""),
+                    )
+                    # P1 WP4: bubble L0 meta onto outer refresh_strategy_context span
+                    try:
+                        from core.performance_trace import attach_span_meta
 
-            try:
-                accepted = set(signature(build_action_timing_report).parameters)
-                kwargs = {k: v for k, v in desired_kwargs.items() if k in accepted}
-            except Exception:
-                kwargs = dict(desired_kwargs)
+                        l0 = (report.get("l0_hand_only") if isinstance(report, Mapping) else None) or {}
+                        attach_span_meta(
+                            _span_bag,
+                            path="true_light",
+                            l0_true_light=True,
+                            ways=list(l0.get("ways") or []),
+                            way_count=int(l0.get("way_count") or len(l0.get("ways") or [])),
+                            matched_way=l0.get("matched_way"),
+                            geo_cache_hit=bool(l0.get("geo_cache_hit")),
+                            hand_rescore=bool(l0.get("hand_rescore")),
+                            full_cache_hit=bool(l0.get("full_cache_hit")),
+                            audit_count=int(l0.get("audit_count") or 0),
+                        )
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    status["error"] = f"l0_strategy_failed: {exc}"
+                    # Do not silently fall back to L2 explore (X4).
+                    self.last_strategy_context_error = status["error"]
+                    self.last_strategy_context_status = status
+                    try:
+                        from core.performance_trace import attach_span_meta
 
-            try:
-                report = build_action_timing_report(self, **kwargs)
-            except Exception as exc:
-                status["error"] = f"planner_failed: {exc}"
-                self.last_action_timing_report = None
-                self.last_strategy_context_error = status["error"]
-                self.last_strategy_context_status = status
+                        attach_span_meta(
+                            _span_bag,
+                            path="true_light",
+                            l0_true_light=True,
+                            l0_error=True,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        self._strategy_refresh_mode = None
+                    except Exception:
+                        pass
+                    return status
+            else:
                 try:
-                    self._strategy_refresh_mode = None
+                    from inspect import signature
+                    from core.action_planner import build_action_timing_report
+                except Exception as exc:
+                    status["error"] = f"planner_import_failed: {exc}"
+                    self.last_strategy_context_error = status["error"]
+                    self.last_strategy_context_status = status
+                    try:
+                        self._strategy_refresh_mode = None
+                    except Exception:
+                        pass
+                    return status
+
+                # P4: fast vs full L2 quality profile (does not change whether L2 runs)
+                try:
+                    from core.l2_profile import resolve_l2_profile
+
+                    l2_prof = resolve_l2_profile(
+                        self,
+                        reason=str(reason or ""),
+                        force=bool(force),
+                        mode=str(resolved_mode),
+                    )
+                    self._l2_profile = l2_prof
                 except Exception:
-                    pass
-                return status
+                    l2_prof = None
+                    try:
+                        self._l2_profile = None
+                    except Exception:
+                        pass
+
+                # Only pass keyword arguments that the installed action_planner accepts.
+                # This keeps the bridge stable if you temporarily test with an older
+                # planner file.
+                if l2_prof is not None and str(getattr(l2_prof, "name", "") or "") == "fast":
+                    desired_kwargs = {
+                        "top_n_actions": 3,
+                        "include_all": bool(l2_prof.stage1_include_all),
+                        "include_debug": False,
+                        "enable_player_trades": bool(l2_prof.enable_player_trades),
+                        "enable_action_projections": bool(l2_prof.enable_projections),
+                        "enable_continuation_strategies": bool(l2_prof.enable_continuations),
+                        "continuation_top_n": 3,
+                        "stage3_player_scope": "current",
+                        "enable_risk_assessment": bool(l2_prof.enable_risk),
+                        "stage4_risk_player_scope": "current",
+                        "enable_strategy_preference": True,
+                        "persist_strategy_preference_to_player": False,
+                    }
+                else:
+                    desired_kwargs = {
+                        "top_n_actions": 3,
+                        "include_all": True,
+                        "include_debug": False,
+                        "enable_player_trades": True,
+                        "enable_action_projections": True,
+                        "enable_continuation_strategies": True,
+                        "continuation_top_n": 3,
+                        "stage3_player_scope": "current",
+                        "enable_risk_assessment": True,
+                        "stage4_risk_player_scope": "current",
+                        "enable_strategy_preference": True,
+                        # Persist manually below for the current player only.  The report has
+                        # by_player rows for all players, while Stage 3/4 is current-player
+                        # scoped; automatic persistence could overwrite opponents with
+                        # "No strategy candidate".
+                        "persist_strategy_preference_to_player": False,
+                    }
+
+                try:
+                    accepted = set(signature(build_action_timing_report).parameters)
+                    # MagicMock / tiny signatures: pass full kwargs (tests + future params)
+                    if len(accepted) >= 5 and "top_n_actions" in accepted:
+                        kwargs = {k: v for k, v in desired_kwargs.items() if k in accepted}
+                    else:
+                        kwargs = dict(desired_kwargs)
+                except Exception:
+                    kwargs = dict(desired_kwargs)
+
+                try:
+                    report = build_action_timing_report(self, **kwargs)
+                    try:
+                        from core.performance_trace import attach_span_meta
+
+                        prof_meta = {}
+                        if l2_prof is not None:
+                            try:
+                                prof_meta = {
+                                    "l2_profile": getattr(l2_prof, "name", None),
+                                    "prefilter_k": getattr(l2_prof, "abstract_prefilter_k", None),
+                                    "portfolio_top_n": getattr(l2_prof, "portfolio_top_n", None),
+                                }
+                            except Exception:
+                                prof_meta = {}
+                        attach_span_meta(
+                            _span_bag,
+                            path="l2_full" if not prof_meta or prof_meta.get("l2_profile") == "full" else "l2_fast",
+                            l0_true_light=False,
+                            mode=str(resolved_mode),
+                            **prof_meta,
+                        )
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    status["error"] = f"planner_failed: {exc}"
+                    self.last_action_timing_report = None
+                    self.last_strategy_context_error = status["error"]
+                    self.last_strategy_context_status = status
+                    try:
+                        self._strategy_refresh_mode = None
+                    except Exception:
+                        pass
+                    return status
 
             self.last_action_timing_report = report
             self.last_strategy_context_reason = reason or "refresh_strategy_context"
@@ -1581,6 +1871,11 @@ class Game:
                 raw_preferred = player_block.get("preferred_strategy", {})
                 if isinstance(raw_preferred, Mapping):
                     preferred = dict(raw_preferred)
+            # L0 may have already written strategic_direction; reuse if block empty
+            if not preferred and resolved_mode == "hand_only":
+                raw_dir = getattr(player, "strategic_direction", None)
+                if isinstance(raw_dir, Mapping):
+                    preferred = dict(raw_dir)
 
             if preferred:
                 preferred["strategy_context_reason"] = reason or "refresh_strategy_context"
@@ -1620,23 +1915,105 @@ class Game:
                 "refresh_mode": resolved_mode,
                 "refresh_mode_detail": mode_detail,
             })
+            # P3: closed L2 policy bag for dig-in / tests
+            try:
+                from core.strategy_reconsider import build_l2_policy_status
+
+                status["l2_policy"] = build_l2_policy_status(
+                    self,
+                    player,
+                    reason=str(reason or ""),
+                    mode=str(resolved_mode),
+                    mode_detail=str(mode_detail),
+                )
+            except Exception:
+                status["l2_policy"] = {
+                    "allowed": resolved_mode == "explore",
+                    "bucket": None,
+                    "gate": str(mode_detail or ""),
+                    "mode": str(resolved_mode),
+                }
+            # Phase L WP-L1: god-view LA/LR probe (observe only; no SE change)
+            try:
+                from core.la_lr_probe_log import maybe_log_la_lr_probe
+
+                maybe_log_la_lr_probe(
+                    self,
+                    player,
+                    reason=str(reason or "refresh_strategy_context"),
+                    event="after_strategy_refresh",
+                )
+            except Exception:
+                pass
+            # Phase L salvage: terminal reminder if S4 would help (bounce after escape)
+            try:
+                from core.partial_way_salvage import maybe_signal_s4_needed
+
+                s4 = maybe_signal_s4_needed(
+                    self,
+                    player,
+                    reason=str(reason or "refresh_strategy_context"),
+                )
+                if s4:
+                    status["s4_needed"] = s4
+            except Exception:
+                pass
             # Surface portfolio L0/L2 diagnostics when present
             try:
                 if isinstance(report, Mapping):
+                    settings = report.get("settings") or {}
                     status["portfolio_hand_only"] = bool(
-                        (report.get("settings") or {}).get("board_way_portfolio_hand_only")
+                        settings.get("board_way_portfolio_hand_only")
+                        or settings.get("l0_true_light")
                     )
+                    status["l0_true_light"] = bool(settings.get("l0_true_light"))
                     if report.get("l0_hand_only"):
                         status["l0_hand_only"] = dict(report.get("l0_hand_only") or {})
+                    if settings.get("skipped_layers"):
+                        status["skipped_layers"] = list(settings.get("skipped_layers") or [])
             except Exception:
                 pass
 
             # S5.5-C: own-turn specials divert cadence (once per round/turn/player).
             # Portfolio override may already have latched during the planner; this
-            # call then skips. If portfolio did not run, assess + divert here.
-            # Skip divert on pure L0 hand_only (way locked); L2 explore may divert.
+            # call then skips unless force=True. If portfolio did not run, assess + divert here.
+            # Skip divert on pure L0 hand_only (way locked) **unless** WP3 give-up
+            # escape episode is active (force divert / unstick dead specials).
             try:
-                if resolved_mode == "hand_only":
+                force_escape_divert = False
+                try:
+                    from core.specials_dead_episode import (
+                        episode_kill_flags,
+                        get_specials_dead_episode,
+                        is_giveup_force_divert_enabled,
+                    )
+
+                    if is_giveup_force_divert_enabled():
+                        ep = get_specials_dead_episode(player)
+                        kla_ep, klr_ep = episode_kill_flags(player)
+                        force_escape_divert = bool(
+                            ep.get("active") and (kla_ep or klr_ep)
+                        )
+                except Exception:
+                    force_escape_divert = False
+
+                # Also force when this refresh just fired L6 give-up
+                if not force_escape_divert:
+                    try:
+                        gu = status.get("lr_giveup") or status.get("la_giveup") or {}
+                        if isinstance(gu, Mapping) and gu.get("fired"):
+                            force_escape_divert = True
+                    except Exception:
+                        pass
+                    try:
+                        if (status.get("lr_giveup") or {}).get("fired") or (
+                            status.get("la_giveup") or {}
+                        ).get("fired"):
+                            force_escape_divert = True
+                    except Exception:
+                        pass
+
+                if resolved_mode == "hand_only" and not force_escape_divert:
                     status["specials_divert"] = {
                         "skipped": True,
                         "fired": False,
@@ -1651,9 +2028,14 @@ class Game:
                         None,
                         preferred if preferred else getattr(player, "strategic_direction", None),
                         abstract_preferred=preferred if preferred else None,
-                        phase="own_turn_start",
+                        phase=(
+                            "own_turn_start_escape"
+                            if force_escape_divert
+                            else "own_turn_start"
+                        ),
                         store=True,
                         apply_direction=True,
+                        force=bool(force_escape_divert),
                     )
                     status["specials_divert"] = {
                         "skipped": bool(s55.get("skipped")),
@@ -1662,8 +2044,12 @@ class Game:
                         "chosen_way_id": s55.get("chosen_way_id"),
                         "kill_la": s55.get("kill_la"),
                         "kill_lr": s55.get("kill_lr"),
+                        "force": bool(s55.get("force")),
+                        "force_kill_la": s55.get("force_kill_la"),
+                        "force_kill_lr": s55.get("force_kill_lr"),
                         "dbg": s55.get("dbg"),
                         "phase": s55.get("phase"),
+                        "escape_divert": bool(force_escape_divert),
                     }
                     if (
                         s55.get("fired")
@@ -1676,12 +2062,21 @@ class Game:
                                 "preferred_way_id", new_pref.get("way_id")
                             )
                             status["specials_divert_applied"] = True
+                            preferred = dict(new_pref)
             except Exception as s55_exc:
                 status["specials_divert"] = {
                     "error": str(s55_exc),
                     "skipped": True,
                     "fired": False,
                 }
+
+            # Phase C2 WP-R3: sample sticky ETA after refresh (setback latch for next gate)
+            try:
+                from core.strategy_explicit_recalc import note_eta_sample
+
+                note_eta_sample(player, None)
+            except Exception:
+                pass
 
             # After successful L2, clear significance so next quiet dice stays L0.
             if resolved_mode == "explore" and not status.get("error"):
@@ -1709,6 +2104,12 @@ class Game:
                 pass
             try:
                 self._strategy_refresh_mode = None
+            except Exception:
+                pass
+            try:
+                # P4: profile only applies to the explore we just ran
+                if resolved_mode != "hand_only":
+                    pass  # keep _l2_profile on status consumers until next refresh
             except Exception:
                 pass
             return status
@@ -1912,10 +2313,30 @@ class Game:
         except Exception:
             pass
 
+        # Full seat-turn DCard header pulse ends when the next seat begins
+        try:
+            self.clear_dcard_header_play_fx()
+        except Exception:
+            pass
+
         # Idempotent maturity for the seat that is about to act (covers load /
         # first Execution turn if end-of-previous-turn maturity was missed).
         try:
             self._mature_player_dcard_new_to_playable(self.get_current_player())
+        except Exception:
+            pass
+        try:
+            from core import mglog
+
+            mglog.log_turn_start(self)
+        except Exception:
+            pass
+
+        # Phase C2 WP-R3: count own Execution turns for every_n explicit recalc
+        try:
+            from core.strategy_explicit_recalc import note_own_execution_turn
+
+            note_own_execution_turn(self, self.get_current_player())
         except Exception:
             pass
 
@@ -1984,6 +2405,10 @@ class Game:
 
         self.dice_roll = dice
         self.dice_rolls.append(dice)
+        try:
+            self.dice_rolls_used = int(getattr(self, "dice_rolls_used", 0) or 0) + 1
+        except Exception:
+            self.dice_rolls_used = len(self.dice_rolls)
 
         if 0 <= total < len(self.dice_roll_history):
             self.dice_roll_history[total] += 1
@@ -2001,6 +2426,12 @@ class Game:
             message=f"rolled {int(dice[0])} + {int(dice[1])} = {total}",
             metadata={"dice": [int(dice[0]), int(dice[1])], "total": total},
         )
+        try:
+            from core import mglog
+
+            mglog.log_dice_roll(self, dice, total, player=player)
+        except Exception:
+            pass
 
         production_result = None
 
@@ -2023,6 +2454,12 @@ class Game:
 
             for p in self.players:
                 self.update_strategy_dashboard(p)
+            try:
+                from core import mglog
+
+                mglog.log_resource_production(self, production_result)
+            except Exception:
+                pass
 
         # Refresh the strategic direction after the dice/resources are known and
         # before Slice A/B interprets strategy needs.  On a 7, publish an
@@ -2034,9 +2471,37 @@ class Game:
         if total != 7:
             self.refresh_strategy_context("after_dice_roll", mode="auto")
         else:
-            self.refresh_strategy_context("after_dice_roll_forced_robber", force=True)
+            # P3: do not force full explore during 7 forced-flow (usually skips anyway).
+            # Robber resolution + P2 dirty flags open L2 on the next auto path.
+            self.refresh_strategy_context(
+                "after_dice_roll_forced_robber",
+                mode="auto",
+            )
 
         scan = self.refresh_viable_actions("execute_roll_dice_action")
+
+        # P1+Q1: after scan, off-way settle/city may force one L2 before BA/preview
+        # P1+Q2: off-way DCard permission (no L2) after Q1
+        if total != 7:
+            try:
+                from core.strategy_offway_q1 import maybe_q1_offway_structure_l2
+
+                maybe_q1_offway_structure_l2(
+                    self,
+                    player,
+                    reason="after_dice_roll",
+                    rescan=True,
+                )
+            except Exception:
+                pass
+            try:
+                from core.strategy_offway_q2 import apply_q2_offway_dcard_permission
+
+                apply_q2_offway_dcard_permission(
+                    self, player, reason="after_dice_roll"
+                )
+            except Exception:
+                pass
 
         # If this roll belongs to an AI player, the AI turn has reached the
         # visible preview checkpoint.  Continue must be available even when the
@@ -2308,12 +2773,42 @@ class Game:
             actionable = [c for c in actionable if not self._should_suppress_ai_strategic_road_choice(c)]
             legal = [c for c in legal if not self._should_suppress_ai_strategic_road_choice(c)]
 
+            # P1+Q2: off-way DCard — allow soft pick / block unguarded DCard fallback
+            q2_allow = False
+            q2_block_fallback = False
+            try:
+                from core.strategy_offway_q2 import q2_dcard_allowed, q2_dcard_blocked
+
+                q2_allow = bool(q2_dcard_allowed(self))
+                q2_block_fallback = bool(q2_dcard_blocked(self))
+            except Exception:
+                q2_allow = False
+                q2_block_fallback = False
+
+            def _is_dcard_row(row: Mapping[str, Any]) -> bool:
+                n = str(row.get("action", "") or "").strip().lower()
+                return "development" in n
+
             action_keys = {str(c.get("action", "") or "") for c in actionable}
             fallback_legal = [c for c in legal if str(c.get("action", "") or "") not in action_keys]
+            if q2_block_fallback:
+                fallback_legal = [c for c in fallback_legal if not _is_dcard_row(c)]
 
             selected: List[Dict[str, Any]] = []
             for c in sorted(actionable, key=lambda row: priority.get(str(row.get("action", "") or ""), 99)):
                 selected.append((dict(c) | {"_execution_source": "strategic"}))
+            # P1+Q2: if nothing strategic, soft off-way DCard before other legal fallbacks
+            if not selected and q2_allow:
+                for c in legal:
+                    if _is_dcard_row(c):
+                        selected.append(
+                            dict(c)
+                            | {
+                                "_execution_source": "q2_offway_dcard",
+                                "strategic_reason": "P1+Q2 opportunistic off-way DCard (guards passed).",
+                            }
+                        )
+                        break
             if not selected:
                 for c in sorted(fallback_legal, key=lambda row: priority.get(str(row.get("action", "") or ""), 99)):
                     selected.append((dict(c) | {"_execution_source": "legal_fallback"}))
@@ -2322,6 +2817,11 @@ class Game:
                 source = str(choice.get("_execution_source", "strategic") or "strategic")
                 if source == "legal_fallback":
                     reason = "Legal now; no strategic action was available, so Slice C2 uses legal fallback."
+                elif source == "q2_offway_dcard":
+                    reason = str(
+                        choice.get("strategic_reason")
+                        or "P1+Q2 opportunistic off-way DCard (no L2)."
+                    )
                 else:
                     reason = str(choice.get("strategic_reason") or choice.get("reason") or "Strategic and legal now.")
                 choice = dict(choice)
@@ -3009,6 +3509,31 @@ class Game:
             scan_ok = False
             scan_error = str(exc)
 
+        # P1+Q1: affordable off-way settle/city → L2 once before BA (restricts L2)
+        q1_status: Dict[str, Any] = {}
+        try:
+            from core.strategy_offway_q1 import maybe_q1_offway_structure_l2
+
+            q1_status = maybe_q1_offway_structure_l2(
+                self,
+                player,
+                reason=reason_text,
+                rescan=True,  # inner post-L2 rescan rebuilds BA
+            )
+        except Exception as exc:
+            q1_status = {"fired": False, "skipped": True, "reason": f"q1_error:{exc}"}
+
+        # P1+Q2: opportunistic off-way DCard (no L2) after Q1
+        q2_status: Dict[str, Any] = {}
+        try:
+            from core.strategy_offway_q2 import apply_q2_offway_dcard_permission
+
+            q2_status = apply_q2_offway_dcard_permission(
+                self, player, reason=reason_text
+            )
+        except Exception as exc:
+            q2_status = {"allow": False, "reason": f"q2_error:{exc}"}
+
         try:
             viable_actions = scan.viable_actions() if scan is not None and hasattr(scan, "viable_actions") else []
         except Exception:
@@ -3070,6 +3595,8 @@ class Game:
             "scan_refresh_ok": scan_ok,
             "scan_refresh_error": scan_error,
             "strategy_milestone": milestone_meta,
+            "q1_offway_l2": dict(q1_status) if isinstance(q1_status, dict) else q1_status,
+            "q2_offway_dcard": dict(q2_status) if isinstance(q2_status, dict) else q2_status,
             "viable_actions_after": viable_actions,
             "buy_build_choices_after": list(getattr(self, "current_execution_choices", []) or []),
             "actionable_choices_after": list(getattr(self, "current_actionable_choices", []) or []),
@@ -3232,6 +3759,19 @@ class Game:
         )
         self.emit_twitter_event(getattr(player, "id", None), message)
         self._play_execution_action_sound("TwB")
+
+        try:
+            from core import mglog
+
+            mglog.log_twb(
+                self,
+                player,
+                give_vec,
+                get_vec,
+                source=str(source or "twb"),
+            )
+        except Exception:
+            pass
 
         try:
             self.update_strategy_dashboard(player)
@@ -4752,12 +5292,23 @@ class Game:
 
         Returns True when a concrete sound object was found and play was requested.
         Game logic must never fail because pygame/mixer/sound assets are unavailable.
+
+        Headless policy: ``NO_GUI_AT_ALL_TF=True`` → no sounds (same as no GUI).
         """
         keys = [str(name or "").strip() for name in sound_names if str(name or "").strip()]
         if not keys:
             return False
 
-        # Prefer a future GUI-level sound API when available.
+        # Operator flag: headless lab = silent.
+        try:
+            from core.constants import NO_GUI_AT_ALL_TF
+
+            if bool(NO_GUI_AT_ALL_TF):
+                return False
+        except Exception:
+            pass
+
+        # Prefer GUI-level sound API when available (NullGui no-ops).
         try:
             gui = getattr(self, "gui", None)
             play_sound = getattr(gui, "play_sound", None)
@@ -4772,26 +5323,15 @@ class Game:
         except Exception:
             pass
 
+        # Canonical choke-point (also re-checks NO_GUI / missing assets).
         try:
-            from gui.gui_constants import SOUNDS, initialize_sounds  # local import avoids hard GUI dependency
+            from gui.gui_constants import play_sound as play_named_sound
 
-            if not SOUNDS:
+            for i, key in enumerate(keys):
+                fb = "BUTTON" if i == len(keys) - 1 else ""
                 try:
-                    initialize_sounds()
-                except Exception:
-                    pass
-
-            for key in keys:
-                sound = SOUNDS.get(key)
-                if sound is None:
-                    continue
-                try:
-                    play = getattr(sound, "play", None)
-                    if callable(play):
-                        play()
+                    if play_named_sound(key, fallback=fb):
                         return True
-                    pygame.mixer.Sound.play(sound)
-                    return True
                 except Exception:
                     pass
         except Exception:
@@ -6304,6 +6844,25 @@ class Game:
             self.refresh_viable_actions("after_ai_twp_support")
         except Exception:
             pass
+        try:
+            from core.strategy_offway_q1 import maybe_q1_offway_structure_l2
+
+            maybe_q1_offway_structure_l2(
+                self,
+                player,
+                reason="after_ai_twp_support",
+                rescan=True,
+            )
+        except Exception:
+            pass
+        try:
+            from core.strategy_offway_q2 import apply_q2_offway_dcard_permission
+
+            apply_q2_offway_dcard_permission(
+                self, player, reason="after_ai_twp_support"
+            )
+        except Exception:
+            pass
 
         followup_item = self.get_current_best_executable_action()
         if not isinstance(followup_item, Mapping):
@@ -7443,6 +8002,25 @@ class Game:
             self.refresh_viable_actions("after_ai_twb_support")
         except Exception:
             pass
+        try:
+            from core.strategy_offway_q1 import maybe_q1_offway_structure_l2
+
+            maybe_q1_offway_structure_l2(
+                self,
+                player,
+                reason="after_ai_twb_support",
+                rescan=True,
+            )
+        except Exception:
+            pass
+        try:
+            from core.strategy_offway_q2 import apply_q2_offway_dcard_permission
+
+            apply_q2_offway_dcard_permission(
+                self, player, reason="after_ai_twb_support"
+            )
+        except Exception:
+            pass
 
         planned_followup = plan_item.get("then_plan_item", {})
         followup_item = dict(planned_followup) if isinstance(planned_followup, Mapping) else {}
@@ -7615,11 +8193,28 @@ class Game:
         rows = [row for row in list(getattr(self, "current_actionable_choices", []) or []) if isinstance(row, Mapping)]
         rows = [row for row in rows if str(row.get("action", "") or "") in executable_actions and bool(row.get("actionable", row.get("viable", False)))]
 
+        q2_allow = False
+        q2_block_fallback = False
+        try:
+            from core.strategy_offway_q2 import q2_dcard_allowed, q2_dcard_blocked
+
+            q2_allow = bool(q2_dcard_allowed(self))
+            q2_block_fallback = bool(q2_dcard_blocked(self))
+        except Exception:
+            pass
+
         if not rows:
             # Fallback keeps older/no-strategy turns usable, but still reads from
             # scanner rows rather than from stale preview-plan rows.
             rows = [row for row in list(getattr(self, "current_execution_choices", []) or []) if isinstance(row, Mapping)]
             rows = [row for row in rows if str(row.get("action", "") or "") in executable_actions and bool(row.get("viable", False))]
+            # P1+Q2: prefer soft off-way DCard when allowed; strip blocked DCard fallback
+            if q2_allow:
+                dcard_rows = [r for r in rows if str(r.get("action", "") or "") == "Buy development_card"]
+                if dcard_rows:
+                    rows = dcard_rows
+            elif q2_block_fallback:
+                rows = [r for r in rows if str(r.get("action", "") or "") != "Buy development_card"]
 
         if not rows:
             twp_plan = self._plan_ai_trade_with_player_for_strategy(step=1)
@@ -7670,7 +8265,30 @@ class Game:
             )
 
         choice = dict(sorted(rows, key=_sort_key)[0])
-        plan = self._plan_item_from_execution_choice(choice, source="canonical_best_action", step=1)
+        ba_source = "canonical_best_action"
+        try:
+            if (
+                q2_allow
+                and str(choice.get("action") or "") == "Buy development_card"
+                and not any(
+                    bool(r.get("actionable", False))
+                    for r in list(getattr(self, "current_actionable_choices", []) or [])
+                    if isinstance(r, Mapping)
+                )
+            ):
+                ba_source = "canonical_best_action_q2_offway_dcard"
+        except Exception:
+            pass
+        plan = self._plan_item_from_execution_choice(choice, source=ba_source, step=1)
+        try:
+            if ba_source.endswith("q2_offway_dcard"):
+                plan["q2_offway_dcard"] = True
+                plan["reason"] = str(
+                    plan.get("reason")
+                    or "P1+Q2 opportunistic off-way DCard (guards passed; no L2)."
+                )
+        except Exception:
+            pass
         try:
             if _action_wins_now(str(choice.get("action") or "")):
                 plan["win_now"] = True
@@ -8003,6 +8621,7 @@ class Game:
         except Exception:
             pass
         moved = 0
+        matured_types: List[str] = []
         try:
             summary = list(getattr(player, "dcard_summary", []) or [])
             for i, row in enumerate(summary):
@@ -8024,9 +8643,27 @@ class Game:
                 # col3 (played/revealed) intentionally unchanged
                 summary[i] = row_list[:4]
                 moved += new_n
+                try:
+                    matured_types.append(str(row_list[0]))
+                except Exception:
+                    pass
             player.dcard_summary = summary
             out["ok"] = True
             out["moved"] = int(moved)
+            out["types"] = list(matured_types)
+            if moved > 0:
+                try:
+                    from core import mglog
+
+                    mglog.log_activate_dcard(
+                        self,
+                        player,
+                        moved=moved,
+                        types=matured_types,
+                        source="maturity",
+                    )
+                except Exception:
+                    pass
         except Exception as exc:
             out["error"] = str(exc)
         return out
@@ -8158,6 +8795,34 @@ class Game:
                 pass
         try:
             self.dcard_played_in_turn_player_id = player_id
+        except Exception:
+            pass
+
+        # D2: arm full seat-turn header play pulse (human Confirm + AI after mark)
+        try:
+            gui = getattr(self, "gui", None)
+            arm = getattr(gui, "arm_dcard_header_play_fx", None) if gui is not None else None
+            if callable(arm):
+                pl = player
+                if pl is None and player_id:
+                    try:
+                        for p in list(getattr(self, "players", []) or []):
+                            if p is not None and int(getattr(p, "id", 0) or 0) == int(player_id):
+                                pl = p
+                                break
+                    except Exception:
+                        pl = None
+                arm(str(card_name or ""), pl, player_id=player_id)
+        except Exception:
+            pass
+
+    def clear_dcard_header_play_fx(self) -> None:
+        """Clear shared DCard header play pulse (seat-turn boundary)."""
+        try:
+            gui = getattr(self, "gui", None)
+            clear = getattr(gui, "clear_dcard_header_play_fx", None) if gui is not None else None
+            if callable(clear):
+                clear()
         except Exception:
             pass
 
@@ -8326,6 +8991,21 @@ class Game:
                         prev_id,
                         "Largest Army special is vacant",
                     )
+            except Exception:
+                pass
+
+        # MGlog: LA holder flip (even if twitter emit skipped; only when changed)
+        if info.get("holder_changed"):
+            try:
+                from core import mglog
+
+                mglog.log_largest_army_change(
+                    self,
+                    previous_holder_id=prev_id,
+                    holder_id=new_id,
+                    best_size=best,
+                    reason=str(reason or "recompute_largest_army"),
+                )
             except Exception:
                 pass
 
@@ -8541,6 +9221,22 @@ class Game:
         info["gained_longest_road"] = bool(new_id is not None and new_id != prev_id)
         info["lost_longest_road"] = bool(prev_id is not None and prev_id != new_id)
 
+        # Phase L: sample on LR holder change
+        if info.get("holder_changed"):
+            try:
+                from core.la_lr_probe_log import maybe_log_la_lr_probe
+
+                focal = new_holder if new_holder is not None else self._player_by_id(prev_id)
+                maybe_log_la_lr_probe(
+                    self,
+                    focal,
+                    reason=str(reason or "recompute_longest_road"),
+                    event="lr_holder_changed",
+                    force=True,
+                )
+            except Exception:
+                pass
+
         if emit_events and info["holder_changed"]:
             try:
                 if new_holder is not None and prev_id is None:
@@ -8562,6 +9258,21 @@ class Game:
                         prev_id,
                         "Longest Road special is vacant",
                     )
+            except Exception:
+                pass
+
+        # MGlog: LR holder flip (independent of twitter / emit_events noise)
+        if info.get("holder_changed"):
+            try:
+                from core import mglog
+
+                mglog.log_longest_road_change(
+                    self,
+                    previous_holder_id=prev_id,
+                    holder_id=new_id,
+                    best_length=best,
+                    reason=str(reason or "recompute_longest_road"),
+                )
             except Exception:
                 pass
 
@@ -8752,6 +9463,20 @@ class Game:
             )
         except Exception:
             info["win_check"] = {"ok": False, "won": False, "reason": "win_check_exception"}
+        # Phase L: sample on LA holder change
+        try:
+            if info.get("holder_changed"):
+                from core.la_lr_probe_log import maybe_log_la_lr_probe
+
+                maybe_log_la_lr_probe(
+                    self,
+                    player,
+                    reason="after_knight_la",
+                    event="la_holder_changed",
+                    force=True,
+                )
+        except Exception:
+            pass
         return info
 
     def execute_human_play_knight_action(self) -> Dict[str, Any]:
@@ -8862,6 +9587,17 @@ class Game:
                     "timing": timing,
                     "army_size": army_info.get("army_size"),
                 },
+            )
+        except Exception:
+            pass
+        try:
+            from core import mglog
+
+            mglog.log_play_dcard(
+                self,
+                player,
+                "knight",
+                payload=f"timing={timing}",
             )
         except Exception:
             pass
@@ -9089,6 +9825,19 @@ class Game:
                 )
             except Exception:
                 pass
+
+        try:
+            from core import mglog
+
+            mglog.log_play_dcard(
+                self,
+                player,
+                "year_of_plenty",
+                resource_indices=[a, b],
+                rc_in=list(gain_vec),
+            )
+        except Exception:
+            pass
 
         try:
             self.emit_twitter_event(getattr(player, "id", None), message)
@@ -9375,6 +10124,24 @@ class Game:
             pass
 
         try:
+            from core import mglog
+
+            mono_rc_in = [0, 0, 0, 0, 0]
+            if total_taken > 0 and 0 <= ridx < 5:
+                mono_rc_in[ridx] = int(total_taken)
+            mglog.log_play_dcard(
+                self,
+                player,
+                "monopoly",
+                resource_index=ridx,
+                resource_name=res_name,
+                total_taken=total_taken,
+                rc_in=mono_rc_in,
+            )
+        except Exception:
+            pass
+
+        try:
             self._play_execution_action_sound("Play development_card")
         except Exception:
             pass
@@ -9528,6 +10295,17 @@ class Game:
                     "roads_total": roads_to_place,
                     "pieces_at_start": pieces_left,
                 },
+            )
+        except Exception:
+            pass
+        try:
+            from core import mglog
+
+            mglog.log_play_dcard(
+                self,
+                player,
+                "two_free_roads",
+                payload=f"roads_total={roads_to_place}",
             )
         except Exception:
             pass
@@ -9753,17 +10531,34 @@ class Game:
             bump_player_stat(player, "stats_dcards_bought", 1)
         except Exception:
             pass
-        # S1 ext: weak flag for LA-pursuing opponents (deck thins)
+        # P2-7: opp DCard dirty only for LA-relevant seats (not global)
         try:
             from core.strategy_sticky import flag_opponents_after_dcard_buy
 
             out_flag = flag_opponents_after_dcard_buy(self, player)
         except Exception:
             out_flag = {}
+        # P2-5: own Q2 opportunistic buy is analytics only — never sets L2 flags
+        try:
+            src = str(plan_item.get("source") or "")
+            if "q2" in src.lower():
+                from core.strategy_dirty import mark_q2_bought_this_turn
+
+                mark_q2_bought_this_turn(player)
+        except Exception:
+            pass
         self.update_strategy_dashboard(player)
         self._refresh_gui_scoreboard_after_dcard_change("after_ai_buy_dcard")
         self.emit_twitter_event(getattr(player, "id", None), f"bought a DCard ({card_name})")
         self._play_execution_action_sound(action)
+        try:
+            from core import mglog
+
+            mglog.log_buy_dcard(
+                self, player, card_name, rc_out=cost, source="ai_buy_dcard"
+            )
+        except Exception:
+            pass
         out: Dict[str, Any] = {
             "ok": True,
             "action": action,
@@ -9828,6 +10623,12 @@ class Game:
         self.emit_twitter_event(getattr(player, "id", None), f"built City @{target}")
         self._play_execution_action_sound(action)
         self._set_pending_execution_build_animation(action, player, target_id=target)
+        try:
+            from core import mglog
+
+            mglog.log_build(self, "city", player, target_id=target, rc_out=cost)
+        except Exception:
+            pass
         # S1: flag opponents once; own city milestone handled in Slice D after scan
         try:
             from core.strategy_sticky import flag_opponents_after_structure
@@ -9886,6 +10687,12 @@ class Game:
         self.emit_twitter_event(getattr(player, "id", None), f"built Settlement @{target}")
         self._play_execution_action_sound(action)
         self._set_pending_execution_build_animation(action, player, target_id=target)
+        try:
+            from core import mglog
+
+            mglog.log_build(self, "settlement", player, target_id=target, rc_out=cost)
+        except Exception:
+            pass
         try:
             from core.strategy_sticky import flag_opponents_after_structure
 
@@ -9949,6 +10756,12 @@ class Game:
         self.emit_twitter_event(getattr(player, "id", None), f"built Road [{road[0]},{road[1]}]")
         self._play_execution_action_sound(action)
         self._set_pending_execution_build_animation(action, player, road_id=road)
+        try:
+            from core import mglog
+
+            mglog.log_build(self, "road", player, road=road, rc_out=cost)
+        except Exception:
+            pass
         out: Dict[str, Any] = {
             "ok": True,
             "action": action,
@@ -10069,6 +10882,14 @@ class Game:
         self._refresh_gui_scoreboard_after_dcard_change("after_human_buy_dcard")
         self.emit_twitter_event(getattr(player, "id", None), f"bought a DCard ({card_name})")
         self._play_execution_action_sound(action)
+        try:
+            from core import mglog
+
+            mglog.log_buy_dcard(
+                self, player, card_name, rc_out=cost, source="human_buy_dcard"
+            )
+        except Exception:
+            pass
 
         result.update({"ok": True, "reason": "executed", "card_name": card_name})
         try:
@@ -10155,6 +10976,12 @@ class Game:
         self.emit_twitter_event(getattr(player, "id", None), f"built City @{target}")
         self._play_execution_action_sound(action)
         self._set_pending_execution_build_animation(action, player, target_id=target)
+        try:
+            from core import mglog
+
+            mglog.log_build(self, "city", player, target_id=target, rc_out=cost)
+        except Exception:
+            pass
         # Own city does not interrupt continuous road; recompute keeps LR length/VP in sync
         try:
             self.recompute_longest_road(
@@ -10249,6 +11076,12 @@ class Game:
         self.emit_twitter_event(getattr(player, "id", None), f"built Settlement @{target}")
         self._play_execution_action_sound(action)
         self._set_pending_execution_build_animation(action, player, target_id=target)
+        try:
+            from core import mglog
+
+            mglog.log_build(self, "settlement", player, target_id=target, rc_out=cost)
+        except Exception:
+            pass
         # Settlement can break opponent continuous roads → recompute LR
         try:
             self.recompute_longest_road(
@@ -10456,6 +11289,19 @@ class Game:
         self._set_pending_execution_build_animation(action, player, road_id=road)
 
         result.update({"ok": True, "reason": "executed", "road_id": list(road)})
+        try:
+            from core import mglog
+
+            mglog.log_build(
+                self,
+                "road",
+                player,
+                road=road,
+                free=bool(free_tfr),
+                rc_out=[0, 0, 0, 0, 0] if free_tfr else cost,
+            )
+        except Exception:
+            pass
         # W2: paid road or free TFR road may award Longest Road and end the game.
         try:
             win_reason = (
@@ -11245,6 +12091,23 @@ class Game:
             invalidate_board_way_portfolio_cache(self, "basic_robber_strategy")
         except Exception:
             pass
+        # P2-8: dirty only seats for whom robber tile is plan/production relevant
+        try:
+            from core.strategy_dirty import flag_opponents_after_robber
+
+            tile = None
+            move = result.get("move") if isinstance(result, Mapping) else None
+            if isinstance(move, Mapping):
+                tile = move.get("tile_id") or move.get("robber_tile_id")
+            if tile is None:
+                tile = getattr(self, "robber_tile_id", None) or getattr(
+                    getattr(self, "board", None), "robber_tile_id", None
+                )
+            result["strategy_recalc_flagged_opponents"] = flag_opponents_after_robber(
+                self, player, tile_id=tile
+            )
+        except Exception:
+            pass
         # Single strategy refresh for robber path (Slice D may dedupe same reason).
         self.refresh_strategy_after_event(
             "after_basic_robber_strategy", kind="turn_start"
@@ -11290,6 +12153,15 @@ class Game:
             from core.ai_way_portfolio import invalidate_board_way_portfolio_cache
 
             invalidate_board_way_portfolio_cache(self, "move_robber")
+        except Exception:
+            pass
+        # P2-8: plan/production-relevant dirty flags only
+        try:
+            from core.strategy_dirty import flag_opponents_after_robber
+
+            result["strategy_recalc_flagged_opponents"] = flag_opponents_after_robber(
+                self, player, tile_id=int(tile_id)
+            )
         except Exception:
             pass
         self.refresh_viable_actions("execute_move_robber_action")
@@ -11393,8 +12265,9 @@ class Game:
                 except Exception:
                     pass
                 try:
+                    # Knight moved robber: board geometry, not pure hand (P1 WP3)
                     self.refresh_strategy_after_event(
-                        "after_human_knight_robber_pre_roll", kind="hand"
+                        "after_human_knight_robber_pre_roll", kind="board"
                     )
                 except Exception:
                     pass
@@ -11469,7 +12342,12 @@ class Game:
         """
         # W2: do not start another player's turn after a winner was declared.
         if bool(getattr(self, "game_over", False)) and str(getattr(self, "phase", "") or "") == "Execution":
-            print("game.advance_turn skipped — game_over")
+            try:
+                from core.console import digin, DEBUG
+
+                digin("game.advance_turn skipped — game_over", level=DEBUG)
+            except Exception:
+                print("game.advance_turn skipped — game_over")
             try:
                 self.ai_execution_preview_ready = False
                 self.ai_execution_preview_player_id = None
@@ -11480,7 +12358,20 @@ class Game:
                 pass
             return
 
-        print("game.advance_turn executed")
+        try:
+            from core.console import digin, DEBUG
+
+            digin("game.advance_turn executed", level=DEBUG)
+        except Exception:
+            print("game.advance_turn executed")
+        # MGlog: close Execution turn before seat advances
+        try:
+            if str(getattr(self, "phase", "") or "") == "Execution":
+                from core import mglog
+
+                mglog.log_turn_end(self)
+        except Exception:
+            pass
         # DCard scoreboard: end of this player's turn → move x (new) into y (playable).
         # Must run while the finishing player is still current.
         try:
@@ -11501,6 +12392,14 @@ class Game:
         self.ai_execution_stage = ""
         self.current_ai_execution_plan = []
         self.current_ai_decision_trace = []
+        # P2: clear ephemeral Q2 markers on the seat that just finished
+        try:
+            from core.strategy_dirty import clear_turn_ephemeral_dirty
+
+            leaving = self.get_current_player()
+            clear_turn_ephemeral_dirty(leaving)
+        except Exception:
+            pass
         try:
             self.pending_human_twp_offer = None
             self.human_twp_accepted_this_turn = set()
@@ -11534,6 +12433,12 @@ class Game:
                     # Initial placement has just completed. Save a full game
                     # snapshot immediately so test.py can load this position.
                     self.sync_round_turn()
+                    try:
+                        from core import mglog
+
+                        mglog.log_ip_complete(self)
+                    except Exception:
+                        pass
                     saved_game_name = self.save_game()
                     if MG:
                         with open(FILENAME_MG, "a", encoding="utf-8") as f:
@@ -11637,11 +12542,26 @@ class Game:
             f.write("\n")
 
     def save_screenshot(self) -> None:
-        """Save a screenshot of the game window via the GUI."""
+        """Save a screenshot of the game window via the GUI.
+
+        No-op when headless / no presentation GUI is attached (Phase A).
+        """
         if FNFREQ == "Y":
             with open(FILENAME_FREQ, "a") as f:
                 f.write(f"{self.id} | {self.state} | game.py | save_screenshot\n")
-        self.gui.save_screenshot()
+        try:
+            from core.batch.null_gui import is_gui_presentation_enabled
+
+            if not is_gui_presentation_enabled(self):
+                return
+        except Exception:
+            pass
+        gui = getattr(self, "gui", None)
+        if gui is None:
+            return
+        saver = getattr(gui, "save_screenshot", None)
+        if callable(saver):
+            saver()
 
 
     def _json_safe(self, value: Any) -> Any:
@@ -11771,12 +12691,37 @@ class Game:
         except Exception:
             pass
 
+    def _should_auto_save_completed_round(self, completed_round: int) -> bool:
+        """Whether to snapshot after this Execution round finishes.
+
+        Policy:
+          - ``CHECK_MODE=True`` (dig-in): every completed Execution round.
+          - ``CHECK_MODE=False`` (normal / headless lab): **no** mid-game
+            end-of-round saves (not every 5 rounds either).
+          - IP-end and game-over saves are handled elsewhere (always),
+            including when ``NO_GUI_AT_ALL_TF=True``.
+        """
+        try:
+            r = int(completed_round or 0)
+        except Exception:
+            return False
+        if r <= 0:
+            return False
+        try:
+            from core.debug_mode import is_check_mode
+
+            return bool(is_check_mode())
+        except Exception:
+            return False
+
     def _auto_save_end_of_round(self, completed_round: int) -> str:
         """Persist a full snapshot after the last player finishes a round.
 
         Called from ``advance_turn`` when Execution turn N (player 4 of 4)
         completes and the game has already stepped to the next round / P1.
-        Safe no-op when game_over.
+        Safe no-op when game_over or round is not on the save cadence
+        (``CHECK_MODE`` dig-in only). Also takes a screenshot when a save
+        runs (NullGui no-ops headless).
         """
         if bool(getattr(self, "game_over", False)):
             return ""
@@ -11785,6 +12730,8 @@ class Game:
         except Exception:
             r = 0
         if r <= 0:
+            return ""
+        if not self._should_auto_save_completed_round(r):
             return ""
 
         timestamp = datetime.now().strftime("%d_%b_%Y_%H_%M_%S")
@@ -11801,6 +12748,11 @@ class Game:
             except Exception:
                 pass
             return ""
+
+        try:
+            self.save_screenshot()
+        except Exception:
+            pass
 
         try:
             self.last_auto_save_path = path
@@ -11826,6 +12778,69 @@ class Game:
                 pass
         return str(path or "")
 
+    def _auto_save_game_over(self, win_result: Optional[Mapping[str, Any]] = None) -> str:
+        """Persist a full snapshot when a winner is declared.
+
+        Always runs (GUI and headless / ``NO_GUI_AT_ALL_TF``). Idempotent:
+        skips if ``last_game_over_save_path`` is already set for this game.
+        Screenshot is best-effort (NullGui no-ops).
+        """
+        if bool(getattr(self, "_game_over_save_done", False)):
+            return str(getattr(self, "last_game_over_save_path", "") or "")
+
+        winner_id = None
+        try:
+            if isinstance(win_result, Mapping):
+                winner_id = win_result.get("winner_id")
+        except Exception:
+            winner_id = None
+        if winner_id is None:
+            try:
+                winner_id = self._player_id_or_none(getattr(self, "winner", None))
+            except Exception:
+                winner_id = None
+
+        timestamp = datetime.now().strftime("%d_%b_%Y_%H_%M_%S")
+        if winner_id is not None:
+            filename = f"Saved_Game_{timestamp}_GameOver_P{int(winner_id)}.txt"
+        else:
+            filename = f"Saved_Game_{timestamp}_GameOver.txt"
+
+        try:
+            path = self.save_game(filename)
+        except Exception as exc:
+            print(f"Auto-save game over failed: {exc}")
+            try:
+                self.emit_twitter_event(None, "Auto-save failed at game over")
+            except Exception:
+                pass
+            return ""
+
+        try:
+            self._game_over_save_done = True
+            self.last_game_over_save_path = path
+            self.last_auto_save_path = path
+        except Exception:
+            pass
+
+        try:
+            self.save_screenshot()
+        except Exception:
+            pass
+
+        print(f"✅ Auto-saved game over: {path}")
+        try:
+            self.emit_twitter_event(None, "Auto-saved game over")
+        except Exception:
+            pass
+        if MG:
+            try:
+                with open(FILENAME_MG, "a", encoding="utf-8") as f:
+                    f.write(f"game.py | _auto_save_game_over | → {path}\n")
+            except Exception:
+                pass
+        return str(path or "")
+
     def save_game(self, filename: str = "") -> str:
         """
         Save the complete game state to a Saved_Game txt file.
@@ -11833,8 +12848,15 @@ class Game:
         Filename format when filename is omitted:
             Saved_Game_23_Apr_2025_09_53_50_R2T1.txt
 
-        End-of-round auto-saves use:
+        End-of-round auto-saves (CHECK_MODE dig-in only) use:
             Saved_Game_<timestamp>_EndRound{N}.txt
+
+        Game-over auto-saves (always, including headless) use:
+            Saved_Game_<timestamp>_GameOver_P{id}.txt
+
+        Bare basenames (and omitted names) are written under ``saved_games/``
+        (see ``SAVED_GAMES_DIR``). Absolute paths or paths with a directory
+        component are respected as given.
 
         The saved file is JSON inside a .txt file. It contains game state,
         board state, player state, dashboards, turn details, development-card
@@ -11844,6 +12866,22 @@ class Game:
         if not filename:
             filename = f"Saved_Game_{timestamp}_R{self.round}T{self.turn}.txt"
 
+        # Route bare basenames into saved_games/ so the project root stays tidy.
+        try:
+            from pathlib import Path as _Path
+
+            _p = _Path(str(filename))
+            if _p.is_absolute() or len(_p.parts) > 1:
+                out_path = _p if _p.is_absolute() else (_Path.cwd() / _p)
+            else:
+                out_path = _Path(SAVED_GAMES_DIR) / _p.name
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            write_path = str(out_path)
+            meta_filename = out_path.name
+        except Exception:
+            write_path = str(filename)
+            meta_filename = os.path.basename(write_path) or str(filename)
+
         for player in self.players:
             player.recalculate_victory_points()
             self.update_strategy_dashboard(player)
@@ -11852,7 +12890,7 @@ class Game:
             "schema": "CatanSavedGame",
             "version": 1,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
-            "filename": filename,
+            "filename": meta_filename,
             "game": {
                 "sequence_number": self.sequence_number,
                 "id": self.id,
@@ -11863,6 +12901,7 @@ class Game:
                 "state_2": self.state_2,
                 "round": self.round,
                 "turn": self.turn,
+                "seed": getattr(self, "seed", None),
                 "dice_roll": self._json_safe(self.dice_roll),
                 "dice_rolls": self._json_safe(self.dice_rolls),
                 "dice_roll_history": self._json_safe(self.dice_roll_history),
@@ -11916,11 +12955,11 @@ class Game:
             "turn_event_ledger": self._save_turn_event_ledger(),
         }
 
-        with open(filename, "w", encoding="utf-8") as f:
+        with open(write_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, sort_keys=True)
 
-        print(f"✅ Saved game to {filename}")
-        return filename
+        print(f"✅ Saved game to {write_path}")
+        return write_path
 
     def load_game(self, filename: str, *, strict: bool = True) -> Dict[str, Any]:
         """
@@ -11959,6 +12998,18 @@ class Game:
         self.state_2 = str(game_data.get("state_2", self.state_2))
         self.round = int(game_data.get("round", self.round))
         self.turn = int(game_data.get("turn", self.turn))
+        # WP-R1: restore seed metadata (do not re-seed RNG on load — replay uses dice list later)
+        try:
+            raw_seed = game_data.get("seed", game_data.get("game_seed", None))
+            if raw_seed is None or raw_seed == "":
+                self.seed = None
+                self.game_seed = None
+            else:
+                self.seed = int(raw_seed)
+                self.game_seed = self.seed
+        except Exception:
+            self.seed = getattr(self, "seed", None)
+            self.game_seed = getattr(self, "game_seed", self.seed)
         self.dice_roll = tuple(game_data["dice_roll"]) if isinstance(game_data.get("dice_roll"), list) else game_data.get("dice_roll", self.dice_roll)
         self.dice_rolls = [tuple(x) if isinstance(x, list) else x for x in game_data.get("dice_rolls", self.dice_rolls)]
         self.dice_roll_history = game_data.get("dice_roll_history", self.dice_roll_history)

@@ -970,14 +970,16 @@ def log_ai_monopoly_plan(game: Any, plan: Dict[str, Any]) -> Dict[str, Any]:
         pass
 
     try:
-        if bool(getattr(game, "execution_debug_print_tf", False)):
-            print(
-                "AI Monopoly plan "
-                f"[P{plan.get('player_id')}] window={window} "
-                f"legal={plan.get('legal')} play={plan.get('play')} "
-                f"timing={plan.get('timing')} reason={plan.get('reason')} "
-                f"r={plan.get('resource_name')} score={plan.get('score')}"
-            )
+        from core.console import execution_debug_print
+
+        execution_debug_print(
+            game,
+            "AI Monopoly plan "
+            f"[P{plan.get('player_id')}] window={window} "
+            f"legal={plan.get('legal')} play={plan.get('play')} "
+            f"timing={plan.get('timing')} reason={plan.get('reason')} "
+            f"r={plan.get('resource_name')} score={plan.get('score')}",
+        )
     except Exception:
         pass
 
@@ -1350,6 +1352,23 @@ def execute_ai_play_monopoly(
             )
     except Exception:
         pass
+    try:
+        from core import mglog
+
+        mono_rc_in = [0, 0, 0, 0, 0]
+        if total_taken > 0 and 0 <= ridx < 5:
+            mono_rc_in[ridx] = int(total_taken)
+        mglog.log_play_dcard(
+            game,
+            player,
+            CARD_TYPE,
+            resource_index=ridx,
+            resource_name=res_name,
+            total_taken=total_taken,
+            rc_in=mono_rc_in,
+        )
+    except Exception:
+        pass
 
     slice_d = None
     cont = getattr(game, "continue_action_selection_after_action", None)
@@ -1435,12 +1454,14 @@ def execute_ai_play_monopoly(
         pass
 
     try:
-        if bool(getattr(game, "execution_debug_print_tf", False)):
-            print(
-                "AI Monopoly EXECUTE "
-                f"[P{result.get('player_id')}] {message} "
-                f"state={result.get('state_after')}"
-            )
+        from core.console import execution_debug_print
+
+        execution_debug_print(
+            game,
+            "AI Monopoly EXECUTE "
+            f"[P{result.get('player_id')}] {message} "
+            f"state={result.get('state_after')}",
+        )
     except Exception:
         pass
 

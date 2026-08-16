@@ -293,13 +293,23 @@ def open_game_over_panel(game: Any, *, win_result: Optional[Dict[str, Any]] = No
             "statistics": None,
         }
     )
-    # S7b: freeze Overview/Dice/deck tables at open so toggles stay stable
+    # S7b: freeze Overview/Dice/deck tables at open so toggles stay stable.
+    # S8: optional MGLOG_STATS_ON_GAME_OVER → MGlog offline tables (fallback live).
     try:
-        from core.game_statistics import collect_endgame_statistics
+        from core.mglog_statistics import collect_endgame_statistics_for_ui
 
-        state["statistics"] = collect_endgame_statistics(game, post_game_state=state)
+        state["statistics"] = collect_endgame_statistics_for_ui(
+            game, post_game_state=state
+        )
     except Exception:
-        state["statistics"] = None
+        try:
+            from core.game_statistics import collect_endgame_statistics
+
+            state["statistics"] = collect_endgame_statistics(
+                game, post_game_state=state
+            )
+        except Exception:
+            state["statistics"] = None
     try:
         game.post_game_ui = state
     except Exception:
@@ -476,14 +486,26 @@ def _color_rgb(name: str) -> Tuple[int, int, int]:
     return PLAYER_COLOR_RGB.get(str(name or ""), COLORS.get("DGRAY", (100, 100, 100)))
 
 
+def _ensure_fonts() -> None:
+    """Product fonts: Comic Sans MS via Font.SMALL / NORMAL / LARGE."""
+    try:
+        Font.initialize_fonts()
+    except Exception:
+        pass
+
+
 def _font_small():
+    """Body / table text — same as scoreboard small labels."""
+    _ensure_fonts()
     try:
         return Font.SMALL.value["regular"]
     except Exception:
-        return pygame.font.SysFont("Comic Sans MS", 12)
+        return pygame.font.SysFont("Comic Sans MS", 10)
 
 
 def _font_normal():
+    """Normal body / Resource Potential style text."""
+    _ensure_fonts()
     try:
         return Font.NORMAL.value["regular"]
     except Exception:
@@ -491,6 +513,8 @@ def _font_normal():
 
 
 def _font_normal_bold():
+    """Section headers (Overview, Activity, …)."""
+    _ensure_fonts()
     try:
         return Font.NORMAL.value["bold"]
     except Exception:
@@ -498,10 +522,20 @@ def _font_normal_bold():
 
 
 def _font_large():
+    """Titles / button-sized labels — same family as Play / Continue buttons."""
+    _ensure_fonts()
     try:
         return Font.LARGE.value["regular"]
     except Exception:
-        return pygame.font.SysFont("Comic Sans MS", 22)
+        return pygame.font.SysFont("Comic Sans MS", 24)
+
+
+def _font_large_bold():
+    _ensure_fonts()
+    try:
+        return Font.LARGE.value["bold"]
+    except Exception:
+        return pygame.font.SysFont("Comic Sans MS", 24, bold=True)
 
 
 def _draw_toggle_button(
@@ -526,9 +560,12 @@ def _draw_toggle_button(
         fill = COLORS.get("DGRAY", (100, 100, 100))
     pygame.draw.rect(WIN, fill, rect)
     pygame.draw.rect(WIN, border, rect, 2)
-    font = _font_normal()
-    # Shrink label if needed
+    # Same size ladder as live Play / Continue / re-play GO buttons
+    font = _font_large()
     text_surf = font.render(label, True, text_c)
+    if text_surf.get_width() > rect.width - 6:
+        font = _font_normal()
+        text_surf = font.render(label, True, text_c)
     if text_surf.get_width() > rect.width - 6:
         font = _font_small()
         text_surf = font.render(label, True, text_c)
@@ -638,14 +675,19 @@ def collect_dice_stats(game: Any) -> Dict[str, Any]:
 
 def _endgame_statistics_snapshot(game: Any, st: Optional[Mapping] = None) -> Dict[str, Any]:
     """Return (and optionally cache) the S7a/S7b statistics bundle."""
-    from core.game_statistics import collect_endgame_statistics
-
     state = st if isinstance(st, Mapping) else (_state(game) if game is not None else {})
     cached = state.get("statistics") if isinstance(state, Mapping) else None
     if isinstance(cached, Mapping) and cached.get("overview_rows") is not None:
         # Refresh dice/deck cheaply if frozen mid-game? Prefer freeze at open.
         return dict(cached)
-    snap = collect_endgame_statistics(game, post_game_state=state)
+    try:
+        from core.mglog_statistics import collect_endgame_statistics_for_ui
+
+        snap = collect_endgame_statistics_for_ui(game, post_game_state=state)
+    except Exception:
+        from core.game_statistics import collect_endgame_statistics
+
+        snap = collect_endgame_statistics(game, post_game_state=state)
     try:
         if game is not None:
             ui = _state(game)

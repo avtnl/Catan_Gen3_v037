@@ -974,14 +974,16 @@ def log_ai_yop_plan(game: Any, plan: Dict[str, Any]) -> Dict[str, Any]:
         pass
 
     try:
-        if bool(getattr(game, "execution_debug_print_tf", False)):
-            print(
-                "AI YOP plan "
-                f"[P{plan.get('player_id')}] window={window} "
-                f"legal={plan.get('legal')} play={plan.get('play')} "
-                f"timing={plan.get('timing')} reason={plan.get('reason')} "
-                f"pick={plan.get('resource_names')} target={plan.get('target_action')}"
-            )
+        from core.console import execution_debug_print
+
+        execution_debug_print(
+            game,
+            "AI YOP plan "
+            f"[P{plan.get('player_id')}] window={window} "
+            f"legal={plan.get('legal')} play={plan.get('play')} "
+            f"timing={plan.get('timing')} reason={plan.get('reason')} "
+            f"pick={plan.get('resource_names')} target={plan.get('target_action')}",
+        )
     except Exception:
         pass
 
@@ -1304,6 +1306,21 @@ def execute_ai_play_yop(
     except Exception:
         pass
     try:
+        from core import mglog
+
+        yop_rc_in = [0, 0, 0, 0, 0]
+        yop_rc_in[a] += 1
+        yop_rc_in[b] += 1
+        mglog.log_play_dcard(
+            game,
+            player,
+            CARD_TYPE,
+            resource_indices=[a, b],
+            rc_in=yop_rc_in,
+        )
+    except Exception:
+        pass
+    try:
         delta_fn = getattr(game, "record_turn_delta", None)
         if callable(delta_fn):
             delta = {}
@@ -1402,12 +1419,14 @@ def execute_ai_play_yop(
         pass
 
     try:
-        if bool(getattr(game, "execution_debug_print_tf", False)):
-            print(
-                "AI YOP EXECUTE "
-                f"[P{result.get('player_id')}] {message} "
-                f"target={plan.get('target_action')} state={result.get('state_after')}"
-            )
+        from core.console import execution_debug_print
+
+        execution_debug_print(
+            game,
+            "AI YOP EXECUTE "
+            f"[P{result.get('player_id')}] {message} "
+            f"target={plan.get('target_action')} state={result.get('state_after')}",
+        )
     except Exception:
         pass
 

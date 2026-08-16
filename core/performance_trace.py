@@ -294,6 +294,14 @@ def should_auto_save_phase0_for_pipeline(
     enabled_global = bool(PHASE0_AUTO_SAVE_ENABLED)
     per_game = getattr(game, "phase0_auto_save_enabled", None)
     enabled = enabled_global if per_game is None else bool(per_game)
+    # Lab / fair-play: no auto Phase0 dumps when CHECK_MODE is off.
+    try:
+        from core.debug_mode import is_check_mode
+
+        if not is_check_mode():
+            enabled = False
+    except Exception:
+        pass
     out: Dict[str, Any] = {
         "should_save": False,
         "enabled": enabled,
@@ -305,6 +313,13 @@ def should_auto_save_phase0_for_pipeline(
     }
     if not enabled:
         out["reason"] = "disabled"
+        try:
+            from core.debug_mode import is_check_mode
+
+            if not is_check_mode():
+                out["reason"] = "check_mode_false"
+        except Exception:
+            pass
         return out
     try:
         if bool(getattr(game, "phase0_save_busy", False)):
@@ -536,6 +551,24 @@ def _emit_spike_event(game: Any, entry: Mapping[str, Any]) -> None:
         pass
 
 
+def attach_span_meta(bag: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Merge kwargs into a ``timed_span`` bag's ``meta`` (recorded on exit).
+
+    Top-level keys on the bag are **not** recorded — only ``bag["meta"]``.
+    Safe no-op when bag is missing or not a dict.
+    """
+    if not isinstance(bag, dict):
+        return {}
+    meta = bag.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        bag["meta"] = meta
+    for key, value in kwargs.items():
+        if value is not None:
+            meta[key] = value
+    return meta
+
+
 @contextmanager
 def timed_span(
     game: Any,
@@ -550,7 +583,8 @@ def timed_span(
 
         with timed_span(game, "refresh_strategy_context") as span:
             ...
-            span["meta"]["reason"] = reason
+            attach_span_meta(span, reason=reason, path="true_light")
+            # or: span["meta"]["reason"] = reason
     """
     ensure_perf_fields(game)
     bag: Dict[str, Any] = {"meta": dict(meta) if isinstance(meta, Mapping) else {}}
@@ -560,6 +594,12 @@ def timed_span(
     finally:
         ms = (time.perf_counter() - t0) * 1000.0
         extra = bag.get("meta") if isinstance(bag.get("meta"), dict) else {}
+        # Allow late top-level keys (legacy callers) to merge into meta once.
+        for key, value in list(bag.items()):
+            if key in ("meta", "ms", "name") or value is None:
+                continue
+            if key not in extra:
+                extra[key] = value
         record_perf_span(
             game,
             name,
@@ -567,6 +607,83 @@ def timed_span(
             meta=extra,
             emit_spike=emit_spike,
         )
+
+
+def _agg_span_ms(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    mss: List[float] = []
+    for r in rows:
+        try:
+            mss.append(float(r.get("ms") or 0.0))
+        except Exception:
+            mss.append(0.0)
+    if not mss:
+        return {"count": 0, "total_ms": 0.0, "max_ms": 0.0, "mean_ms": 0.0}
+    total = sum(mss)
+    return {
+        "count": len(mss),
+        "total_ms": round(total, 2),
+        "max_ms": round(max(mss), 2),
+        "mean_ms": round(total / len(mss), 2),
+    }
+
+
+def _is_l0_refresh_meta(meta: Mapping[str, Any]) -> bool:
+    if not isinstance(meta, Mapping):
+        return False
+    if bool(meta.get("l0_true_light")):
+        return True
+    if str(meta.get("path") or "") in ("true_light", "l0", "hand_only"):
+        return True
+    if str(meta.get("mode") or "").lower() in ("hand_only", "l0", "hand"):
+        return True
+    return False
+
+
+def summarize_strategy_refresh_perf(
+    history: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """P1 WP4: split strategy refresh spans into L0 true-light vs L2 full.
+
+    Looks at ``refresh_strategy_context`` (outer) and ``l0_strategy_update``
+    (inner). Useful for batch/TO forensics and Phase0 dig-in.
+    """
+    rows = [dict(x) for x in (history or []) if isinstance(x, Mapping)]
+    outer_l0: List[Mapping[str, Any]] = []
+    outer_l2: List[Mapping[str, Any]] = []
+    inner_l0: List[Mapping[str, Any]] = []
+    geo_hits = 0
+    hand_rescores = 0
+    multi_way = 0
+    for r in rows:
+        name = str(r.get("name") or "")
+        meta = r.get("meta") if isinstance(r.get("meta"), Mapping) else {}
+        if name == "l0_strategy_update":
+            inner_l0.append(r)
+            if bool(meta.get("geo_cache_hit")):
+                geo_hits += 1
+            if bool(meta.get("hand_rescore")):
+                hand_rescores += 1
+            try:
+                wc = int(meta.get("way_count") if meta.get("way_count") is not None else len(meta.get("ways") or []))
+            except Exception:
+                wc = 0
+            if wc > 1:
+                multi_way += 1
+        elif name == "refresh_strategy_context":
+            if _is_l0_refresh_meta(meta):
+                outer_l0.append(r)
+            else:
+                outer_l2.append(r)
+
+    return {
+        "refresh_strategy_l0": _agg_span_ms(outer_l0),
+        "refresh_strategy_l2": _agg_span_ms(outer_l2),
+        "l0_strategy_update": _agg_span_ms(inner_l0),
+        "l0_geo_cache_hits": int(geo_hits),
+        "l0_hand_rescores": int(hand_rescores),
+        "l0_multi_way_spans": int(multi_way),  # should stay 0 under true-light
+        "l0_single_way_ok": bool(multi_way == 0),
+    }
 
 
 def summarize_perf(
@@ -595,12 +712,24 @@ def summarize_perf(
         key=lambda b: (float(b.get("max_ms") or 0), float(b.get("total_ms") or 0)),
         reverse=True,
     )
-    return {
+    out: Dict[str, Any] = {
         "span_count": len(rows),
         "unique_names": len(by_name),
         "top_spans": ranked[: max(1, int(top_n or 10))],
         "total_ms": round(sum(float(r.get("ms") or 0) for r in rows), 2),
     }
+    # P1 WP4: always attach L0/L2 strategy split when any refresh spans present
+    try:
+        strat = summarize_strategy_refresh_perf(rows)
+        if (
+            int(strat.get("refresh_strategy_l0", {}).get("count") or 0)
+            + int(strat.get("refresh_strategy_l2", {}).get("count") or 0)
+            + int(strat.get("l0_strategy_update", {}).get("count") or 0)
+        ) > 0:
+            out["strategy_refresh"] = strat
+    except Exception:
+        pass
+    return out
 
 
 def snapshot_perf_for_phase0(game: Any) -> Dict[str, Any]:
@@ -614,6 +743,11 @@ def snapshot_perf_for_phase0(game: Any) -> Dict[str, Any]:
         game.last_perf_summary = summary
     except Exception:
         pass
+    strategy_refresh = None
+    try:
+        strategy_refresh = summarize_strategy_refresh_perf(history)
+    except Exception:
+        strategy_refresh = None
     return {
         "ai_pipeline_busy": bool(getattr(game, "ai_pipeline_busy", False)),
         "ai_pipeline_busy_reason": str(getattr(game, "ai_pipeline_busy_reason", "") or ""),
@@ -623,6 +757,7 @@ def snapshot_perf_for_phase0(game: Any) -> Dict[str, Any]:
         "last_perf_trace": last,
         "perf_history_tail": history[-40:],
         "perf_summary": summary,
+        "strategy_refresh_perf": strategy_refresh,
         # P2-C
         "perf_pipeline_gen": int(getattr(game, "_perf_pipeline_gen", 0) or 0),
         "perf_auto_save_ms": float(PERF_AUTO_SAVE_MS),

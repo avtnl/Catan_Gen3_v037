@@ -1257,7 +1257,33 @@ def estimate_first_payable_turn(
         Before future timing, check whether the current real hand can already
         pay the full action cost after legal whole bank/port trades. If yes,
         return turns=0.0 and confidence=1.0.
+
+    P5: when continuous trading is enabled and NumPy is available, uses
+    ``core.eh_numpy`` for the search loop (same public result shape).
     """
+    # P5 NumPy path (continuous trading only; integer zero-turn still inside kernel)
+    if continuous_trading:
+        try:
+            from core.eh_numpy import estimate_first_payable_turn_np, numpy_eh_available
+
+            if numpy_eh_available():
+                np_result = estimate_first_payable_turn_np(
+                    current_hand,
+                    production_pips,
+                    need,
+                    trade_rates,
+                    confidence_target=confidence_target,
+                    num_players=num_players,
+                    step=step,
+                    max_turns=max_turns,
+                    continuous_trading=True,
+                    require_confidence=require_confidence,
+                )
+                if isinstance(np_result, dict):
+                    return np_result
+        except Exception:
+            pass
+
     hand = clean_vector(current_hand)
     pips = clean_vector(production_pips)
     need_v = clean_vector(need)

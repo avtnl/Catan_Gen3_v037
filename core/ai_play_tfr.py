@@ -907,16 +907,18 @@ def log_ai_tfr_plan(game: Any, plan: Dict[str, Any]) -> Dict[str, Any]:
         pass
 
     try:
-        if bool(getattr(game, "execution_debug_print_tf", False)):
-            print(
-                "AI TFR plan "
-                f"[P{plan.get('player_id')}] window={window} "
-                f"legal={plan.get('legal')} play={plan.get('play')} "
-                f"timing={plan.get('timing')} reason={plan.get('reason')} "
-                f"score={plan.get('score')} rule={plan.get('rule')} "
-                f"free_roads={plan.get('free_roads_available')} "
-                f"roads={plan.get('road_ids')} path_ok={plan.get('road_path_ok')}"
-            )
+        from core.console import execution_debug_print
+
+        execution_debug_print(
+            game,
+            "AI TFR plan "
+            f"[P{plan.get('player_id')}] window={window} "
+            f"legal={plan.get('legal')} play={plan.get('play')} "
+            f"timing={plan.get('timing')} reason={plan.get('reason')} "
+            f"score={plan.get('score')} rule={plan.get('rule')} "
+            f"free_roads={plan.get('free_roads_available')} "
+            f"roads={plan.get('road_ids')} path_ok={plan.get('road_path_ok')}",
+        )
     except Exception:
         pass
 
@@ -1553,6 +1555,17 @@ def execute_ai_play_tfr(
             )
     except Exception:
         pass
+    try:
+        from core import mglog
+
+        mglog.log_play_dcard(
+            game,
+            player,
+            CARD_TYPE,
+            payload=f"roads_total={len(to_place)}",
+        )
+    except Exception:
+        pass
 
     placed: List[List[int]] = []
     failed: List[Dict[str, Any]] = []
@@ -1600,9 +1613,10 @@ def execute_ai_play_tfr(
             slice_d = {"ok": False, "reason": str(exc)}
     else:
         try:
+            # Roads already placed: milestone/board geometry — not pure hand (P1 WP3)
             ref = getattr(game, "refresh_strategy_after_event", None)
             if callable(ref):
-                ref("after_ai_play_tfr", kind="hand")
+                ref("after_ai_play_tfr", kind="milestone")
             else:
                 ref2 = getattr(game, "refresh_strategy_context", None)
                 if callable(ref2):
@@ -1667,13 +1681,15 @@ def execute_ai_play_tfr(
         pass
 
     try:
-        if bool(getattr(game, "execution_debug_print_tf", False)):
-            print(
-                "AI TFR EXECUTE "
-                f"[P{result.get('player_id')}] reason={result.get('reason')} "
-                f"placed={placed} failed={len(failed)} "
-                f"state={result.get('state_after')}"
-            )
+        from core.console import execution_debug_print
+
+        execution_debug_print(
+            game,
+            "AI TFR EXECUTE "
+            f"[P{result.get('player_id')}] reason={result.get('reason')} "
+            f"placed={placed} failed={len(failed)} "
+            f"state={result.get('state_after')}",
+        )
     except Exception:
         pass
 

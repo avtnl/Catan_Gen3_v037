@@ -178,6 +178,26 @@ class Player:
         self.last_specials_divert: Optional[Dict[str, Any]] = None
         self.last_specials_assess: Optional[Dict[str, Any]] = None
 
+        # Phase C2 WP-R0: explicit Victory-Way / L2 reassess triggers (OR of entries).
+        # Each entry is an int code, or [code, param...] for parameterized codes.
+        # Codes: 0=none, 1=on_vp_gain, 2=on_eta_setback, 3=on_target_hard_invalid,
+        #   4=every_n_own_turns as [4, n] (n own turns), 5=milestones.
+        # Examples: [0]; [1, [4, 5]]; [1, 2, 3, [4, 2]].
+        # Product default [0]. See docs/PhaseC2_way_reassess_experiment_plan.md
+        # and core/explicit_142_recalc.py. Triggers + always-best: strategy_explicit_recalc (WP-R3).
+        self.explicit_142_recalc: List[Any] = [0]
+        self.explicit_142_recalc_norm: List[Dict[str, Any]] = [{"code": 0}]
+        # Explore dig-in (WP-R3): distinct way ids used this game
+        self.ways_used_this_game: List[int] = []
+        self.way_switch_count: int = 0
+        # WP-R3 runtime latches (pending codes, own-turn counter, session)
+        self.explicit_recalc_runtime: Dict[str, Any] = {}
+        self.explicit_l2_session: bool = False
+        self.last_explicit_trigger: Optional[Dict[str, Any]] = None
+        self.last_way_reassess_compare: Optional[Dict[str, Any]] = None
+        # WP-R5: first Victory-Way fit snapshot (once per seat at first lock)
+        self.first_way_fit: Optional[Dict[str, Any]] = None
+
         # Strategy instances (Gen2 style) populated by core/strategy.initialize or on first update_strategy
         # self.strategy.append(Strategy(...))  # done post-init to avoid import cycles
         w = h = 67
@@ -262,6 +282,19 @@ class Player:
             with open(FILENAME_MG, "a") as f:
                 f.write(f"player.py | build_structure | {structure} at {location} by player {self.id} "
                         f"(settlements: {len(self.settlements)}, cities: {len(self.cities)})\n")
+
+        # MGlog: cover any path that uses Player.build_structure (legacy/tests)
+        try:
+            from core import mglog
+
+            game = getattr(self, "game", None)
+            if game is not None:
+                if structure == "road":
+                    mglog.log_build(game, "road", self, road=location)
+                else:
+                    mglog.log_build(game, structure, self, target_id=location)
+        except Exception:
+            pass
 
         return True
 
@@ -673,6 +706,14 @@ class Player:
             "last_specials_assess": _json_safe(
                 getattr(self, "last_specials_assess", None)
             ),
+            "explicit_142_recalc": _json_safe(
+                getattr(self, "explicit_142_recalc", [0])
+            ),
+            "ways_used_this_game": _json_safe(
+                getattr(self, "ways_used_this_game", [])
+            ),
+            "way_switch_count": int(getattr(self, "way_switch_count", 0) or 0),
+            "first_way_fit": _json_safe(getattr(self, "first_way_fit", None)),
             "distance_map": _json_safe(self.distance_map),
             "min_distance_map_for_targeted_TWs": _json_safe(self.min_distance_map_for_targeted_TWs),
             "path_map": _json_safe(self.path_map),
@@ -836,6 +877,37 @@ class Player:
         self.last_specials_assess = _as_optional_dict(
             _get("last_specials_assess", getattr(self, "last_specials_assess", None))
         )
+
+        # Phase C2: explicit_142_recalc (default [0] if missing in older saves)
+        try:
+            from core.explicit_142_recalc import set_player_explicit_142_recalc
+
+            set_player_explicit_142_recalc(
+                self, _get("explicit_142_recalc", getattr(self, "explicit_142_recalc", [0]))
+            )
+        except Exception:
+            self.explicit_142_recalc = [0]
+            self.explicit_142_recalc_norm = [{"code": 0}]
+        _ways = _get("ways_used_this_game", getattr(self, "ways_used_this_game", []))
+        if isinstance(_ways, list):
+            try:
+                self.ways_used_this_game = [int(x) for x in _ways if x is not None]
+            except Exception:
+                self.ways_used_this_game = list(_ways)
+        else:
+            self.ways_used_this_game = []
+        try:
+            self.way_switch_count = int(
+                _get("way_switch_count", getattr(self, "way_switch_count", 0)) or 0
+            )
+        except Exception:
+            self.way_switch_count = 0
+        # WP-R5 first-way fit
+        _fwf = _get("first_way_fit", getattr(self, "first_way_fit", None))
+        if isinstance(_fwf, dict):
+            self.first_way_fit = dict(_fwf)
+        else:
+            self.first_way_fit = None
 
         # Outlook is optional. Rehydrate one Outlook object when possible.
         saved_outlooks = _get("outlook", None)

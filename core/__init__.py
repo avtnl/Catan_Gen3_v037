@@ -1,13 +1,33 @@
 """
-Core module for the Catan game.
-This module imports key classes for game logic, board management, and initial placement phase.
-Classes:
-    Board: Manages the game board layout and state.
-    Player: Represents a player with resources and game statistics.
-    Game: Handles game state, player interactions, and turn progression.
-    InitialPlacement: Manages the initial placement phase for settlements and roads.
+Core package for the Catan game.
+
+Exports Board, Player, Game, InitialPlacement. Imports are **lazy** so lab tools
+(e.g. Phase C CS probe under ``core.batch``) can import without pulling pygame
+via ``core.game``.
 """
-from .board import Board
-from .player import Player
-from .game import Game
-from .initial_placement_phase_manager import InitialPlacement
+
+from __future__ import annotations
+
+from typing import Any
+
+__all__ = ["Board", "Player", "Game", "InitialPlacement"]
+
+
+def __getattr__(name: str) -> Any:
+    if name == "Board":
+        from .board import Board
+
+        return Board
+    if name == "Player":
+        from .player import Player
+
+        return Player
+    if name == "Game":
+        from .game import Game
+
+        return Game
+    if name == "InitialPlacement":
+        from .initial_placement_phase_manager import InitialPlacement
+
+        return InitialPlacement
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

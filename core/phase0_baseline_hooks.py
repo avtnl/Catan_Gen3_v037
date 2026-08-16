@@ -842,9 +842,15 @@ def _save_phase0_baseline_body(
     for ch in '<>:"/\\|?*':
         safe_label = safe_label.replace(ch, "_")
 
-    # Prefer project cwd; also keep a second absolute path note in result
-    path = Path(f"Phase0_AI_Baseline_{safe_label}.json").resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # Write under saved_phase0_files/ (project root) so the repo root stays tidy.
+    try:
+        from core.constants import SAVED_PHASE0_DIR
+
+        out_dir = Path(SAVED_PHASE0_DIR)
+    except Exception:
+        out_dir = Path("saved_phase0_files")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = (out_dir / f"Phase0_AI_Baseline_{safe_label}.json").resolve()
     try:
         with path.open("w", encoding="utf-8") as f:
             json.dump(baseline, f, indent=2, ensure_ascii=False, default=json_default)

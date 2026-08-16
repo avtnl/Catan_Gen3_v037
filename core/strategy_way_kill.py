@@ -559,6 +559,36 @@ def pick_audit_excluding_way(audits: Sequence[Any], blocked_way_id: Optional[int
     return audits[0] if audits else None
 
 
+def pick_audit_excluding_specials(
+    audits: Sequence[Any],
+    *,
+    kill_la: bool = False,
+    kill_lr: bool = False,
+    blocked_way_id: Optional[int] = None,
+) -> Any:
+    """Prefer audits that do not need dead specials; fall back to exclude way_id.
+
+    Used after give-up / S5b when a specials-dead episode is active (WP2).
+    """
+    src = list(audits or [])
+    if not src:
+        return None
+    if kill_la or kill_lr:
+        try:
+            from core.strategy_specials_divert import filter_ways_without_specials
+
+            filtered = filter_ways_without_specials(
+                src, kill_la=bool(kill_la), kill_lr=bool(kill_lr)
+            )
+            if filtered:
+                return filtered[0]
+        except Exception:
+            pass
+    if blocked_way_id is not None:
+        return pick_audit_excluding_way(src, blocked_way_id)
+    return src[0]
+
+
 def format_way_kill_dbg(meta: Mapping[str, Any]) -> str:
     if not meta:
         return "way_kill: n/a"

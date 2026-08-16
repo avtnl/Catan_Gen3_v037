@@ -1018,13 +1018,15 @@ def _log_choice(game: Any, choice: Mapping[str, Any]) -> None:
     except Exception:
         pass
     try:
-        if bool(getattr(game, "execution_debug_print_tf", False)):
-            print(
-                "AI DCard choice "
-                f"[P{choice.get('player_id')}] window={choice.get('window')} "
-                f"play={choice.get('play')} chosen={choice.get('chosen')} "
-                f"reason={choice.get('reason')} score={choice.get('score')}"
-            )
+        from core.console import execution_debug_print
+
+        execution_debug_print(
+            game,
+            "AI DCard choice "
+            f"[P{choice.get('player_id')}] window={choice.get('window')} "
+            f"play={choice.get('play')} chosen={choice.get('chosen')} "
+            f"reason={choice.get('reason')} score={choice.get('score')}",
+        )
     except Exception:
         pass
 
@@ -1110,12 +1112,14 @@ def maybe_execute_ai_dcard_choice(
         except Exception:
             pass
         try:
-            if bool(getattr(game, "execution_debug_print_tf", False)):
-                print(
-                    "AI DCard execute "
-                    f"[P{choice.get('player_id')}] chosen={choice.get('chosen')} "
-                    f"ok={executed.get('ok')} reason={executed.get('reason')}"
-                )
+            from core.console import execution_debug_print
+
+            execution_debug_print(
+                game,
+                "AI DCard execute "
+                f"[P{choice.get('player_id')}] chosen={choice.get('chosen')} "
+                f"ok={executed.get('ok')} reason={executed.get('reason')}",
+            )
         except Exception:
             pass
     return choice

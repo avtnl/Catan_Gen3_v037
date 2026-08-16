@@ -313,11 +313,35 @@ def _execute_selected_road(game: Any, road: RoadId, *, free: bool = False) -> Ma
     return {"ok": False, "reason": "missing_execute_human_build_road_action", "road_id": list(road)}
 
 
-def _refresh_after_build(game: Any) -> None:
+def _strategy_already_refreshed_after_action(game: Any) -> bool:
     try:
-        refresh_strategy = getattr(game, "refresh_strategy_context", None)
-        if callable(refresh_strategy):
-            refresh_strategy("after_human_build_road", force=True)
+        slice_d = getattr(game, "last_slice_d_result", None)
+        if isinstance(slice_d, Mapping) and slice_d.get("ok") is True:
+            return True
+    except Exception:
+        pass
+    try:
+        last = getattr(game, "last_execution_result", None)
+        if isinstance(last, Mapping):
+            sd = last.get("slice_d")
+            if isinstance(sd, Mapping) and sd.get("ok") is True:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _refresh_after_build(game: Any) -> None:
+    """Rescan + GUI; no force=True L2 (P1 WP3). Game executors usually already Slice-D."""
+    try:
+        if not _strategy_already_refreshed_after_action(game):
+            ref = getattr(game, "refresh_strategy_after_event", None)
+            if callable(ref):
+                ref("after_human_build_road", kind="milestone")
+            else:
+                refresh_strategy = getattr(game, "refresh_strategy_context", None)
+                if callable(refresh_strategy):
+                    refresh_strategy("after_human_build_road", mode="auto")
     except Exception:
         pass
     try:

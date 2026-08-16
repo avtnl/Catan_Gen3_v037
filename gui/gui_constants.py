@@ -34,29 +34,100 @@ Dependencies:
 """
 import pygame
 from pathlib import Path
-from typing import Dict, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 from enum import Enum
 from core.constants import MG, FILENAME_MG
 
-# Debug print to confirm file loading
-print(f"Loading gui_constants.py from: {__file__}")
+# Import-time path banner: headless dig-in only (DEBUG / -v). Interactive stays quiet.
+try:
+    from core.console import digin, DEBUG, is_no_gui
+
+    if is_no_gui():
+        digin(f"Loading gui_constants.py from: {__file__}", level=DEBUG)
+except Exception:
+    pass
+
+
+# Optional override: True/False force on/off; None → follow NO_GUI_AT_ALL_TF.
+# Re-play GUI sets True so Continue SFX work even when headless default is on.
+_AUDIO_FORCE: Union[bool, None] = None
+
+
+def set_audio_force(enabled: Optional[bool]) -> None:
+    """Force audio on/off (``True``/``False``), or ``None`` to clear override."""
+    global _AUDIO_FORCE
+    _AUDIO_FORCE = enabled
+
+
+def is_audio_enabled() -> bool:
+    """Return True when sound effects may play.
+
+    Policy:
+      - If ``set_audio_force(True/False)`` was used, that wins.
+      - Else ``NO_GUI_AT_ALL_TF=False`` → sounds on; ``True`` → sounds off.
+    """
+    global _AUDIO_FORCE
+    if _AUDIO_FORCE is not None:
+        return bool(_AUDIO_FORCE)
+    try:
+        import core.constants as _cc
+
+        return not bool(getattr(_cc, "NO_GUI_AT_ALL_TF", False))
+    except Exception:
+        return True
+
+
+def _project_root_for_assets() -> Path:
+    """``gui/gui_constants.py`` → project root (parent of ``gui/``)."""
+    return Path(__file__).resolve().parents[1]
+
+
+def _sound_file_path(rel: str) -> Path:
+    """Resolve sound path relative to project root (cwd-independent)."""
+    p = Path(rel)
+    if p.is_file():
+        return p
+    cand = _project_root_for_assets() / rel
+    return cand
+
+# Specs survive re-init: initialize_fonts() replaces Enum .value with Font dicts.
+_FONT_SPECS = {
+    "SMALL": ("Comic Sans MS", 10),
+    "NORMAL": ("Comic Sans MS", 16),
+    "LARGE": ("Comic Sans MS", 24),
+}
+
 
 class Font(Enum):
     """Enumeration for font sizes."""
-   
+
     SMALL = ("Comic Sans MS", 10)
     NORMAL = ("Comic Sans MS", 16)
     LARGE = ("Comic Sans MS", 24)
+
     @classmethod
     def initialize_fonts(cls) -> None:
-        """Initialize Pygame font module and create font objects with bold variants."""
+        """Initialize Pygame font module and create font objects with bold variants.
+
+        Idempotent across ``pygame.quit()`` / re-init cycles: after the first call
+        each member's ``.value`` is a ``{regular, bold}`` dict; later calls re-read
+        name/size from ``_FONT_SPECS`` instead of unpacking that dict.
+        """
         if not pygame.font.get_init():
             pygame.font.init()
         for font in cls:
-            font_name, size = font.value
+            spec = _FONT_SPECS.get(font.name)
+            if spec is not None:
+                font_name, size = spec
+            else:
+                val = font.value
+                if isinstance(val, dict):
+                    # Fallback: already converted and missing from _FONT_SPECS
+                    continue
+                font_name, size = val
             font._value_ = {
-                "regular": pygame.font.SysFont(font_name, size, bold=False),
-                "bold": pygame.font.SysFont(font_name, size, bold=True)
+                "regular": pygame.font.SysFont(font_name, int(size), bold=False),
+                "bold": pygame.font.SysFont(font_name, int(size), bold=True),
             }
 
 # class Font(Enum):
@@ -150,22 +221,118 @@ class Sound(Enum):
 SOUNDS: Dict[str, pygame.mixer.Sound] = {}
 """Dictionary mapping sound effect names to Pygame Sound objects."""
 
-def initialize_sounds() -> None:
+
+def initialize_sounds(*, force: bool = False) -> int:
     """Initialize sound effects and populate the SOUNDS dictionary.
 
-    Args:
-        None
+    No-op when audio is disabled (unless ``force=True``, which also calls
+    ``set_audio_force(True)``). Paths are resolved from the project root so
+    loading does not depend on process cwd.
+
+    Returns the number of successfully loaded sound objects.
     """
-    if not pygame.mixer.get_init():
-        pygame.mixer.init()
+    if force:
+        set_audio_force(True)
+    if not is_audio_enabled():
+        SOUNDS.clear()
+        return 0
+    try:
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+    except Exception:
+        return 0
+    loaded = 0
     for sound in Sound:
+        path = _sound_file_path(str(sound.value))
         try:
-            SOUNDS[sound.name] = pygame.mixer.Sound(str(Path(sound.value)))
-        except FileNotFoundError:
+            if not path.is_file():
+                raise FileNotFoundError(str(path))
+            SOUNDS[sound.name] = pygame.mixer.Sound(str(path))
+            loaded += 1
+        except Exception:
             SOUNDS[sound.name] = None
             if MG:
-                with open(FILENAME_MG, "a") as f:
-                    f.write(f"gui_constants.py | initialize_sounds | Missing sound file: {sound.value}\n")
+                try:
+                    with open(FILENAME_MG, "a") as f:
+                        f.write(
+                            f"gui_constants.py | initialize_sounds | "
+                            f"Missing/bad sound file: {path}\n"
+                        )
+                except Exception:
+                    pass
+    return loaded
+
+
+def ensure_replay_audio() -> int:
+    """F1: enable + load sounds for interactive re-play (headless-safe override).
+
+    Call after ``pygame.display.set_mode`` / importing ``WIN`` so the mixer is
+    (re)initialized with a display present — needed on some Windows setups.
+    """
+    set_audio_force(True)
+    try:
+        # Display may have been created after an earlier mixer.init(); re-init.
+        try:
+            if pygame.mixer.get_init():
+                pygame.mixer.quit()
+        except Exception:
+            pass
+        pygame.mixer.init()
+    except Exception:
+        pass
+    return initialize_sounds(force=True)
+
+
+def play_sound(name: str, fallback: str = "BUTTON") -> bool:
+    """Play a named sound effect if audio is enabled and the asset exists.
+
+    Preferred choke-point for all UI/core sound playback. Returns True when a
+    sound was started; False when muted, missing, or on any error.
+    """
+    if not is_audio_enabled():
+        return False
+    key = str(name or "").strip()
+    fb = str(fallback or "").strip()
+    if not key and not fb:
+        return False
+    try:
+        if not any(v is not None for v in SOUNDS.values()):
+            initialize_sounds()
+        sound = SOUNDS.get(key) if key else None
+        if sound is None and fb:
+            sound = SOUNDS.get(fb)
+        if sound is None:
+            # Lazy one-shot load of the requested key
+            for candidate in (key, fb):
+                if not candidate:
+                    continue
+                try:
+                    rel = Sound[candidate].value
+                except Exception:
+                    continue
+                path = _sound_file_path(str(rel))
+                if path.is_file():
+                    try:
+                        sound = pygame.mixer.Sound(str(path))
+                        SOUNDS[candidate] = sound
+                        break
+                    except Exception:
+                        continue
+        if sound is None:
+            return False
+        if not pygame.mixer.get_init():
+            try:
+                pygame.mixer.init()
+            except Exception:
+                return False
+        play = getattr(sound, "play", None)
+        if callable(play):
+            play()
+            return True
+        pygame.mixer.Sound.play(sound)
+        return True
+    except Exception:
+        return False
 
 class Image(Enum):
     """Enumeration for image asset paths and sizes."""
@@ -713,6 +880,12 @@ ROBBER_AVAILABLE_TILE_HIGHLIGHT_RADIUS: int = 35
 
 ROBBER_AVAILABLE_STEAL_TARGET_RADIUS: int = 20
 """Radius of player-colored circles for human steal-target choices."""
+
+DCARD_HEADER_PLAY_PULSE_RADIUS: int = 24
+"""Pulse radius around the shared scoreboard DCard header icon after a play (full seat-turn)."""
+
+DCARD_HEADER_ICON_CENTER_Y: int = 560
+"""Y-center of the shared DCard header 30x30 icons (must match update_scoreboard blit)."""
 
 # Keep this intentionally unannotated. Some pygame type stubs expose
 # pygame.Rect as a factory rather than a type, which can make VS Code/Pylance

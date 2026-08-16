@@ -1,0 +1,1008 @@
+Summary
+We built an unattended multi-game path: run_headless.py + HeadlessGameRunner + GameManager, which can run more games after each other in one batch. With NO_GUI_AT_ALL_TF=True and four AI seats, batches write per-game result.json and batch_summary.json (wins, stuck/error, dice, give-up/salvage dig fields, etc.).
+
+Initially the performance (=time to run) such a batch was pretty long. Therefore we spend quite some time and effort performance improvement.  Runtime improved from roughly ~1–2 min/game toward ~30 s/game on recent product-scale runs (perf work on Strategy-Engine / L2 policy paths).
+
+After running a batch, which played multiple games, we should assess each individual game regarding and check if the Strategy-Engine did what it is supposed to do. However we don't have the time to do so, which is what a CS-probe is made (CS =  Change Strategy). The CS-probe looks for changes in Victory-Ways and changes in sticky target withing a selected Victory-Way. If such cases are detected, these are reported, so we can spend time assessing the most interesting individual games to check if the Strategy-Engine is doing what it is supposed to do. We used digs to tune when to re-plan (setbacks, product sticky/explicit-recalc policy) rather than relying only on manual full-game review. We optimized the L2 reset for each AI Player, after ETA setback and after 4 own turns (default: [2,[4,4]]). This means we actively check once again the best strategy, given the current circumstances (both Victory-Way and sticky target), every 4 own turns. 
+
+We made a LA/LR probe as well. This probe looks for game situations where the selected game strategy to keep pursuing LA and/or LR should be abondonned because it is quite clear that an opponent is unstoppable in achieving and pertaining LA and/or LR. Again these game situations are reported so that we can spend time assessing those interesting games to check if the Strategy-Engine is doing what it is supposed to do. Based on multiple smoke tests we defined theta (θ) and optimised this for LA and LR seperately. Theta (θ) is the give-up threshold for LA or LR: “how hopeless does the race look before we abandon that special (LA/LR)?”
+
+After focussing on pillar A (gods_view), one other thing came to mind and that is that there might be situations where none of the 142 Victory_Ways is feasible anymore. In such cases the objective should be to gain as much victory points asap, ignoring the component that can never be achieved. If LR can't be achieved: 1) Find a viable Victory-Way not having  LR as component, 2) If no such Victory-Way is feasible, find a Victory-Way, ignore LR and find the Victory-Way where a) it is feaible to achieve the remaining components AND b) still least number of own turn is needed to do so. All this is implemented as "Give-up escape + partial Victory-Way salvage". The core fix here is that after give-up, the Strategy-Engine must not re-lock a dead special (LA/LR) forever. Escape (specials-dead episode, portfolio filter, force-adopt, sticky gates) plus partial salvage: 1) Prefer Victory-Ways that never needed the dead components (T1), 2) If none, strip dead components and rank residual need by least own-turns (T2) and 3) Sticky carries partial_plan / ignored_components (S4); expansion death is geometry-fair (S5/S5b); digs record adopts and switch quality (S7/S7a, G6). Needed implementations: S0-S7 + D0-D7 + G0-G6. Note: S8 (VP scrape when T1/T2 empty) waits for digs showing the need to implement.
+
+After this we focussed on 2 other open issues: 1) Product matched A/B (ops/science) and 2) Optional hard WdB stress dig. 3) Once completed we could focus on pillar B (players_view) and implement L4 & L5.
+Ad 1) Product matched A/B: shared dice library (product_lib_n100), control with escape off (product_ctrl_n100), treat with escape on (in progress). Goal: measure whether escape/salvage changes stability, fires, salvage/switches, and wins under matched dice — ops/science, not missing probe code.
+Ad 2) Optional hard WdB stress dig: not re-run as a new post-escape stress campaign; Domain C hard WdB was already frozen earlier (lr_lab_wdb_n100) and reused offline for L4/L5. Live escape/salvage stress leaned on mild LR lab + product A/B. Hard WdB re-stress remains optional if we want current-stack fires/salvage on the hard map.
+Ad 3) was done as well, more details below.
+
+The LA/LR-probe detected features that are implemented in the AI players logic applied when playing a game. Examples: b) Giving up LA and/or LR ambitions and b) Ignoring LA and/or LR component in selected Victory-Way (knowing this component can not successfully be achieved, however no other Victory-Way needs this low number of own turns before acquiring the remaning number of VPs. Does the CS-probe changed any logic, which is applied by AI players when playing a game or is all instrumental and focussing on detection/ reporting? Below all situations were LA/LR-probe logic impacts individual games: 
+1. Give up LA/LR ambition (L6 θ) — your (a)
+2. Escape: never re-sticky the dead special
+Ad 2) After give-up: do not re-lock the dead special (escape)
+┌─────────────────┬───────────────────────────────────────────┐
+│ Piece           │ In-game effect                            │
+├─────────────────┼───────────────────────────────────────────┤
+│ specials_dead_  │ Seat remembers “LA dead” and/or “LR dead” │
+│ episode         │ for this episode                          │
+├─────────────────┼───────────────────────────────────────────┤
+│ Portfolio hard  │ L2 / board override drops Victory-Ways    │
+│ filter          │ that still need the dead special          │
+├─────────────────┼───────────────────────────────────────────┤
+│ Sticky gate     │ Blocks re-commit to a way that still      │
+│                 │ needs kill_la / kill_lr                   │
+├─────────────────┼───────────────────────────────────────────┤
+│ GIVEUP_FORCE_   │ Forces S5.5-style divert even if soft     │
+│ DIVERT          │ assess lags θ                             │
+└─────────────────┴───────────────────────────────────────────┘
+    Example line for talks: “Probe θ fires give-up; escape makes the AI switch to a non-LA way instead of sticky-re-locking way 88 every refresh.”
+3. T1: switch to another Victory-Way without that special
+4. T2 residual strip: keep way family, ignore LA/LR component — your (b)
+5. Clear la_progress / lr_project so BA stops chasing the special project
+6. One fire / episode so give-up doesn’t thrash
+Ad 6) One fire per episode (thrash control)
+    After L6 fires under escape, la_giveup_fired / lr_giveup_fired block another L6 fire for that special until the kill flag is released.
+    Example: “Without this, digs showed dozens of LR give-up fires per game as salvage/sticky thrashed; with it, at most one L6 fire per kill episode.”
+7. S5b / S5.5 hopeless kill/divert (rule-based siblings in the same sub-engine)
+Ad 7) Cheap / enriched “already dead” kills (same sub-engine family)
+    These predate or sit beside pure θ, but Phase L aligned, digged, and integrated them with probe features and escape:
+┌───────────┬──────────────────────────────┬──────────────────┐
+│ Mechanism │ Trigger (sketch)             │ Live effect      │
+├───────────┼──────────────────────────────┼──────────────────┤
+│ S5b way-  │ Gap too large (LA gap≥3 +    │ Kill current     │
+│ kill      │ weak catch-up; LR gap≥4 no   │ special way,     │
+│           │ claim) or LA stack tiny      │ force replan     │
+├───────────┼──────────────────────────────┼──────────────────┤
+│ S5.5      │ Hopeless / unstoppable       │ Divert preferred │
+│ divert    │ opponent (richer residual    │ way off LA and/  │
+│           │ /stack/claim window)         │ or LR            │
+└───────────┴──────────────────────────────┴──────────────────┘
+    Example: “Even before θ fire, S5b can abandon LA when the deck is almost empty and the army gap can’t close.”
+    (Fair to say: probe measured these races; freezes θ for L6; S5b/S5.5 are the rule-based cousins in the same specials sub-engine.)
+    Bottom line: Your two examples are correct and central. The main ones people often miss are escape (no re-lock), T1 way switch, project clear, and one-fire thrash control—all live during execution when the LA/LR stack is enabled.
+8. Operator-tunable freezes that change play when flags are on
+Ad 8) Not a separate “behavior type,” but does have real execution impact:
+    • LA_GIVEUP_L2_ENABLED / LR_GIVEUP_L2_ENABLED
+    • θ / dwell / latch profiles (Domain A / C freezes)
+    • GIVEUP_ESCAPE_ENABLED (default True)
+    • salvage flags / T1 expand N
+    Example: “Same dice, treat arm with L6+escape vs control off → different way histories and fire counts (matched A/B).”
+
+An implementation plan was drafted to give up LA and/or LR permanently. This plan is not implemented.
+
+For implementing the pillar B (players_view; L4+L5), we implemented L4-0 to L4-5 and L5-0 to L5-5.
+
+=/=
+Main activities A-G below:
+| Phase | Deliverable | Success criterion |
+|-------|-------------|-------------------|
+| **A** | Headless 4-AI single game | Finishes without window clicks; CS + stats available |
+| **B** | Sound off when NO_GUI_AT_ALL_TF=True + Cleaning printing in Terminal Output	
+| **C** | `GameManager` N games + batch summary | e.g. 10 games, win rates, avg rounds, artifact folder |
+| **D** | Performace (time to process a headleass game)
+| **F** | More cleaning
+| **F** | CS ETA setback analyzer | Report over batch; known setbacks classified |
+| **G** | LA probe / LR probe | Viability & race metrics |
+| **H** | TwP/TwB probes + log upgrades | Efficiency definitions + tests |
+
+A) Add game_manager
+1) I like to kind of wrap or inbed what we have write now in a game_manager. I did something like that in Gen2_v045. The purpose is simple -> I want to run more games after each other in one batch. Obviously we need to track some things including statistics for each game and for the whole batch all together. 2) I like to start using the constant NO_GUI_AT_ALL_TF=True combined with 4 AI players (no human player), meaning we can run a game from start to finish with minimum use of a GUI. 3) I like to define "sniffers"/ "analysers" (perhaps you have a better name) that can look into specific game logs of all games in a batch describe in 2) to search for patterns/ inefficiencies/ potential mistakes in the code/ etc. One example is checking of the CS log (Change Strategy). Each turn we should reduce the number of expected turns to reach 10 VPs. I do expect set-backs. These are mainly caused by lost races, robber impact (blocking resource production and hardly moved or mostly returned to that very same tile), a lot of bad luck having more than 7 RCards and getting forced to discard (due to dice roll = 7), DCard Monopoly impact and may be some more. Examples: 3a) If LA (Largest Army) is one of the components of the leading Victory-Way, I would like to track the buying of DCards, the DCards received, the moment DCards were played and particular the gap of played knights between all players. Here we can test if LA-viability is working correctly or if this can be improved. 3b) We can do the same for LR (=Longest Road) by tracking the development of longest path per player and building efficiencies. 3c) I think here we can build something to do some checking on TwP and TwB quality. I know we don't change Victory-Ways based on changes in RCards, nevertheless over turns we can define algorithms to check how efficient these deals were. Likely we need to define both the algorithms to do the anaylisis/ checking and in parralel improve the log files (and do more testing) to get this really moving. I will stop here. 3 basic idea's. Do you kind of understand what I am aiming for? Do some analysis to familiarize yourself in this project. Pleas tell me where you recommend me to start.
+
+Implementation:
+| WP					| Size 						|
+|----------------------------------	|----------------------------------------	|
+| WP1 NullGui + guards 	| S–M 						|
+| WP2 result 			| S 							|
+| WP3 runner 			| M (most integration risk) 	|
+| WP4 CLI 				| S 							|
+| WP5 tests 				| S–M 						|
+| WP6 docs 				| S 							|
+
+B) Sound off + Cleaning Terminal Output
+I noticed during smoke test that ther was no GUi, but I did keep hearing the sounds correponding to the various actions. I think we should turn these sounds off as well. Another thing that come to mind is to revisit the print statements sent to Terminal. I guess no it is the time for some clean-up and add new and relevant print statement helpfull for this new endeavor. Please fix the sounds right way. NO_GUI_AT_ALL_TF=False is GUI + Sounds and NO_GUI_AT_ALL_TF=True is no GUI + no sounds. Please provide suggestions you to clean an update making print statement to Terminal Output as well.  
+
+Implementation Cleaning Terminal Output:
+1. Add `core/console.py` + wire `HeadlessGameRunner` / `run_headless` only  
+2. Silence or downgrade the worst offenders: `advance_turn executed`, Slice A/B print, Markov dumps under `NO_GUI`
+3. Adding a shared `execution_debug_print` helper and routing all AI DCard dig-in prints through it.
+4. Replace import-time `gui_constants` print  
+5. Optional: action summary line after each successful Continue
+
+Running game_manager:
+run_headless.py.
+## Two different products
+
+| | **`main.py`** | **`run_headless.py`** |
+|--|----------------|------------------------|
+| **What it is** | Interactive game (pygame window) | Lab runner (no play window) |
+| **Who plays** | Human + AI (default P3) *or* whatever you set in constants | Expects **all AI** (`HUMAN_PLAYER=False`, `HP_ID=[]`) |
+| **How you advance** | Clicks: Play / Continue / Roll / … | Automatic: IP + roll + Continue loop |
+| **Sounds** | On if `NO_GUI_AT_ALL_TF=False` | Off if `NO_GUI_AT_ALL_TF=True` |
+| **Batch N games** | No (one session; New Game in UI) | Yes (`--games N`) |
+| **Result JSON** | No | Yes (`result.json` / `batch_summary.json`) |
+
+D) Performance
+D1) In TO_05Aug_004509.txt, the Terminal Output of 2nd testrun dd 5 Aug (3 Games). MG=False and NO_GUI_AT_ALL_TF-False.
+Q0) Please do some analysis regarding performace. 
+
+My take is that performace is still very bad. 1 Game is taking approx 14 min and it should be no more than 1 min. Hnce a couple of questions, below.
+See TO_04Aug_010548.txt (Terminal Output of 1st testrun dd 4 Aug - 3 Games) and TO_05Aug_004509.txt (Terminal Output of 2nd testrun dd 5 Aug - 3 Games).
+Q1) Why do we have 2 line regarding saving at the end of a round in Terminal?; Example:
+✅ Saved game to Saved_Game_05_Aug_2026_00_44_40_EndRound13.txt
+✅ Auto-saved end of round 13: Saved_Game_05_Aug_2026_00_44_40_EndRound13.txt
+I see that only 1 file is saved or is it over-written in Explorer?
+Saved_Game_05_Aug_2026_00_44_40_EndRound13
+Q2) How much time is needed to save a file at the end of a round? Is this done once or twice?
+Q3) I see quite a number of files (Explorer) of type: Phase0_AI_Baseline_auto_slow_xxxms_RxxTx_PxColor (JSON Source File). How much time is needed to save such a file?
+Q4) In Terminal I see quite a number of times: DBG recompute_longest_road [after_ai_build_road]. How long does it take to recompute longest road? Most certainly in early game/ midgame longest path for each player is pretty easy to track. Check Gen2_045 who this was done using Path.
+
+Q5) What are the files of type Phase0_AI_Baseline_auto_slow_xxxms_RxxTx_PxColor (JSON Source File) telling us? Please do some tourough analysis.
+
+Q6) For example what are the 2 line below telling us? What are steps? Wahat is "contunue ok", "adv"?
+headless: steps=275 R19T4 state=ActionSelection continue ok=True adv=False act=Build settlement
+headless: finished status=won steps=275 duration_s=1013.27 error=None
+
+I understand that Markov takes about 30 sec. within Initial Placement, per game. But 1 rond in the Execution phase should take only a couple of seconds.
+Q7) Any idea why the average time for 1 round for the first couple of rounds takes far more time than average time for 1 round for the rounds at the end of the game.
+
+Pick a JSON Source file, perferrable in early game, where a targeted settlement was just built, meaning we had to update taget and perahps victory_way.
+Q8) Share resource production for that player after building the targetted settlement; menaing total pips in format [Wh,O, Wd, B, Sh).
+Q9) Share new target(s) and the estimated turns to get there.
+Q10) Share victory-way (id) tied to these new targets and the estimated turns to get to this victory-way.
+Q11) Is estimated turns of Q10 minus estimated turns of Q9, approximately the estimated turns to this victory-way after sucessfully achieving the next target?  
+I want to do some checking regarding Turns-Estimator, hense Q8-Q11.
+
+D2) Do you have ideas how we can 1) improve the performance of these repeated multi second strategy refreshes. The performance of Catanatron (B. Collazo) seems to be excellent due to using JSON everywhere. Different format, different structure, different archtecture, can vecorize and use GPU instead of CPU and 2 how can we potentially reduce the number of repeated multi second strategy refreshes, for instance by advance filtering?
+
+D3) Are we addressing d) in below? Might impact P1, P2 or P3! A. Stop paying L2 when L0 is enough (highest leverage) -> Indeed no heavy calculations if only RCards in hand changed (no building and/or buying). If AI Player has enough RCards to buy and d) bolow applies than I have no issue with executing the heavy calculation. Stated before (so repeating)-> When to reconsider strategy/way (=heavy calculation):
+a) Target is achieved and a next target needs to be set. If player has no viable actions, finding new target should happen at the beginning of players next turn (doing this right away is no always efficient due to b) and c) which could apply to more opponents in the same round (if all opponents make an meaningful move, we should avoid looking for a new strategy/way per turn and simply flag the significance and at the start of players turn, test the flag (significance) and explore a new strategy/way once!
+b) Opponent built something on the playboard which b1) prevents the execution of target or b2) increases the risk of gotten beaten by opponent and therefore not being able/ successful to achieve target, that it makes sense to reconsider strategy/ way, right away at the start of players turn.
+c) Opponent acquired LA or LR or made significant progress in acquiring LA (another Knight played) or LR (1 or more roads added to longest path of opponent), that a strategy succesfully acquiring LA and/or LR is low. In such circumstances it - once again -  makes sense to reconsider strategy/ way, right away  at the start of players turn.
+d) Player has the opportunity to build road + settlement/ settlement/ city or buy a DCard, which is not part/listed as a component of current strategy/way. In these cases we need to compare the expected turns to win of the targeted strategy/way with the various strategies/ ways having this component (= adhering to the reality check that potential LA and/or LR is viable). If one of these strategies/ways reduces the expected turns to win, significantly (*),  it - once again -  makes sense to reconsider strategy/ way, right away  at the start of players turn. (* = we shold avoid marginal improvement and keep switching between 2 or more scenario's, where expected turns to win keeps being marginally better). 
+
+D4) Are vialble actions scanned after each TwP/ TwB action? If so, we should match these viable actions with components listed in selected Victory-Way. Calculate L2 if player has enough RCards to buy new-settlement or city, not listed as component in selected Victory-Way. Q1) Do you agree or is this conflicting something? If player has enough RCards to buy DCard and player is not in race and has no target to upgrade to city and buying DCard is not listed as component in selected Victory-Way, buy DCard but no L2 (simply wait for next turn; drawn DCards are not playable right away). Q2) Do you agree or is this conflicting something?
+
+Implementation:
+## Updated roadmap (practical order) — with Q1/Q2
+
+| Phase | Action | Notes |
+|-------|--------|--------|
+| **P0** | `CHECK_MODE=False` → no Phase0; end-of-round only **R5/10/15…** (+ IP + game over) | **Done** |
+| **P1** | True-light L0: hand-only RCard change → **no L2**; sticky-way ETA only | After TwP/TwB: **always rescan** (already) |
+| **P1+Q1** | After scan: affordable **settlement or city** **not** on selected Victory-Way/sticky → **L2 once** (OK same turn before BA) | Off-way **structure** only |
+| **P1+Q2** | Affordable **DCard** not on way: may **buy**, **no L2**; don’t starve sticky city/settle or **races** (specific road, specific settle, LA, LR, last DCards). DCard not playable same turn | Opportunistic buy |
+| **P2** | Coalesce dirty flags; one heavy job when possible | a/b/c → flag → explore at **own turn start** |
+| **P3** | L2 only: (a) need next target, (b) blocked/race worse, (c) LA/LR shock, (d) **Q1** off-way settle/city — never for pure TwP/TwB/hand or off-way DCard alone | Align S14-2 with Q1 |
+| **P4** | Filter 142 → top K; portfolio cap 3 in fast mode | Cheaper L2 |
+| **P5** | NumPy EH; profile; optional GPU later | Structural |
+
+**Race** = contest for: **specific road**, **specific settlement**, **LA**, **LR**, or **last DCards**.
+
+Full text is under **MANUAL.md → Multi-game batch / Strategy refresh roadmap**.
+
+D5) We agreed to calculate L2 at the start of every turn, but I think we need to revise this.
+- No L2 at the start of a turn if:
+- No road was built by an opponent, not already listed in players WAYS or PLAN.
+- No road was built by an opponent threatening target LR.
+- No settlement was built by an opponent, not already listed in players WAYS or PLAN.
+- No DCard bought by player in previous turn (Q2).
+- Player didn't build a settlement, city targetted in previous turn without calculation new L2.
+- No DCard was bought by opponent threatening target LA or need for remaning DCard VP in DCard deck.
+Does this impact P2-P5?
+
+D6) L2 flag is per player, right? L2 flags relevant issues after players turn and relevant issues of all 3 opponent turns following, right? 
+
+Implementation (continued):
+### What P3 is
+**Freeze *why* L2 may run** — not redoing P1/P2, not cheapening L2 (that’s P4/P5).
+
+### Closed L2 table (core of the plan)
+
+| Id | When |
+|----|------|
+| **(a)** Need next target | Own planned structure done |
+| **(b)** Target blocked / race worse | Plan-relevant opp settle/city/road (P2 dirt) |
+| **(c)** LA/LR shock | Army/road races, LA DCard/knight, relevant robber |
+| **(d)** Q1 | Mid-turn off-way settle/city → L2 once |
+| + cold / hard / dig-in | No way; sticky dead; Phase0/F9 |
+
+**Never L2 alone:** hand, TwP/TwB, Q2 DCard, off-plan opp builds, own Q2 buy.
+
+### Also in the plan
+- **Per-player** bags; dirt accumulates over opponent turns → **one** L2 at your next auto  
+- **Single gate:** `should_run_l2_explore`  
+- Fix **reason map** (e.g. `opponent_road` → `race_worse`, not always `la_lr_shock`)  
+- **S14-2** only inside L2; Q1 is (d); no mid-L0 S14-2  
+- Call-site audit for leftover `force=True` / explore  
+- Status bag `l2_policy.bucket` for dig-in  
+- Tests + docs WPs  
+
+### Not P3
+P4 (top-K / cheaper portfolio), P5 (NumPy EH).
+
+E) More Cleaning
+I added 2 folders: "saved_games" and "saved_phase0_files". Let's change the code such that new saved games and phase0-files get saved in the corresponding folders right away. This to keep the root nice and tidy.
+
+F) Change Strategy Probe
+Your original sniffer pitch still matches Phase C: *ETA should trend down; classify expected setbacks* (lost races, robber, forced discards on 7, Monopoly, …), then LA/LR probes later as Phase D.
+
+This (batch) probe should also look into 1) the moment Victory_Way changed and the reason for doing so. I can think of: a) lost race for road, b) lost race for settlement, c) built settlment by opponent blocking initial target (S@xx) and d) taken off-way opportunity. I don't think that successfully achieving a target or component in target should change Victory-Way. 2) the moment (sticky) target changed, obviously a)-d) above can change (sticky) target, additionally e) successfully achieving a target or component in target. Does this make sence? Did I forget to list situation that should be included in either 1) or 2)?
+
+Implementation:
+### Work packages
+1. **WP-C0** — load CS + fixtures  
+2. **WP-C1** — detect setbacks  
+3. **WP-C2** — classify + unit tests  
+4. **WP-C3** — `scripts/analyze_cs_setbacks.py` + `setback_report.json`  
+5. **WP-C5** — MANUAL / AGENTS  
+6. **WP-C4** *(optional)* — per-batch CS path / richer event tags if unknown rate stays high
+
+What is reported:
+Four event families + aggregates:
+
+| Family | What is detected | What each event carries |
+|--------|------------------|-------------------------|
+| **Setbacks (C-ETA)** | Samples with `delta_turns ≥ threshold` (default 1.0) | ΔETA, way/target context, **setback class** (robber, discard_7, monopoly, way_switch, build_spent, estimator_jump, unknown, …), confidence, evidence |
+| **Way changes (C-WAY)** | Victory-Way / sticky way changed (or first lock) | prev/new `way_id`, **way_change class** (race_road, race_settle, target_blocked, offway, way_kill, specials_shock, soft_eta_switch, hard_invalid, first_lock, unknown, …) |
+| **Target changes (C-TGT)** | Sticky rec-target id/kind changed (or first lock) | prev/new target, **target_change class** (achieve_settle/city/component, block, races, same_way_rerank, way_switch_cascade, …) |
+| **Anomalies** | Policy smells across the above | Codes like `anomaly_way_change_on_achieve`, hand-only way change, Q2 way change, optional target thrash |
+
+Every event also has identity for dig-in: **`game_id`, `sequence_number`, `player_id`, `round`, `turn`**, plus CS `reason` / `sample_kind` and short **`evidence[]`**.
+
+Analyzing results:
+F1) See TO_05Aug_202630.txt, Terminal Output of a batch having 25 games. CHECK_MODE=True. Q1) Do some performance analysis. Q2) Do some win analysis. Q3) How to I launch the CS probe?
+
+F2) I did run py -3.13 scripts/analyze_cs_setbacks.py --batch-dir batch_runs/20260805_201452_batch. How do I review the results/ findings?
+
+Your report is already written here:
+
+**`batch_runs/20260805_201452_batch/strategy_probe_report.json`**
+
+(About 6340 CS rows, 25 games.)
+
+---
+
+## 1. Start with what you already saw (console)
+
+That one-pager is the **dashboard**. Read it top-down:
+
+| Block | Question it answers |
+|-------|---------------------|
+| **SETBACK** | How often ETA got worse, and *why classes dominate* |
+| **WAY** | How often Victory-Way changed (and classes) |
+| **TARGET** | Sticky target churn + achieve rate |
+| **ANOMALY** | Policy smells (way-on-achieve, thrash, …) |
+| **worst_game** | Which `game_id` to open first |
+
+**Your batch (from the report on disk):**
+
+| Probe | Finding (high level) |
+|-------|----------------------|
+| SETBACK | 220 events; top: **trade_reprice**, **estimator_jump**, discard_7, dcard, robber…; unknown+estimator rate **~0.22** (OK soft target) |
+| WAY | 100 events, **all `first_lock`** → no mid-game Victory-Way *switches* detected in this batch |
+| TARGET | 489 changes; **achieve ~49%**, many **target_blocked**, some race_road / unknown |
+| ANOMALY | **23 thrash only**; **way_on_achieve = 0** (good vs your policy rule) |
+
+If that story is enough for a first pass, you’re done. For dig-in, use the JSON.
+
+---
+
+## 2. Open the JSON (source of truth)
+
+**Path:**  
+`batch_runs/20260805_201452_batch/strategy_probe_report.json`
+
+Open with:
+
+- **VS Code / Cursor** (search, fold JSON), or  
+- Any editor; file is large (~0.5 MB) but structured.
+
+### Structure
+
+```text
+summary          ← same stats as console (by_class, rates)
+per_game[]       ← one row per game_id (counts, max_delta, winner)
+events_setback[] ← individual setback dig-ins
+events_way[]
+events_target[]  ← capped (e.g. 300 of many)
+events_anomaly[]
+```
+
+### Each event has dig-in identity
+
+Look for:
+
+- `game_id`, `player_id`, `round`, `turn`
+- `primary_class`, `tags`, `confidence`, `evidence`
+- `reason` (strategy refresh reason)
+- `delta_turns` (setbacks)
+- `way_id` / `prev_way_id`, sticky targets when present
+
+---
+
+## 3. Practical review paths
+
+### A) “Is the engine healthy?” (5 minutes)
+
+1. Console / `summary.anomalies`  
+   - **way_on_achieve / hand_only / q2** should stay ~0.  
+   - Your batch: thrash only → no way-policy red flags.
+2. `summary.setbacks.unknown_rate`  
+   - Low/moderate is fine; high → more dig-in on `estimator_jump` / unknown.
+3. `summary.target_changes.achieve_rate`  
+   - Healthy churn includes achieve; yours ~0.5 is plausible.
+
+F3) Just finished a batch with 100 games all using IP algo=2.
+Q1) Do some performance analysis. Q2) Do some win analysis. Q3) What are the highlights of the CS Probe
+Last part of Terminal Output; CHECK_MODE=False.
+GameManager: game 100/100 done status=won winner=1 rounds=26 duration_s=25.502224999989267
+GameManager: batch_summary → C:\Users\avtnl\Documents\Projecten\Python\Catan_Gen3\catan_game_v037\batch_runs\20260805_214449_batch\batch_summary.json
+GameManager: batch CS → C:\Users\avtnl\Documents\Projecten\Python\Catan_Gen3\catan_game_v037\batch_runs\20260805_214449_batch\cs.jsonl
+GameManager: finished completed=100/100 wall_s=2374.5 status_counts={'won': 99, 'max_round': 1, 'stuck': 0, 'error': 0} wins={'1': 31, '2': 10, '3': 33, '4': 25}
+=== Batch summary ===
+  batch_id         = batch_20260805_214449_n100
+  completed        = 100/100
+  status_counts    = {'won': 99, 'max_round': 1, 'stuck': 0, 'error': 0}
+  wins_by_player   = {'1': 31, '2': 10, '3': 33, '4': 25}
+  duration_s_mean  = 23.742460906999476
+  duration_s_wall  = 2374.538580399996
+  rounds_mean      = 23.9
+  steps_mean       = 280.31
+  batch_dir        = C:\Users\avtnl\Documents\Projecten\Python\Catan_Gen3\catan_game_v037\batch_runs\20260805_214449_batch  batch_summary    = C:\Users\avtnl\Documents\Projecten\Python\Catan_Gen3\catan_game_v037\batch_runs\20260805_214449_batch\batch_summary.json
+=====================
+After running: PS C:\Users\avtnl\Documents\Projecten\Python\Catan_Gen3\catan_game_v037> py -3.13 scripts/analyze_cs_setbacks.py --batch-dir batch_runs/20260805_214449_batch       
+Strategy probe | games=100 cs_rows=34098 thr=1.0
+SETBACK  n=1251  top: estimator_jump=290 build_spent=225 trade_reprice=216 discard_7=152 robber=132  (unknown_rate=0.2318)
+WAY      n=400  top: first_lock=400  (switches excl. first_lock=0)
+TARGET   n=2722  top: target_blocked=959 achieve_settle=932 first_lock=409 race_road=220 achieve_city=119  (achieve_rate=0.4544)
+ANOMALY  way_on_achieve=0  hand_only_way=0  q2_way=0  thrash=161
+worst_game: 20260805_221535 (setbacks=11 maxΔ=5.75 anomalies=10)
+  anomaly anomaly_target_thrash g=20260805_215911 P2 R18T2 build_settlement
+  anomaly anomaly_target_thrash g=20260805_221647 P2 R8T2 build_settlement
+  anomaly anomaly_target_thrash g=20260805_221647 P3 R6T3 build_settlement
+wrote: C:\Users\avtnl\Documents\Projecten\Python\Catan_Gen3\catan_game_v037\batch_runs\20260805_214449_batch\strategy_probe_report.json
+
+F4) Picking the right Victory-Way seems very very important given the stickness. Can we assess the quality of first selected Victorry way based on 1) resource production of players first 2 settlments, 2) overall resource availability on the playboard (pips) and 3) the portfolio of new  settlement locations (having distance 2) from initial settlements and its resource production?
+
+F5) How often was L2 calculated on average per game?
+
+F6) Meaning none of these (on average 21) L2 calculations triggered a new Victory-Way deviating from the original over these 100 games, right?
+
+F7) The 100% sticky Victory-Way selected at the start looks suspicious. What I propose is to 1) wire game.dice_roll_history, meaning we track all dice rolls in a given game, 2) if needed add a new attribute game.seed, 3) on a player level allow either 3a) L2 calculation the moment 1 or more VP's are gained or 3b) L2 every own turn. I would say this gives us the ability to compare results and test the quality of initial selected Victory-Way vs. the ability to activily re-assess. We simply play the same 100 games twice and give P2 the ability to use 3a or 3b. Please challenge this line of reasoning.
+
+## Challenges (where the line of reasoning is incomplete or risky)
+
+### 1) `dice_roll_history` is not the sequence you think
+
+In Gen3 today:
+
+| Attribute | What it is |
+|-----------|------------|
+| **`game.dice_rolls`** | List of **(d1, d2)** rolls — the **sequence** |
+| **`game.dice_roll_history`** | Length-13 **histogram** of totals 0–12 (counts), **not** order |
+
+Saved games already serialize both. So “wire dice history for replay” is mostly: **treat `dice_rolls` as the source of truth**, optionally rename/document, not invent a new list from scratch.
+
+**Replay needs the ordered list (or a scripted file via `DICEROLL_SET_TF` / `NAME_DR_FILE`), not the histogram.**
+
+---
+
+### 2) `game.seed` alone does not freeze a Catan game
+
+A single `game.seed` is necessary but **far from sufficient** for “same 100 games twice”:
+
+| Source of randomness | Seeded by `game.seed` today? |
+|----------------------|------------------------------|
+| Dice | Only if you **script** dice or seed the RNG that rolls them |
+| TwP near-tie RNG | Partially (Stage D uses `game_seed` / `seed` when present) |
+| Steal / robber target among ties | Often local `random` |
+| DCard draw order | Deck shuffle at start / reshuffles |
+| Hand-risk Stage D | Seeded when context has seed |
+| Any other `random.*` | Easy to miss |
+
+So: **seed is good plumbing; fixed dice sequence (+ fixed board + fixed deck if needed) is what actually matches games.**  
+Best lab stack:
+
+1. Fixed playboard (you already do),  
+2. **Recorded `dice_rolls` sequence** (or pre-generated file) replayed with `DICEROLL_SET_TF`,  
+3. Optional master seed for residual RNG,  
+4. Log seed + dice path hash on `result.json`.
+
+Without (2), “same 100 games” will **diverge after the first policy difference** even with the same seed, because different actions → different who-gets-robbed / different branches — and also because unseeded RNG still fires.
+
+---
+
+### 3) “Play the same 100 games twice” breaks after the first divergent action
+
+Even with **identical dice**:
+
+- P2 with 3a/3b builds differently → different board → later **legal** options differ.  
+- Opponents still use sticky → they react to P2’s different board.  
+- You are **not** replaying the same *game tree*; you are replaying the same **chance inputs** under two P2 policies.
+
+That is still a valid experiment, but rename it mentally:
+
+> **Same dice + board + IP, different P2 reassess policy**  
+> not “the same game played twice.”
+
+For causal claims, that is actually what you want. Just don’t expect identical round counts or identical P1/P3/P4 lines.
+
+---
+
+### 4) 3a (L2 on +1 VP) and 3b (L2 every own turn) are not pure “reassess Victory-Way” knobs
+
+**L2 ≠ switch way.** You already saw: L2 runs and **still keeps the same way**.  
+
+So:
+
+| Policy | What it actually does | Risk |
+|--------|------------------------|------|
+| **3b L2 every own turn** | Full portfolio + EH often; **may still refuse to switch** if switch needs ETA gain ≥ 1.0 and sticky hard-holds | Expensive; may measure **compute**, not **openness to new ways** |
+| **3a L2 on VP gain** | Fires after own settle/city (and maybe LA/LR VP) | Sparse; misses “I’m stuck for 8 rounds on a dead way” |
+
+If sticky **forbids** switch unless hard-invalid / big ETA gain, then 3a/3b can still yield **~0 way switches** and you’ll falsely conclude “reassess doesn’t help.”
+
+**You must also loosen or instrument the switch gate for the treatment seat**, e.g.:
+
+- Allow way switch on treatment seat with lower `STRATEGY_SWITCH_MIN_ETA_GAIN`, or  
+- Force a **true multi-way compare** and log “best alt vs locked” even if you don’t switch, or  
+- Explicit policy: “on 3a/3b, unlock sticky way and re-pick from top K.”
+
+Otherwise the experiment confounds **“how often we L2”** with **“whether we may change way.”**
+
+---
+
+### 5) VP-gain trigger (3a) is a biased sample of “good” moments
+
+Gaining a VP usually means **the current plan just worked** (settled/citied). Re-assessing then:
+
+- Often **reinforces** the current way (confirmation),  
+- Rarely catches “wrong way, grinding.”
+
+The times you most need re-assess are often:
+
+- ETA rising repeatedly (`estimator_jump` / setbacks),  
+- target thrash / blocked,  
+- specials lost,  
+- many rounds without VP.
+
+So 3a is a weak probe of **initial way quality under failure**. Better companions:
+
+- **3c:** L2 when cumulative setbacks or ΔETA ≥ X,  
+- **3d:** L2 when sticky target hard-invalid,  
+- **3e:** scheduled L2 every N own turns (cheaper than every turn),  
+- **3f:** L2 at fixed milestones (after 2nd settle, after first city, at 6 VP, at 8 VP).
+
+I’d keep 3a as optional, not primary.
+
+---
+
+### 6) Every-own-turn L2 (3b) is heavy and may not answer “first way quality”
+
+Order of magnitude: ~25 rounds × 1 L2 for P2 ≈ **25 L2s/game for one seat** (plus existing L2s). At ~80–130 ms/step overall, pure L2 is a big fraction of turn cost → P2 games slower, batch wall time up, and you mix **speed** with **policy**.
+
+Also: if everyone else is sticky and P2 re-plans every turn, you measure **asymmetric multi-agent dynamics**, not pure “was first way good?”
+
+Stronger design for **first-way quality**:
+
+- **Arm A:** sticky as now (control).  
+- **Arm B:** same dice; P2 may **re-open way only at few gates** (e.g. after each own structure, or every 3 own turns), with **switch allowed**.  
+- Log for P2 at each L2: `locked_way`, `best_alt_way`, `eta_locked`, `eta_alt`, `switched?`.
+
+That separates:
+
+- **Information:** “L2 saw a better way”  
+- **Action:** “we switched”  
+- **Outcome:** win/VP  
+
+---
+
+### 7) Only treating P2 interacts badly with “P2 is the weak seat”
+
+Your 100-game IP2 batch: **P2 ~10% wins**. If you only empower P2:
+
+- Positive result: “reassess helps the weak seat” (great).  
+- Null result: may mean **IP seat/map**, not sticky (P2’s two settles are just bad).  
+- You learn less about **first-way quality for a strong seat**.
+
+Better: run the same dice library with treatment on **P1, P2, P3, P4 in separate arms** (or rotate which seat gets 3x), or treat **all seats** with a cheap reassess policy in one arm.  
+Starting with P2 is fine as a pilot, but don’t over-generalize.
+
+---
+
+### 8) “Quality of initial way” needs fit metrics, not only win rate
+
+Even a perfect reassess policy might not move win rate much if:
+
+- IP already determined fate,  
+- way switches are rare because **no better way exists**,  
+- opponents punish expansion.
+
+Pair the experiment with the **first-way fit** idea (own pips, board pips, d≈2 portfolio). Then:
+
+| Pattern | Interpretation |
+|---------|----------------|
+| Low fit + reassess → more switches + better VP | Sticky was wrong; reassess helps |
+| Low fit + reassess → switches but no better outcome | Board/IP doomed |
+| High fit + reassess → no switch | Sticky was right |
+| High fit + reassess → switch + worse | Switch gate / L2 noise thrash |
+
+Without fit scores, win rate alone is underpowered and confounded.
+
+---
+
+### 9) Sample size and power
+
+100 games with ~10–33% win rates: moving P2 from 10% → 15% is only **+5 wins** — noisy.  
+For a clear seat effect you may want **200–500 matched dice seeds**, or primary metrics **mean VP / mean rank**, not only win rate.
+
+---
+
+### 10) You already have half the dice plumbing
+
+- **`dice_rolls`**: sequence (use this).  
+- **`DICEROLL_SET_TF` + file**: scripted dice (lab standard).  
+- Saves store dice lists.  
+
+What you **lack** for clean A/B:
+
+- Per-game **exported dice sequence** in `result.json` / batch folder,  
+- Headless **replay mode**: load dice list + board + optional seat policy,  
+- Optional **master seed** logged for residual RNG,  
+- **Per-seat L2/switch policy** flags (not only global CHECK).
+
+---
+
+## Sharper experimental design (recommended reshape)
+
+```text
+Library: 100 (or 300) dice sequences + fixed board + all IP algo 2
+         export dice_rolls[] + board id per game_id
+
+Arm Control:   sticky as now (all seats)
+Arm Treat-P2:  same dice; P2 only:
+                 - L2 on schedule (e.g. every 2–3 own turns OR after structure/setback)
+                 - sticky way unlock allowed for P2 (lower switch threshold or force re-rank)
+Arm optional:  same but P3 (strong seat) for comparison
+
+Metrics per arm (matched by dice_id):
+  - P2 win rate, mean VP, mean rank
+  - P2 way switches (count, when, from→to)
+  - At each P2 L2: eta_locked vs eta_best_alt (even if no switch)
+  - first_way_fit at lock vs outcome
+  - setbacks / thrash
+  - wall time / L2 count
+```
+
+**Drop or demote pure 3b** (every turn) until a lighter schedule shows signal.  
+**Keep dice sequence + seed logging**, but **sequence is the spine**.  
+**Loosen switch**, not only fire more L2.
+
+---
+
+## Direct answers to your three pieces
+
+| Proposal | Verdict |
+|----------|---------|
+| **1) Wire dice history** | Use/export **`dice_rolls` sequence**; histogram alone is not enough. Already partly there. |
+| **2) `game.seed`** | Useful for residual RNG; **not** enough alone for matched games. |
+| **3a L2 on VP gain** | Weak primary trigger for testing bad first ways; OK as extra gate. |
+| **3b L2 every own turn** | Expensive; still may not switch ways without policy change. Prefer scheduled L2 + **allowed switch**. |
+| **Same 100 games, only P2 treated** | Good pilot if “same” means **same dice library**; expect divergence after P2’s first different act; P2 is a biased seat. |
+
+---
+
+## Bottom line
+
+- **Yes:** matched dice + asymmetric reassess is the right way to test “100% sticky first way is suspicious.”  
+- **No:** more L2 alone will not prove it if sticky still refuses to change `way_id`.  
+- **Yes:** export/replay **`dice_rolls`**, log **seed**, add **per-seat policy**.  
+- **Challenge hard:** 3a is late/biased, 3b is costly and confounded; “same game twice” is really **same chance inputs**; measure **switch opportunity** (alt ETA) not only switches; don’t only treat weak P2; add **first-way fit** as co-primary.
+
+If you want a next step in-repo, the highest leverage minimal slice is: **export dice sequence on batch results + headless replay-from-dice + per-seat flag `WAY_REASSESS=off|vp|every_n|structure` with switch unlock for that seat** — not full 3b first.
+
+F8) I understand we need game.dice_rolls instead of game.dice_rolls_history. Good to hear this is already wired. Add game.seed. I understand we are not playing the same game We are playing the same playboard + dicerolls. Note: In case a new game is taking longer than the list length of game.dice_rolls, we need to truely throw the dice and add these to game.dice_rolls. If the new game is shorter we need to delete or simply not record the dice_rolls actually not used (due to the shorter game). Let's use the explicit policy regarding L2 for 3a/3b. Should we add new attributes explicit_142_recalc_ (list of int) to each player? explicit_142_recalc=0 means no recalc at all, =1 means recalc when gaining VP (3a), =2 means recalc every own turn (3b), =3 means 3c, etc.(add this to doc_string). Note: A player can have multiple triggers for L2 recalc (example [3,4]. Agree we skip 3b completely; meaning 3c becomes new 3b, 3d becomes new 3c, etc. Add logging of: locked_way, best_alt_way, eta_locked, eta_alt, switched?. Add fit metrics. Complete dice plumbing. Adopt "Sharper experimental design (recommended reshape)". Is this sufficient for you to draft an implementation plan?
+
+Implementation (continued):
+**WP-R1** (`game.seed`)
+**WP-R2** (dice replay).
+**WP-R3** explicit L2 triggers and always-best way pick on reassess. Reviewing the plan and current strategy/L2 wiring.
+**WP-R4** way-reassess compare logging (JSONL + CS fields). Checking the plan and current hooks.
+**WP-R5** (first-way fit metrics). Reviewing the plan and how first way lock is recorded today.
+**WP-R6** batch CLI arms (`--dice-from-batch`, `--explicit-recalc`, arm metadata). Checking the plan and current CLI/batch wiring.
+**WP-R7** matched control-vs-treat way-reassess analyzer. Checking the plan and existing analysis scripts for patterns.
+**WP-R8** consolidating Phase C2 tests and filling coverage gaps. Reviewing the plan and existing tests.
+**WP-R9** documenting Phase C2 in MANUAL, AGENTS, and the plan checklist.
+
+G) LA/LR Probe
+G1) What are your idea's for a LA/LR probe? Start spitting your idea's right way. 2) Mine is written here below: For LA/LR probe we need to distinct 2 views. god_view, where an observer can "see" all Victory-Ways selected by all individual players and see if LA and/or LR is part of this. For each of these compare how well an individual player is doing in achieving this vs. how far off this player is doing in achieving this. The objective is to find a threshold where giving up LA and or LR as a target can be found (2 spearate thresholds by the way). Transfering this threshold to players_view is something we try and deal with later in time. The other view is players_view. Here we need to a) label each opponent as i) having LA ambition (scale: low/ moderate/ high), same for ii) having LR ambition. The hard part is that buying DCards serves 2 purposes (gaining free VP's and gaining knights, which once played support gaining LA). For LR we need to be mindfull of players max of being able to build 15 roads. perhaps keeping track of how long are bought DCards are not played can tell something about DCard being VP. Obviously in players_view we need to find common ground between all players as to finding a threshold for each of them). Adding these thresholds to the Strategy-Engine (as to when give up LA/LR ambition and search for new best Victory-Way) should improve Strategy-Engine quality, which is whay we are having this probe in the first place. 3) Let's combine 1 (your idea's) and 2 (my idea) into 1 draft of what we are aiming for. 
+
+## 1) My ideas (raw, fast)
+
+**A. God-view “ambition vs progress” scoreboard**  
+Per game, per seat, per special (LA / LR):  
+- *On-way?* (locked Victory-Way requires LA and/or LR)  
+- *Progress* (knights played / army rank; roads built / longest path / claim)  
+- *Gap* (turns-to-claim estimate, or discrete “steps left”)  
+- *Outcome* (claimed? stolen? abandoned? still on-way at end?)  
+Offline: when do seats that stay on LA/LR still lose the race → candidate **give-up thresholds**.
+
+**B. Race clock, not just binary on-way**  
+Track **lead / deficit** vs best opponent: knight lead, road-length lead, “first to claim” ETA. Give-up is about **race hopelessness**, not absolute progress alone.
+
+**C. Counterfactual sticky switch**  
+At sample times: if we forced kill LA/LR off-way and re-ranked 142-ways, what was `eta_gain`? Label “should have switched” when gain ≥ X and race gap ≥ Y. Calibrate thresholds to maximize that label’s hit rate (god-view oracle).
+
+**D. Path typology**  
+Separate ways: LA-only, LR-only, both, neither. Different thrash/give-up rates. Don’t one-size-threshold both specials.
+
+**E. Process metrics (already partly there)**  
+Setback on sticky ETA when special is blocked; `way_kill` / divert events; CS `target_changed` near LA/LR milestones. Probe **when** specials divert already fires vs when it should.
+
+**F. Matched batches**  
+Same dice lib, product `[2,[4,4]]`, log specials every N turns + on claim/steal. Offline only first (your god_view → players_view later).
+
+**G. Cheap players_view proxies (later)**  
+Road count + length trajectory; knight plays + buy rate; **hold time** of unplayed DCards; settlement graph “expandability”; public VP. Ambition = latent class (L/M/H) from trajectories, not mind-reading ways.
+
+**H. Don’t start with live SE change**  
+Probe = labels + thresholds + backtest. Wire into Strategy-Engine only after god-view thresholds are stable.
+
+**I. Two thresholds × two specials**  
+LA_giveup, LR_giveup independent; optional “both” interaction term later.
+
+**J. Failure modes to log**  
+False give-up (would have claimed in ≤K turns); false hold (never claim, ETA blows up); thrash (kill/re-add special).
+
+---
+
+## 2) Your idea (compressed, as I hear it)
+
+| View | Job |
+|------|-----|
+| **god_view** | See each seat’s Victory-Way; know if LA/LR is *in* the plan; compare **how far they are toward** LA/LR vs **how far they should be / race state**; find **separate give-up thresholds** for LA and LR. |
+| **players_view** | No way table: label each opponent’s **LA ambition** and **LR ambition** (low/mod/high); hard parts = DCards dual-use (VP vs knights), 15-road cap, unplayed DCard age as VP signal; find **common-ground thresholds** usable by every seat. |
+| **Goal** | Thresholds eventually tell Strategy-Engine: **drop LA/LR ambition, re-solve Victory-Way** → better execution quality. Players_view transfer is **phase 2**. |
+
+---
+
+## 3) Combined draft — what we are aiming for
+
+### Title
+
+**LA/LR Probe (Phase L)** — offline god-view race & give-up thresholds; players_view ambition labels later; SE wiring last.
+
+### Product goal
+
+Reduce **dead specials**: staying on a Victory-Way that needs LA/LR when the race is lost (or never started), so sticky + portfolio **re-aim** earlier. Success = fewer hopeless LA/LR holds, not more LA/LR claims for their own sake. Secondary: shorter games / fewer setbacks when specials were the bottleneck (same spirit as product explicit pace wins).
+
+### Non-goals (v1)
+
+- No live SE change until god-view thresholds validated.  
+- No full opponent mind-read of 142-ways in players_view.  
+- No merging LA and LR into one threshold.  
+- No expansions / 5–6p.
+
+### Two views, one pipeline
+
+```text
+Batch (product default [2,[4,4]], matched dice optional)
+        │
+        ▼
+  Event / sample log (specials + ways + public board)
+        │
+   ┌────┴────┐
+   ▼         ▼
+god_view   players_view (later)
+   │         │
+   ▼         ▼
+LA/LR give-up    opponent ambition L/M/H
+thresholds       (features only)
+   │
+   ▼
+Backtest “if we killed special at T, eta/way …”
+   │
+   ▼
+SE hook (future): sticky kill / way reassess
+```
+
+---
+
+### Pillar A — God-view (first to build)
+
+**Inputs (per seat, time t):**  
+- Locked / preferred Victory-Way tags: `needs_LA`, `needs_LR`  
+- Own progress: knights played, army size, road count, longest path, claim flags  
+- Race: max opponent army, max opponent longest, who holds LA/LR  
+- Timing: sticky ETA, optional EH “turns to claim special” if available  
+- Outcome later: claimed / lost / still needing at game end  
+
+**Derived scores (examples to refine):**  
+- `progress_LA ∈ [0,1]`, `progress_LR ∈ [0,1]`  
+- `race_gap_LA` (knights behind leader or behind claim bar)  
+- `race_gap_LR` (length behind / roads left to claim under 15-cap)  
+- `hopeless_score = f(gap, own rate, turns left proxy)`  
+
+**Labels (oracle-style, for learning thresholds):**  
+- **Hold OK:** on-way and claims special, or still race-viable at end  
+- **Should give up:** on-way, never claims, gap stays bad / ETA special dominates  
+- Optional: **should have given up by t\*** = first time gap > g for K consecutive samples  
+
+**Outputs:**  
+- Threshold candidates **θ_LA**, **θ_LR** (separate) on `hopeless_score` or gap  
+- ROC-style offline: false give-up vs false hold  
+- Per-seat and pooled (common θ if similar; seat-specific only if needed)  
+
+**Artifacts:**  
+- `la_lr_probe.jsonl` (or CS enrich): way tags, progress, gaps, events claim/steal/buy/play knight/road  
+- `la_lr_godview_report.json`: distributions, threshold proposals, confusion vs labels  
+
+---
+
+### Pillar B — Players_view (second; no way table)
+
+**Ambition labels (per opponent, rolling window):**  
+
+| Signal | LA ambition | LR ambition |
+|--------|-------------|-------------|
+| High knight buy/play rate | ↑ | — |
+| Long unplayed DCard dwell (VP-ish) | ↓ knights / ↑ VP | — |
+| Road build rate, length growth, toward open chains | — | ↑ |
+| Approaching 15 roads / blocked expand | — | cap / ↓ |
+| Public structures only | weak | moderate |
+
+Ambition ∈ {low, moderate, high} via rules first, ML later.
+
+**Shared thresholds:**  
+Features must be **player-symmetric** (same formula every seat). Thresholds from god-view **projected** onto public features (e.g. “≥2 knights behind + no knight play in N own turns”).
+
+**Hard problems (explicit work items):**  
+1. DCard dual use → separate buy intent vs play intent; dwell-time heuristic for VP.  
+2. Road cap 15 → LR ambition decays as remaining road slots → 0.  
+3. Hidden hand → never depend on private cards in players_view v1.  
+
+---
+
+### Pillar C — Strategy-Engine use (third; not probe v1 code path)
+
+When sticky way needs LA/LR and **players_view** (or god-view dig-in) crosses θ:  
+- Invalidate special commitment / divert or full L2  
+- Re-rank ways **excluding** lost special (or deprioritize)  
+- Log `la_lr_giveup` reason for CS  
+
+Align with existing specials divert / way-kill rather than a parallel engine.
+
+Implemention:
+| WP | Content |
+|----|---------|
+| **L0** | Inventory: what we already log (LA/LR holder, knights, roads, way tags, divert/kill) |
+| **L1** | God-view sampler + JSONL (on-way, progress, race gap, claims) |
+| **L2** | Labels + threshold search (LA and LR separate) |
+| **L3** | Backtest: apply θ offline, count false hold/give-up, ETA impact |
+| **L4** | Players_view feature kit + ambition L/M/H (no SE change) |
+| **L5** | Map θ → public features; agreement god vs player view |
+| **L6** | SE hook (sticky/L2) behind flag; A/B rounds + special outcomes |
+
+After implementing L0-L4:
+G2) One other thing comes to mind. There might be situations where no of the 142 Victory_Ways is feasible. In such cases the objective should be to gain as much victory points asap, ignoring the component that can never be achieved. If LR can't be achieved: 1) Find a viable Victory-Way not having  LR as component
+2) If no such Victory-Way is feasible, find a Victory-Way, ignore LR and find the Victory-Way where
+  a) it is feaible to achieve the remaining components AND
+  b) still least number of own turn is needed to do so.
+Assess the impact and draft an implementation plan to accomodate this. No change of any code yet!
+
+Plan to address G2): File: docs/PhaseL_partial_way_salvage_plan.md
+
+Implementation work packages:
+| WP | Deliverable |
+|----|-------------|
+| **S0** | This spec frozen; flag name e.g. `GIVEUP_SALVAGE_PARTIAL` |
+| **S1** | `strip_components(req, dead_set)` + residual ETA helper |
+| **S2** | T1: expand eval set with non-dead-special ways when `kill_lr`/`kill_la` |
+| **S3** | T2: residual rank when T1 empty; force adopt; meta `salvage_mode` |
+| **S4** | Sticky/BA: `partial_plan`, `ignored_components`; suppress dead projects |
+| **S5** | `roads_expand` / `settles_expand` from legal scanner → same pipeline |
+| **S6** | VP DCards: only **deck empty** (public) or need already met — **not** god-view count |
+| **S7** | Probe/result dig fields; mild + product smoke |
+| **S8** | T3 open VP scrape if needed |
+
+**Suggested order:** S0 → S1–S4 (finish LR/LA escape) → S5 (road-block) → S6 (VP cards fair) → S7–S8.
+
+=/=
+Implement S8 now?	No — T1/T2 cover the mild board; no T2-empty crisis
+Better next steps than S8
+(1) Done - Fix dig: record real abstract_way_before on force-adopt
+      Plan: PhaseL_S7a_abstract_way_before_plan.md 
+(2) Done - Tighten S5 so early “no settle target yet” ≠ permanent settles_expand death ( require true lock-out / late game / no path forever)
+      Plan: PhaseL_S5b_settles_expand_gate_plan.md
+(3) Optional: dig KPI split LR-episode salvage vs expansion/vp-only salvage
+(4) Optional hard WdB n=20 for T2-heavy stress — still not S8 unless T2 empty
+
+## Ad1) Work packages
+| WP | Deliverable | Effort | Status |
+|----|-------------|--------|--------|
+| **D0** | This plan frozen | — | **Done** |
+| **D1** | `resolve_pre_adopt_way_id` + unit tests | 1–2 h | **Done** (`core/partial_way_salvage.py`, `tests/test_partial_way_salvage_s7a_d1.py`) |
+| **D2** | Wire portfolio force-adopt; pass source | 1 h | **Done** (`ai_way_portfolio.apply_board_behavior_override` + `tests/test_partial_way_salvage_s7a_d2.py`) |
+| **D3** | Logger: `way_change_kind`, source; redefine `way_changed` | 1 h | **Done** (`classify_way_change_kind`, note/log, `tests/test_partial_way_salvage_s7a_d3.py`) |
+| **D4** | KPI + dig CLI | 1 h | **Done** (`dig_salvage_fire_switch_kpis` S7a fields; `scripts/dig_salvage_s7.py`; tests s7 + s7a_d4) |
+| **D5** | Integration-style unit: sticky=88 → adopt 44 → switch | 1 h | **Done** (`tests/test_partial_way_salvage_s7a_d5.py` — live filter path + dig KPIs) |
+| **D6** | Docs: parent salvage plan S7a row, MANUAL dig fields | 0.5 h | **Done** (parent S7a table; `MANUAL.md` S7a dig + artifact rows) |
+| **D7** | Validation: mild n=5 or n=20 | 0.5–2 h | **Done** — `batch_runs/lr_lab_mild_s7a_d7_n5` (see §6.1) |
+
+**Order:** D1 → D3 → D2 → D5 → D4 → D6 → D7.
+
+## Ad2) Work packages
+| WP | Deliverable | Effort | Status |
+|----|-------------|--------|--------|
+| **G0** | This plan frozen | — | **Done** |
+| **G1** | Implement gate B + reason codes + S5b impl id | 1–2 h | **Done** (`detect_expansion_geometry_block` + payload dig fields) |
+| **G2** | Unit tests: empty settle + legal roads → **not** dead; empty settle + empty roads → dead; max pieces → dead | 1–2 h | **Done** (`tests/test_partial_way_salvage_s5b_g2.py` full §6 matrix) |
+| **G3** | Update `test_partial_way_salvage_s5.py` expectations; status_dict | 0.5 h | **Done** (with G1) |
+| **G4** | Docs: parent salvage plan S5b note, MANUAL one-liner | 0.5 h | **Done** (parent S5b table; `MANUAL.md` S5b lock) |
+| **G5** | Mild n=20 re-smoke + dig: r1 settles-only mass adopt gone; LR fire salvage still present | 1–2 h wall + dig | **Done — pass** (see §6.1) |
+| **G6** | Dig KPI deferred vs dead settles | 0.5 h | **Done** — `note_expansion_settles_dig` / `collect_expansion_settles_dig_summary`; result.json + `dig_salvage_s7.py`; `tests/test_partial_way_salvage_s5b_g6.py` |
+
+**Order:** G1 → G2 → G3 → G4 → G5.  
+
+=/=
+Sensible next steps (pick one)
+
+1. Done - Write a short A/B note (1 page): contrast table + “treat changes behavior, not big win/length; 2× cost.”
+2. Done - Optional dig: why treat LR fires ≫ control (193 vs 61).
+3. Product decision: keep escape on for dig/default SE, or flag for “lab only” if wall time hurts.
+4. Do not rush S8 or n=1000 unless you redefine the success metric.
+
+Still open (not required for “lab salvage works”)
+
+• S8 — only if digs show T1/T2 empty
+• Product matched A/B (ops/science, not missing probe code)
+• Optional hard WdB stress dig
+• Players-view / public ambition (Phase L L4–L5 if still on the roadmap — separate from salvage)
+
+=/=
+Ad2) Optional dig: why treat LR fires ≫ control (193 vs 61) and 4 migration options:
+
+┌───┬──────────────────┬─────────────────┬────────────────────┐
+│ # │ Mitigation       │ Effect on the   │ Overlap            │
+│   │                  │ dig story       │                    │
+├───┼──────────────────┼─────────────────┼────────────────────┤
+│ 1 │ Don’t clear      │ Directly blocks │ Hits the main      │
+│   │ latch when way_  │ the code path   │ mechanism          │
+│   │ id changes while │ that re-arms    │                    │
+│   │ kill_lr episode  │ after salvage   │                    │
+│   │ is active        │ switches way    │                    │
+├───┼──────────────────┼─────────────────┼────────────────────┤
+│ 2 │ Hard one fire    │ Same end state: │ Stronger / simpler │
+│   │ per episode      │ no re-fire      │ than (1);          │
+│   │ until release    │ until holds/    │ supersedes a lot   │
+│   │                  │ needs clears    │ of latch edge      │
+│   │                  │                 │ cases              │
+├───┼──────────────────┼─────────────────┼────────────────────┤
+│ 3 │ Stricter S4/     │ Reduces why     │ Complementary;     │
+│   │ sticky: block    │ score stays     │ doesn’t fix latch  │
+│   │ re-lock of LR    │ high on LR      │ if needs_LR flips  │
+│   │ ways under       │ templates       │ true another way   │
+│   │ episode          │                 │                    │
+├───┼──────────────────┼─────────────────┼────────────────────┤
+│ 4 │ Salvage/         │ Reduces re-     │ Complementary;     │
+│   │ portfolio: less  │ entry to LR     │ latch can still    │
+│   │ oscillation back │ templates       │ re-fire if needs   │
+│   │ to LR under kill │                 │ _LR returns        │
+│   │ _lr              │                 │                    │
+└───┴──────────────────┴─────────────────┴────────────────────┘
+
+(1) and (2) are almost substitutes. (3) and (4) are supporting, not required for a first fix. Note: (2) is implemented, but not tested in n=100 situation!
+
+Recommendation
+
+Do one of (1) or (2) — not all four.
+
+┌────────────┬────────────────────────────────────────────────┐
+│ Prefer     │ When                                           │
+├────────────┼────────────────────────────────────────────────┤
+│ (2) one    │ You want the simplest product rule: “give up   │
+│ fire per   │ LR once per hopeless episode.” Easy to dig (   │
+│ episode    │ fires/game ≤ seats that ever fire).            │
+├────────────┼────────────────────────────────────────────────┤
+│ (1) latch  │ You want to keep multi-fire after episode      │
+│ under      │ truly releases (e.g. race changes, then        │
+│ episode    │ becomes hopeless again) and only block thrash  │
+│            │ during the same kill_lr episode. Slightly more │
+│            │ nuanced.                                       │
+└────────────┴────────────────────────────────────────────────┘
+
+For your A/B dig (same-way re-fire next round after salvage), either (1) or (2) alone should collapse 193 → roughly first-fire order (~70–80 range).
+
+Add (3) or (4) only if after (1)/(2):
+
+• sticky still thrash-locks LR ways for dig noise, or
+• you still see pathological L2 churn without re-fire.
+
+Add to L4 implementation plan:
+1) Optional later product idea (not L4 MVP): online adaptation per game/seat. That would be extra.
+2) Optional later: god-view shadow log even in fair-play (dig only, no effect) to keep measuring agreement.
+
+Implementation of L4:
+| WP | Name | Deliverable | Est. |
+|----|------|-------------|------|
+| **L4-0** | Spec freeze | This doc accepted; constants table locked v0 | — |
+| **L4-1** | Public feature builder | `build_public_features` + unit tests | 0.5–1 d |
+| **L4-2** | Ambition labels | `label_ambition_la/lr` + table-driven tests | 0.5 d |
+| **L4-3** | Offline analyzer | Script + `players_view_report.json` | 0.5–1 d |
+| **L4-4** | Agreement dig | Run on existing Domain A/C batches; write dig note | 0.5 d |
+| **L4-5** | Gate decision | Short note: proceed L5 / tune rules / stop | 0.25 d |
+| **L4-6** (optional and not implemented) | Live nest on probe | Append `players_view` on sample rows | 0.5 d |
+**Order:** L4-0 → L4-1 → L4-2 → L4-3 → L4-4 → L4-5; L4-6 only if digs need live columns.
+
+Implementation of L5:
+| WP | Name | Deliverable | Est. |
+|----|------|-------------|------|
+| **L5-0** | Spec freeze | **Done** §0 — `L5_PUBLIC_GIVEUP_SPEC_v0` | — |
+| **L5-1** | Teacher join | **Done** — teacher API + tests | 0.5 d |
+| **L5-2** | Public proxy v0 | **Done** — rule A MVP + score B parallel; constants in module | 0.5–1 d |
+| **L5-3** | Offline analyzer + CLI | `public_giveup_report.json`; precision/FGU tables | 0.5–1 d |
+| **L5-4** | Dig | Domain A (LA) + Domain C (LR) reports; dig note | 0.5 d |
+| **L5-5** | Gate | Pass / soft / fail → L6_players plan or stay god-only | 0.25 d |
+| **L5-6** (optional) | Product-map smoke | One mixed needs batch if lab support skewed | 0.5 d |
+**Order:** L5-0 → L5-1 → L5-2 → L5-3 → L5-4 → L5-5; L5-6 only if digs demand.
+
+Implementation of Grok's idea's:
+1. Implementing G (LR public give-up retune): rule grid, analyzer/CLI variants, digs on lab + product, and freeze/gate.
+2. Implementing C (counterfactual switch oracle): exploring available ETA fields, then building the light offline path + dig.
+3. Implementing E (unified specials process join): loaders, timeline, KPIs, CLI, tests, and dig.
+4. Implementing D (path typology cuts): helper, report wiring, tests, and dig.
+5. Implementing A (end-of-game specials outcomes): series reduce, report, CLI, tests, and dig.
+6. Implementing J (thrash dashboard): KPIs from probe digs and sample series, CLI, tests, and dig.
+
+=/=
+MGlog implementation:
+## 7. Work packages (logging only)
+
+| WP | Deliverable | Est. |
+|----|-------------|------|
+| **M0** | This freeze (§0.1) | **done** (locked 2026-08-15) |
+| **M1** | `core/mglog.py` CSV header + append + event_index + path override | **done** — `core/mglog.py`, `tests/test_mglog_m1.py` |
+| **M2** | Snapshot → CSV columns / board_blob | **done** — `snapshot_from_game`, `encode_board_blob`, `append_event_from_game`; `tests/test_mglog_m2.py` |
+| **M3** | Hooks: game_start, board, IP, turn_start/end, dice, production | 0.5–1 d |
+| **M4** | Hooks: builds, robber, steal, discard | 0.5 d |
+| **M5** | Hooks: TwB, TwP execute, DCard buy/play (exact type) | 0.5–1 d |
+| **M6** | LR/LA holder, game_over | 0.25 d |
+| **M7** | Batch `g00N/mglog.csv` + result.json pointer | 0.25–0.5 d |
+| **M8** | Tests + smoke GUI + headless n=2 | 0.5–1 d |
+| **M9** | MANUAL.md: MG vs MGLOG one paragraph | 0.25 d |
+| **M-stats** |
+
+**Later:** **M-GUI** re-play script (6 controls, no SE).
+
+M-stats implementation:
+## 7. Work packages
+
+| WP | Deliverable | Est. |
+|----|-------------|------|
+| **S0** | `core/mglog_statistics.py` skeleton: CSV load, playboard thin load, empty snapshot with `meta.source=mglog` | **done** — `load_mglog_rows`, `load_playboard_for_stats` / `BoardSnapshot`, `empty_statistics_snapshot`,
+                    `collect_endgame_statistics_from_mglog` (empty tables); `tests/test_mglog_stats_s0.py` |
+| **S1** | Dice + rcards_drawn + dcards_drawn + DC_In / DC_Played | 0.25 d |
+| **S2** | Resource TRC rows (production, discard, steal, twb/twp, builds, buy, yop; monopoly thief) | 0.5 d |
+| **S3** | Structure timeline + Overview (S/C/DC/LA/LR/TVP/winner) | 0.5 d |
+| **S4** | RC Block derivation + playboard adjacency tests | 0.5–1 d |
+| **S5** | Activity rows (TrP=`*`, TrP_A, RC_Use, RC_Block, DC_*) | 0.25 d |
+| **S6** | Tests: unit fixtures + one optional live-vs-mglog parity smoke | 0.5 d |
+| **S7** | CLI `scripts/mglog_stats.py` | 0.25 d |
+| **S8** | Optional: Game Over / dig path can call mglog aggregator when offline flag set | later |
+
+M_GUI implementation:
+## 6. Work packages
+
+| WP | Deliverable | Est. |
+|----|-------------|------|
+| **G0** | This plan freeze + CLI argv contract | **done** (this doc) |
+| **G1** | `core/mglog_replay.py`: load, validate completeness (R-2T1 / game_over), cursor apply 0..k | 1–1.5 d |
+| **G2** | `scripts/replay_catan_game.py` shell: pygame loop, input errors, status banner | 0.5 d |
+| **G3** | Six buttons + enable/disable + red border incomplete-forward policy; dice images | 0.75–1 d |
+| **G4** | Paint: board + scoreboard + DCard column (reuse GUI helpers / minimal fork) | 1–1.5 d |
+| **G5** | Game Over strip: Playboard / Statistics toggle + Save dual screenshots + manifest | 0.75 d |
+| **G6** | “?” derived turn details for current R/T | 0.5 d |
+| **G7** | Optional synthetic Event strip from MGlog | 0.5 d |
+| **G8** | Tests: validate incomplete logs, apply smoke, button policy unit tests | 0.5–0.75 d |
+| **G9** | MANUAL.md short section + cross-link from MGlog plan | 0.25 d |
+
+**Suggested order:** G1 → G2 → G3 → G4 → G5 → G8 → G6 → G7 → G9.
+

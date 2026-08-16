@@ -265,8 +265,23 @@ class EventHandler:
         pass
 
     def _play_sound(self, name: str, fallback: str = "BUTTON") -> None:
-        """Play a sound safely even when a sound asset is missing."""
+        """Play a sound safely even when a sound asset is missing.
+
+        Respects ``NO_GUI_AT_ALL_TF`` (headless = silent) via ``play_sound``.
+        """
         try:
+            from gui.gui_constants import play_sound
+
+            if play_sound(name, fallback=fallback):
+                return
+        except Exception:
+            pass
+        # Legacy fallback only when audio is enabled
+        try:
+            from gui.gui_constants import is_audio_enabled
+
+            if not is_audio_enabled():
+                return
             sound = SOUNDS.get(name) or SOUNDS.get(fallback)
             if sound is not None:
                 pygame.mixer.Sound.play(sound)
@@ -1325,8 +1340,15 @@ class EventHandler:
                 if isinstance(getattr(game, "pending_robber_steal", None), dict):
                     game.pending_robber_steal["active"] = False
                     game.pending_robber_steal["awaiting_human_target"] = False
-                if hasattr(game, "refresh_strategy_context"):
-                    game.refresh_strategy_context("after_human_non7_roll", force=True)
+                # P1 WP3: policy refresh (not force=True full L2); non-7 → auto/L0 unless flags
+                if hasattr(game, "refresh_strategy_after_event"):
+                    game.refresh_strategy_after_event(
+                        "after_human_non7_roll", kind="turn_start"
+                    )
+                elif hasattr(game, "refresh_strategy_context"):
+                    game.refresh_strategy_context(
+                        "after_human_non7_roll", mode="auto"
+                    )
                 if hasattr(game, "refresh_viable_actions"):
                     game.refresh_viable_actions("after_human_non7_roll")
         except Exception:
@@ -1422,7 +1444,15 @@ class EventHandler:
                 game.state_1 = ""
                 game.state_2 = ""
                 try:
-                    game.refresh_strategy_context("after_human_robber_flow", force=True)
+                    # P1 WP3: robber resolved → turn_start/auto (flags may L2); no force L2
+                    if hasattr(game, "refresh_strategy_after_event"):
+                        game.refresh_strategy_after_event(
+                            "after_human_robber_flow", kind="turn_start"
+                        )
+                    else:
+                        game.refresh_strategy_context(
+                            "after_human_robber_flow", mode="auto"
+                        )
                 except Exception:
                     pass
                 try:

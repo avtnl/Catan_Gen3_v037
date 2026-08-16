@@ -489,11 +489,37 @@ def _execute_dcard(game: Any) -> Mapping[str, Any]:
     return {"ok": False, "reason": "missing_execute_human_buy_dcard_action"}
 
 
-def _refresh_after_buy(game: Any, reason: str) -> None:
+def _strategy_already_refreshed_after_action(game: Any) -> bool:
+    """True when Game executor already ran Slice D / strategy for this action."""
     try:
-        refresh_strategy = getattr(game, "refresh_strategy_context", None)
-        if callable(refresh_strategy):
-            refresh_strategy(str(reason), force=True)
+        slice_d = getattr(game, "last_slice_d_result", None)
+        if isinstance(slice_d, Mapping) and slice_d.get("ok") is True:
+            return True
+    except Exception:
+        pass
+    try:
+        last = getattr(game, "last_execution_result", None)
+        if isinstance(last, Mapping):
+            sd = last.get("slice_d")
+            if isinstance(sd, Mapping) and sd.get("ok") is True:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _refresh_after_buy(game: Any, reason: str) -> None:
+    """Rescan + GUI; strategy only if Game did not already Slice-D (P1 WP3: no force L2)."""
+    try:
+        if not _strategy_already_refreshed_after_action(game):
+            ref = getattr(game, "refresh_strategy_after_event", None)
+            if callable(ref):
+                # kind=auto → classify_refresh_kind from reason (hand buy vs build milestone)
+                ref(str(reason), kind="auto")
+            else:
+                refresh_strategy = getattr(game, "refresh_strategy_context", None)
+                if callable(refresh_strategy):
+                    refresh_strategy(str(reason), mode="auto")
     except Exception:
         pass
     try:

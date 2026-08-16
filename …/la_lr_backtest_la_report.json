@@ -1,0 +1,657 @@
+{
+  "schema": 1,
+  "wp": "L3a",
+  "special": "la",
+  "n_rows": 0,
+  "n_episodes": 0,
+  "label_counts": {},
+  "l2_theta": 0.5,
+  "l2_theta_primary": {
+    "theta": 0.5,
+    "tp": 0,
+    "fp": 0,
+    "tn": 0,
+    "fn": 0,
+    "precision": null,
+    "recall": null,
+    "f1": null,
+    "accuracy": null,
+    "n_labeled": 0,
+    "note": "no_labeled_episodes"
+  },
+  "data_quality": {
+    "n_needs_episodes": 0,
+    "n_true_give_up_at_op": 0,
+    "n_false_give_up_at_op": 0,
+    "n_false_hold_at_op": 0,
+    "n_true_hold_at_op": 0,
+    "selection_note": "no_dead_race_signal_use_fallback_theta",
+    "sufficient_for_l6": false
+  },
+  "operating_point": {
+    "theta": 0.5,
+    "metrics": {
+      "counts": {
+        "true_give_up": 0,
+        "false_give_up": 0,
+        "true_hold": 0,
+        "false_hold": 0,
+        "neutral_no_fire": 0
+      },
+      "n_episodes_in": 0,
+      "n_eval": 0,
+      "n_fire": 0,
+      "n_fire_raw": 0,
+      "false_give_up_rate": null,
+      "false_hold_rate": null,
+      "false_hold_among_dead": null,
+      "fire_precision_true_give_up": null,
+      "dead_race_recall": null,
+      "f1_give_up": null,
+      "time_to_fire_needs_mean": null,
+      "fire_round_mean": null
+    },
+    "selection": {
+      "constrained_fgu_le": 0.25,
+      "used_fgu_constraint": false,
+      "n_curve": 21,
+      "n_viable": 0,
+      "note": "no_dead_race_signal_use_fallback_theta"
+    }
+  },
+  "theta_ref": {
+    "theta": 0.5,
+    "source": "operating_point",
+    "metrics": {
+      "counts": {
+        "true_give_up": 0,
+        "false_give_up": 0,
+        "true_hold": 0,
+        "false_hold": 0,
+        "neutral_no_fire": 0
+      },
+      "n_episodes_in": 0,
+      "n_eval": 0,
+      "n_fire": 0,
+      "n_fire_raw": 0,
+      "false_give_up_rate": null,
+      "false_hold_rate": null,
+      "false_hold_among_dead": null,
+      "fire_precision_true_give_up": null,
+      "dead_race_recall": null,
+      "f1_give_up": null,
+      "time_to_fire_needs_mean": null,
+      "fire_round_mean": null
+    }
+  },
+  "theta_l2_backtest": {
+    "theta": 0.5,
+    "metrics": {
+      "counts": {
+        "true_give_up": 0,
+        "false_give_up": 0,
+        "true_hold": 0,
+        "false_hold": 0,
+        "neutral_no_fire": 0
+      },
+      "n_episodes_in": 0,
+      "n_eval": 0,
+      "n_fire": 0,
+      "n_fire_raw": 0,
+      "false_give_up_rate": null,
+      "false_hold_rate": null,
+      "false_hold_among_dead": null,
+      "fire_precision_true_give_up": null,
+      "dead_race_recall": null,
+      "f1_give_up": null,
+      "time_to_fire_needs_mean": null,
+      "fire_round_mean": null
+    }
+  },
+  "baseline_s55_sample": {
+    "name": "s55_kill_recommended_first",
+    "metrics": {
+      "counts": {
+        "true_give_up": 0,
+        "false_give_up": 0,
+        "true_hold": 0,
+        "false_hold": 0,
+        "neutral_no_fire": 0
+      },
+      "n_episodes_in": 0,
+      "n_eval": 0,
+      "n_fire": 0,
+      "n_fire_raw": 0,
+      "false_give_up_rate": null,
+      "false_hold_rate": null,
+      "false_hold_among_dead": null,
+      "fire_precision_true_give_up": null,
+      "dead_race_recall": null,
+      "f1_give_up": null,
+      "time_to_fire_needs_mean": null,
+      "fire_round_mean": null
+    },
+    "n_episodes": 0
+  },
+  "curve": [
+    {
+      "theta": 0.0,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.05,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.1,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.15,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.2,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.25,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.3,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.35,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.4,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.45,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.5,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.55,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.6,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.65,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.7,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.75,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.8,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.85,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.9,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 0.95,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    },
+    {
+      "theta": 1.0,
+      "metrics": {
+        "counts": {
+          "true_give_up": 0,
+          "false_give_up": 0,
+          "true_hold": 0,
+          "false_hold": 0,
+          "neutral_no_fire": 0
+        },
+        "n_episodes_in": 0,
+        "n_eval": 0,
+        "n_fire": 0,
+        "n_fire_raw": 0,
+        "false_give_up_rate": null,
+        "false_hold_rate": null,
+        "false_hold_among_dead": null,
+        "fire_precision_true_give_up": null,
+        "dead_race_recall": null,
+        "f1_give_up": null,
+        "time_to_fire_needs_mean": null,
+        "fire_round_mean": null
+      }
+    }
+  ],
+  "backtest_params": {
+    "claim_window_k": 4,
+    "dwell": 1,
+    "gap_floor": 2,
+    "min_needs": 1,
+    "max_false_give_up_rate": 0.25,
+    "fallback_theta": 0.5
+  },
+  "episodes_at_operating_point": [],
+  "product_gap_kill_const": 3,
+  "note": "L3a: sample-time give-up backtest on hopeless_score; no SE mutation. Operating point prefers F1 then dead-race recall with false_give_up_rate cap.",
+  "batch_dir": "…",
+  "probe_path": "…\\la_lr_probe.jsonl",
+  "probe_exists": false,
+  "n_holder_keys": 0
+}

@@ -1370,6 +1370,37 @@ def _row_sort_key(row: StrategyTimingRow) -> Tuple[Any, ...]:
     )
 
 
+def proxy_turns_for_need(
+    need: Sequence[Any],
+    *,
+    current_hand: Sequence[Any],
+    production_pips: Sequence[Any],
+    trade_rates: Sequence[Any],
+) -> float:
+    """P4 cheap lower-bound style proxy (no iterative EH). Lower is better."""
+    total = 0.0
+    hand = _tuple5(current_hand)
+    pips = _tuple5(production_pips)
+    rates = _tuple5(trade_rates)
+    need_t = _tuple5(need)
+    for i in range(5):
+        deficit = max(0.0, float(need_t[i]) - float(hand[i]))
+        if deficit <= 1e-9:
+            continue
+        pip = max(0.0, float(pips[i]))
+        try:
+            rate = max(2.0, float(rates[i] or 4))
+        except Exception:
+            rate = 4.0
+        if pip > 0.05:
+            # Rough own-turns: deficit scaled by inverse production weight
+            total += deficit * 6.0 / max(pip, 0.5)
+        else:
+            # No production: bank-trade burden proxy
+            total += deficit * rate * 0.55
+    return float(total)
+
+
 def rank_strategies_for_player_state(
     player_state: PlayerStrategyState,
     requirements: Optional[Sequence[StrategyRequirement]] = None,
@@ -1388,12 +1419,13 @@ def rank_strategies_for_player_state(
     subtract_development_cards: bool = False,
     all_player_states: Optional[Sequence[PlayerStrategyState]] = None,
     exclude_non_viable_special_strategies: bool = DEFAULT_EXCLUDE_NON_VIABLE_SPECIAL_STRATEGIES,
+    prefilter_k: Optional[int] = None,
+    always_include_way_ids: Optional[Sequence[Any]] = None,
 ) -> Dict[str, Any]:
-    """Rank all 142 strategies from an already-built player state.
+    """Rank Victory-Ways from an already-built player state.
 
-    This entry point is used by action_planner.py Stage 3A. It lets a
-    hypothetical after-action player state be ranked without mutating game,
-    board, or player objects.
+    P4: optional ``prefilter_k`` runs a cheap proxy over all viable ways, then
+    full EH only on the top-K plus ``always_include_way_ids`` (sticky/preferred).
     """
     if requirements is None:
         requirements = load_strategy_requirements(requirements_path)
@@ -1412,10 +1444,8 @@ def rank_strategies_for_player_state(
 
     special_viability = evaluate_special_strategy_viability(player_state, all_player_states)
 
-    # Multiple ways can collapse to the same remaining resource vector. EH only
-    # needs to run once per unique need vector for this player state.
-    estimate_by_need: Dict[Tuple[float, float, float, float, float], Dict[str, Any]] = {}
-    rows: List[StrategyTimingRow] = []
+    # Pass 1: special filter + remaining need + cheap proxy (no EH)
+    candidates: List[Dict[str, Any]] = []
     rejected_special: List[Dict[str, Any]] = []
 
     for strategy in strategy_list:
@@ -1455,10 +1485,120 @@ def rank_strategies_for_player_state(
             subtract_current_roads=subtract_current_roads,
             subtract_development_cards=subtract_development_cards,
         )
-
         need_key = _tuple5(remaining.need_vector)
-        if need_key not in estimate_by_need:
-            estimate_by_need[need_key] = estimate_resource_requirement_time(
+        proxy = proxy_turns_for_need(
+            need_key,
+            current_hand=player_state.current_hand,
+            production_pips=player_state.production_pips,
+            trade_rates=player_state.trade_rates,
+        )
+        candidates.append(
+            {
+                "strategy": strategy,
+                "remaining": remaining,
+                "need_key": need_key,
+                "proxy": float(proxy),
+                "special_viability": strategy_special_viability,
+            }
+        )
+
+    ways_total_viable = len(candidates)
+    forced_ids = set()
+    for wid in list(always_include_way_ids or []):
+        try:
+            i = int(wid)
+            if i > 0:
+                forced_ids.add(i)
+        except Exception:
+            pass
+
+    # P4 prefilter: keep top-K by proxy + forced sticky/preferred
+    prefilter_applied = False
+    k_eff = None
+    if prefilter_k is not None:
+        try:
+            k_eff = max(1, int(prefilter_k))
+        except Exception:
+            k_eff = None
+    if k_eff is not None and ways_total_viable > k_eff:
+        prefilter_applied = True
+        candidates.sort(key=lambda c: (float(c["proxy"]), int(getattr(c["strategy"], "way_id", 0) or 0)))
+        selected = candidates[:k_eff]
+        selected_ids = {int(getattr(c["strategy"], "way_id", 0) or 0) for c in selected}
+        for c in candidates:
+            wid = int(getattr(c["strategy"], "way_id", 0) or 0)
+            if wid in forced_ids and wid not in selected_ids:
+                selected.append(c)
+                selected_ids.add(wid)
+        candidates = selected
+
+    # Pass 2: EH only on selected candidates (P5: batch when continuous)
+    estimate_by_need: Dict[Tuple[float, float, float, float, float], Dict[str, Any]] = {}
+    rows: List[StrategyTimingRow] = []
+
+    # Unique need vectors among candidates
+    unique_needs: List[Tuple[float, float, float, float, float]] = []
+    seen_need: set = set()
+    for cand in candidates:
+        nk = cand["need_key"]
+        if nk not in seen_need:
+            seen_need.add(nk)
+            unique_needs.append(nk)
+
+    batch_ok = False
+    if continuous_trading and len(unique_needs) >= 1:
+        try:
+            from core.eh_numpy import estimate_first_payable_turn_batch_np, numpy_eh_available
+
+            if numpy_eh_available():
+                batch_results = estimate_first_payable_turn_batch_np(
+                    player_state.current_hand,
+                    player_state.production_pips,
+                    unique_needs,
+                    player_state.trade_rates,
+                    confidence_target=confidence_target,
+                    num_players=int(num_players),
+                    step=step,
+                    max_turns=max_turns,
+                    continuous_trading=True,
+                    require_confidence=require_confidence,
+                )
+                if isinstance(batch_results, list) and len(batch_results) == len(unique_needs):
+                    for nk, est in zip(unique_needs, batch_results):
+                        if isinstance(est, Mapping):
+                            estimate_by_need[nk] = dict(est)
+                            estimate_by_need[nk]["resource_order"] = list(RESOURCE_ORDER_NAMES)
+                            estimate_by_need[nk]["estimator"] = str(
+                                est.get("estimator") or "expected_hand_numpy_batch"
+                            )
+                    batch_ok = len(estimate_by_need) == len(unique_needs)
+        except Exception:
+            batch_ok = False
+
+    if not batch_ok:
+        for nk in unique_needs:
+            estimate_by_need[nk] = estimate_resource_requirement_time(
+                current_hand=player_state.current_hand,
+                production_pips=player_state.production_pips,
+                need=nk,
+                trade_rates=player_state.trade_rates,
+                confidence_target=confidence_target,
+                num_players=int(num_players),
+                step=step,
+                max_turns=max_turns,
+                continuous_trading=continuous_trading,
+                require_confidence=require_confidence,
+            )
+
+    for cand in candidates:
+        strategy = cand["strategy"]
+        remaining = cand["remaining"]
+        need_key = cand["need_key"]
+        strategy_special_viability = cand["special_viability"]
+
+        estimate = estimate_by_need.get(need_key)
+        if estimate is None:
+            estimate = estimate_resource_requirement_time(
                 current_hand=player_state.current_hand,
                 production_pips=player_state.production_pips,
                 need=need_key,
@@ -1470,8 +1610,8 @@ def rank_strategies_for_player_state(
                 continuous_trading=continuous_trading,
                 require_confidence=require_confidence,
             )
+            estimate_by_need[need_key] = estimate
 
-        estimate = estimate_by_need[need_key]
         turns = finite_or_9999(estimate.get("turns"))
         found = bool(estimate.get("found", False))
         confidence = safe_float(estimate.get("confidence"), 0.0)
@@ -1569,6 +1709,12 @@ def rank_strategies_for_player_state(
             "strategy_count": len(strategy_list),
             "excluded_special_strategy_count": len(rejected_special),
             "rte_available": _RTE_AVAILABLE,
+            # P4
+            "abstract_prefilter_k": k_eff,
+            "abstract_prefilter_applied": bool(prefilter_applied),
+            "ways_total_viable": int(ways_total_viable),
+            "ways_scored_eh": int(len(candidates)),
+            "always_include_way_ids": sorted(forced_ids),
         },
         "top_strategies": [row.as_dict(include_debug=include_debug) for row in top_rows],
         "best_non_trade_dependent_strategy": (
@@ -1614,220 +1760,79 @@ def rank_strategies_for_player(
     subtract_development_cards: bool = False,
     all_player_states: Optional[Sequence[PlayerStrategyState]] = None,
     exclude_non_viable_special_strategies: bool = DEFAULT_EXCLUDE_NON_VIABLE_SPECIAL_STRATEGIES,
+    prefilter_k: Optional[int] = None,
+    always_include_way_ids: Optional[Sequence[Any]] = None,
 ) -> Dict[str, Any]:
-    """Rank all 142 strategies for one player using EH timing."""
+    """Rank strategies for one player using EH timing (P4 prefilter via state ranker)."""
     if requirements is None:
         requirements = load_strategy_requirements(requirements_path)
 
-    strategy_list = list(requirements)
     player_state = build_player_strategy_state(board, player)
-
     game = getattr(player, "game", None)
     players = getattr(game, "players", None)
 
     if num_players is None:
         try:
-            num_players = max(1, len(players))
+            num_players = max(1, len(list(players or [])))
         except Exception:
             num_players = EXPECTED_HAND_ROLLS_PER_PLAYER_TURN
 
     if all_player_states is None:
         try:
-            all_player_states = [build_player_strategy_state(board, p) for p in players]
+            all_player_states = [build_player_strategy_state(board, p) for p in (players or [])]
         except Exception:
             all_player_states = [player_state]
-    else:
-        all_player_states = list(all_player_states)
         if not all_player_states:
             all_player_states = [player_state]
 
-    special_viability = evaluate_special_strategy_viability(player_state, all_player_states)
+    forced: list = list(always_include_way_ids or [])
+    if not forced:
+        for src in (
+            getattr(player, "sticky_commitment", None),
+            getattr(player, "strategic_direction", None),
+        ):
+            if isinstance(src, Mapping):
+                for key in ("locked_way_id", "preferred_way_id", "way_id"):
+                    try:
+                        wid = int(src.get(key) or 0)
+                        if wid > 0:
+                            forced.append(wid)
+                    except Exception:
+                        pass
 
-    # Multiple ways can collapse to the same remaining resource vector. EH only
-    # needs to run once per unique need vector for this player state.
-    estimate_by_need: Dict[Tuple[float, float, float, float, float], Dict[str, Any]] = {}
-    rows: List[StrategyTimingRow] = []
-    rejected_special: List[Dict[str, Any]] = []
+    # Inherit prefilter from game L2 profile when not explicit
+    if prefilter_k is None and game is not None:
+        try:
+            from core.l2_profile import profile_from_game
 
-    for strategy in strategy_list:
-        strategy_special_viability: Dict[str, Any] = {}
-        failed_special_reasons: List[str] = []
-        failed_special_rules: List[str] = []
+            prof = profile_from_game(game)
+            if prof is not None and str(getattr(prof, "name", "") or "") == "fast":
+                prefilter_k = getattr(prof, "abstract_prefilter_k", None)
+        except Exception:
+            pass
 
-        if strategy.longest_road:
-            lr = special_viability.get("longest_road", {}) or {}
-            strategy_special_viability["longest_road"] = lr
-            if exclude_non_viable_special_strategies and not bool(lr.get("viable", False)):
-                failed_special_reasons.append(str(lr.get("reason", "Longest Road not viable")))
-                failed_special_rules.extend(str(rule) for rule in lr.get("failed_rules", []) or [])
+    return rank_strategies_for_player_state(
+        player_state,
+        requirements=requirements,
+        requirements_path=requirements_path,
+        top_n=top_n,
+        include_all=include_all,
+        include_debug=include_debug,
+        confidence_target=confidence_target,
+        num_players=num_players,
+        step=step,
+        max_turns=max_turns,
+        continuous_trading=continuous_trading,
+        require_confidence=require_confidence,
+        subtract_current_roads=subtract_current_roads,
+        subtract_development_cards=subtract_development_cards,
+        all_player_states=all_player_states,
+        exclude_non_viable_special_strategies=exclude_non_viable_special_strategies,
+        prefilter_k=prefilter_k,
+        always_include_way_ids=forced,
+    )
 
-        if strategy.biggest_army:
-            la = special_viability.get("largest_army", {}) or {}
-            strategy_special_viability["largest_army"] = la
-            if exclude_non_viable_special_strategies and not bool(la.get("viable", False)):
-                failed_special_reasons.append(str(la.get("reason", "Largest Army not viable")))
-                failed_special_rules.extend(str(rule) for rule in la.get("failed_rules", []) or [])
 
-        if failed_special_reasons:
-            rejected_special.append(
-                {
-                    "way_id": strategy.way_id,
-                    "tags": list(strategy.tags),
-                    "reason": " | ".join(failed_special_reasons),
-                    "failed_rules": sorted(set(failed_special_rules)),
-                    "special_viability": strategy_special_viability,
-                }
-            )
-            continue
-
-        remaining = calculate_remaining_need(
-            strategy,
-            player_state,
-            subtract_current_roads=subtract_current_roads,
-            subtract_development_cards=subtract_development_cards,
-        )
-
-        need_key = _tuple5(remaining.need_vector)
-        if need_key not in estimate_by_need:
-            estimate_by_need[need_key] = estimate_resource_requirement_time(
-                current_hand=player_state.current_hand,
-                production_pips=player_state.production_pips,
-                need=need_key,
-                trade_rates=player_state.trade_rates,
-                confidence_target=confidence_target,
-                num_players=int(num_players),
-                step=step,
-                max_turns=max_turns,
-                continuous_trading=continuous_trading,
-                require_confidence=require_confidence,
-            )
-
-        estimate = estimate_by_need[need_key]
-        turns = finite_or_9999(estimate.get("turns"))
-        found = bool(estimate.get("found", False))
-        confidence = safe_float(estimate.get("confidence"), 0.0)
-        payability = estimate.get("payability", {}) or {}
-        expected_hand = _tuple5(estimate.get("expected_hand", [0, 0, 0, 0, 0]))
-        trade_diagnostics = compute_discrete_trade_diagnostics(
-            need=need_key,
-            expected_hand=expected_hand,
-            trade_rates=player_state.trade_rates,
-            payability=payability,
-        )
-        bottlenecks, dependency, reason = _analyze_bottlenecks(
-            need_key,
-            player_state.production_pips,
-            payability,
-            player_state.trade_rates,
-        )
-
-        rows.append(
-            StrategyTimingRow(
-                way_id=strategy.way_id,
-                rank=0,
-                turns=turns,
-                found=found,
-                confidence=confidence,
-                confidence_label=str(estimate.get("confidence_label", "")),
-                need_vector=need_key,
-                expected_hand=expected_hand,
-                trade_rates=player_state.trade_rates,
-                tags=tuple(strategy.tags),
-                reason=reason,
-                bottlenecks=bottlenecks,
-                trade_dependency=dependency,
-                strategy=strategy,
-                remaining=remaining,
-                estimate=estimate if include_debug else {},
-                special_viability=strategy_special_viability,
-                trade_diagnostics=trade_diagnostics,
-            )
-        )
-
-    rows.sort(key=_row_sort_key)
-    ranked_rows: List[StrategyTimingRow] = []
-    for idx, row in enumerate(rows, start=1):
-        ranked_rows.append(
-            StrategyTimingRow(
-                way_id=row.way_id,
-                rank=idx,
-                turns=row.turns,
-                found=row.found,
-                confidence=row.confidence,
-                confidence_label=row.confidence_label,
-                need_vector=row.need_vector,
-                expected_hand=row.expected_hand,
-                trade_rates=row.trade_rates,
-                tags=row.tags,
-                reason=row.reason,
-                bottlenecks=row.bottlenecks,
-                trade_dependency=row.trade_dependency,
-                strategy=row.strategy,
-                remaining=row.remaining,
-                estimate=row.estimate,
-                special_viability=row.special_viability,
-                trade_diagnostics=row.trade_diagnostics,
-            )
-        )
-
-    n = int(top_n) if top_n is not None else 3
-    top_rows = ranked_rows[: max(0, n)]
-
-    best_non_trade = next((r for r in ranked_rows if r.found and not r.trade_dependency), None)
-    best_high_confidence = next((r for r in ranked_rows if r.found and r.confidence_label in {"exact", "high"}), None)
-
-    output: Dict[str, Any] = {
-        "player": player_state.as_dict(),
-        "special_strategy_viability": special_viability,
-        "settings": {
-            "top_n": top_n,
-            "include_all": include_all,
-            "include_debug": include_debug,
-            "confidence_target": confidence_target,
-            "num_players": int(num_players),
-            "step": step,
-            "max_turns": max_turns,
-            "continuous_trading": continuous_trading,
-            "require_confidence": require_confidence,
-            "subtract_current_roads": subtract_current_roads,
-            "subtract_development_cards": subtract_development_cards,
-            "exclude_non_viable_special_strategies": bool(exclude_non_viable_special_strategies),
-            "special_close_to_best_ratio": SPECIAL_CLOSE_TO_BEST_RATIO,
-            "special_access_pip_threshold": SPECIAL_ACCESS_PIP_THRESHOLD,
-            "special_excess_pips_threshold": SPECIAL_EXCESS_PIPS_THRESHOLD,
-            "special_favourable_trade_rate": SPECIAL_FAVOURABLE_TRADE_RATE,
-            "unique_need_vectors_evaluated": len(estimate_by_need),
-            "strategy_count": len(strategy_list),
-            "excluded_special_strategy_count": len(rejected_special),
-            "rte_available": _RTE_AVAILABLE,
-        },
-        "top_strategies": [row.as_dict(include_debug=include_debug) for row in top_rows],
-        "best_non_trade_dependent_strategy": (
-            best_non_trade.as_dict(include_debug=include_debug) if best_non_trade else None
-        ),
-        "best_high_confidence_strategy": (
-            best_high_confidence.as_dict(include_debug=include_debug) if best_high_confidence else None
-        ),
-    }
-
-    if include_all:
-        output["all_strategies"] = [row.as_dict(include_debug=include_debug) for row in ranked_rows]
-
-    if include_debug:
-        output["rejected_special_strategies"] = rejected_special
-
-    warnings = []
-    for strategy in strategy_list:
-        for warning in strategy.validation_warnings:
-            warnings.append({"way_id": strategy.way_id, "warning": warning})
-    if warnings:
-        output["loader_warnings"] = warnings
-
-    return output
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Report-only player trade opportunities
-# ──────────────────────────────────────────────────────────────────────────────
 
 def _report_player_id_key(by_player: Mapping[Any, Any], player_id: int) -> Optional[Any]:
     """Return the key used in by_player for this player id, supporting int/string keys."""

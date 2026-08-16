@@ -1,19 +1,23 @@
-"""P3 strategy reconsider: L0/L1/L2 gates and significance flags.
+"""P3 strategy reconsider: closed L2 policy + L0/L1 gates.
 
-Heavy L2 board-way portfolio runs only when significance warrants it:
+Heavy L2 board-way portfolio runs only when the closed table allows it:
 
-  (a) need_next_target — target achieved; next target (now or start of next turn)
-  (b) target_blocked / race_worse — opponent board threatens way
-  (c) la_lr_shock — LA/LR acquired or meaningful progress against way
-  (d) off_strategy_opportunity — legal buy/build not in current way, significant ETA gain
+  (a) need_next_target — own planned target achieved; need next project
+  (b) target_blocked / race_worse — plan-relevant opp structure/road race
+  (c) la_lr_shock — LA/LR / knight / LA-DCard / relevant shocks
+  (d) off_strategy_opportunity — Q1 mid-turn off-way settle/city only (not DCard)
+  + cold (no preferred way), hard_invalid, dig-in (phase0 / F9 / force)
 
-Default path is L0 hand_only (rescore sticky/preferred ETA, no way switch).
-``mode="auto"`` is the primary entry: L2 iff ``should_run_l2_explore``.
+Never L2 alone for: pure hand, TwP/TwB, Q2 off-way DCard, off-plan opp builds.
+
+Default path is L0 hand_only (P1 true-light sticky ETA).
+``mode="auto"`` → L2 iff ``should_run_l2_explore``.
+See docs/P3_l2_policy_closed_table_plan.md.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 # (*) Soft switch threshold — avoid thrashing on marginal ETA gains
 STRATEGY_SWITCH_MIN_ETA_GAIN: float = 1.0
@@ -25,6 +29,16 @@ PORTFOLIO_TOP_N_END: int = 9
 GAME_STAGE_EARLY_MAX_VP: int = 3
 GAME_STAGE_MID_MAX_VP: int = 6
 
+# Closed-table buckets (dig-in / tests)
+L2_BUCKET_A = "a"  # need next target
+L2_BUCKET_B = "b"  # target blocked / race worse
+L2_BUCKET_C = "c"  # LA/LR shock
+L2_BUCKET_D = "d"  # Q1 off-way structure
+L2_BUCKET_COLD = "cold"
+L2_BUCKET_HARD = "hard"
+L2_BUCKET_DIAG = "diag"
+L2_BUCKET_EXPLICIT = "explicit"  # Phase C2 WP-R3
+
 _FLAG_BOOL_KEYS = (
     "need_next_target",
     "target_blocked",
@@ -35,20 +49,26 @@ _FLAG_BOOL_KEYS = (
 )
 
 # Sticky / milestone reason substrings → reconsider flag key
+# Order matters: more specific needles first.
 _REASON_TO_FLAG: Tuple[Tuple[str, str], ...] = (
     ("opponent_settlement", "target_blocked"),
     ("opponent_city", "target_blocked"),
     ("opponent_structure", "target_blocked"),
+    ("opponent_robber", "target_blocked"),
     ("target_blocked", "target_blocked"),
     ("target_occupied", "target_blocked"),
+    # Plan-edge / race roads → (b); LR ownership strings → (c) below
+    ("opponent_road", "race_worse"),
+    ("race_worse", "race_worse"),
     ("race", "race_worse"),
-    ("opponent_road", "la_lr_shock"),
     ("longest_road", "la_lr_shock"),
     ("largest_army", "la_lr_shock"),
     ("lost_longest", "la_lr_shock"),
     ("lost_largest", "la_lr_shock"),
     ("own_longest", "la_lr_shock"),
     ("own_largest", "la_lr_shock"),
+    ("opponent_dcard", "la_lr_shock"),
+    ("opponent_knight", "la_lr_shock"),
     ("knight", "la_lr_shock"),
     ("la_lr", "la_lr_shock"),
     ("need_next", "need_next_target"),
@@ -57,12 +77,32 @@ _REASON_TO_FLAG: Tuple[Tuple[str, str], ...] = (
     ("own_city", "need_next_target"),
     ("rec_complete", "need_next_target"),
     ("target_complete", "need_next_target"),
+    ("q1_offway", "off_strategy_opportunity"),
     ("off_way", "off_strategy_opportunity"),
     ("off_strategy", "off_strategy_opportunity"),
     ("hard_invalid", "hard_invalid"),
     ("route_illegal", "hard_invalid"),
     ("sticky_dead", "hard_invalid"),
 )
+
+# Gate why / flag key → closed-table bucket
+_FLAG_TO_BUCKET: Dict[str, str] = {
+    "need_next_target": L2_BUCKET_A,
+    "target_blocked": L2_BUCKET_B,
+    "race_worse": L2_BUCKET_B,
+    "la_lr_shock": L2_BUCKET_C,
+    "off_strategy_opportunity": L2_BUCKET_D,
+    "hard_invalid": L2_BUCKET_HARD,
+}
+
+_DIAG_REASONS = frozenset({
+    "force",
+    "explore",
+    "l2",
+    "f9",
+    "phase0_baseline",
+    "start_execution_phase",
+})
 
 
 def empty_reconsider_flags() -> Dict[str, Any]:
@@ -160,6 +200,103 @@ def map_recalc_reason_to_flag(reason: str) -> str:
     return "race_worse"
 
 
+def classify_l2_bucket(
+    flags: Optional[Mapping[str, Any]] = None,
+    *,
+    gate_why: str = "",
+    reason: str = "",
+) -> Optional[str]:
+    """Map flags / gate why / call reason → closed-table bucket or None (L0).
+
+    Priority when multiple flags: a > b > c > d > hard (first match in that order
+    among raised flags; hard checked after d in flag iteration uses table order).
+    """
+    why = str(gate_why or "").strip().lower()
+    r = str(reason or "").strip().lower()
+
+    if why.startswith("game.force") or why == "force=true" or "force_l2" in why:
+        return L2_BUCKET_DIAG
+    # Phase C2 WP-R3: explicit_142_recalc:<code>
+    if "explicit_142_recalc" in why or "explicit_142_recalc" in r:
+        return L2_BUCKET_EXPLICIT
+    if why.startswith("reason:"):
+        tail = why.split(":", 1)[-1].strip().lower()
+        if tail in _DIAG_REASONS or "phase0" in tail or tail == "f9":
+            return L2_BUCKET_DIAG
+        if "explicit_142_recalc" in tail:
+            return L2_BUCKET_EXPLICIT
+    if r in _DIAG_REASONS or "phase0" in r or r == "f9":
+        return L2_BUCKET_DIAG
+    if "q1" in r or "q1" in why or "offway" in r:
+        if "dcard" not in r:  # Q2 must not map to d
+            return L2_BUCKET_D
+
+    if why == "no_preferred_or_sticky_way" or "no_preferred" in why:
+        return L2_BUCKET_COLD
+    if why.startswith("flag:"):
+        key = why.split(":", 1)[-1].strip()
+        return _FLAG_TO_BUCKET.get(key)
+    if why in ("force_strategy_recalc", "pending_full_resolve", "strategy_recalc_flag.pending"):
+        # Milestone / batched dirt without finer flag: treat as (a) if need-like else (b)
+        if "need" in why or "milestone" in why or "force_strategy" in why:
+            return L2_BUCKET_A
+        return L2_BUCKET_B
+
+    if isinstance(flags, Mapping):
+        for key in (
+            "need_next_target",
+            "target_blocked",
+            "race_worse",
+            "la_lr_shock",
+            "off_strategy_opportunity",
+            "hard_invalid",
+        ):
+            if bool(flags.get(key)):
+                return _FLAG_TO_BUCKET.get(key)
+
+    if why and why not in ("l0_default", ""):
+        # Unknown explore why — still mark diag-ish for dig-in
+        if "explore" in why or "force" in why:
+            return L2_BUCKET_DIAG
+    return None
+
+
+def build_l2_policy_status(
+    game: Any = None,
+    player: Any = None,
+    *,
+    reason: str = "",
+    mode: str = "",
+    mode_detail: str = "",
+) -> Dict[str, Any]:
+    """Compact dig-in bag: allowed, bucket, gate, active flag keys."""
+    flags = get_reconsider_flags(player) if player is not None else empty_reconsider_flags()
+    run, why = should_run_l2_explore(game, player, reason=reason)
+    # Explicit explore mode counts as allowed even if gate would be L0
+    m = str(mode or "").lower()
+    if m in ("explore", "l2", "force", "full"):
+        run = True
+        if not why or why == "l0_default":
+            why = mode_detail or f"mode:{mode}"
+    bucket = classify_l2_bucket(flags, gate_why=why, reason=reason)
+    if run and bucket is None and m in ("explore", "l2", "force", "full"):
+        if "q1" in str(reason or "").lower():
+            bucket = L2_BUCKET_D
+        else:
+            bucket = L2_BUCKET_DIAG
+    active = [k for k in _FLAG_BOOL_KEYS if bool(flags.get(k))]
+    return {
+        "allowed": bool(run),
+        "bucket": bucket,
+        "gate": str(why or ""),
+        "mode": str(mode or ""),
+        "mode_detail": str(mode_detail or ""),
+        "reasons": list(flags.get("reasons") or [])[:12],
+        "active_flags": active,
+        "policy": "p3_closed_table",
+    }
+
+
 def clear_all_strategy_significance(player: Any, *, reason: str = "") -> Dict[str, Any]:
     """Clear reconsider bag + sticky batch flag + force/pending after successful L2."""
     out = clear_reconsider_flags(player, reason=reason or "after_l2")
@@ -183,6 +320,14 @@ def clear_all_strategy_significance(player: Any, *, reason: str = "") -> Dict[st
         setattr(player, "pending_full_resolve", None)
     except Exception:
         pass
+    # Phase C2 WP-R3: drop explicit session + consumed pending codes
+    try:
+        from core.strategy_explicit_recalc import clear_explicit_l2_session
+
+        clear_explicit_l2_session(player, consume_pending=True)
+        out["explicit_cleared"] = True
+    except Exception:
+        out["explicit_cleared"] = False
     return out
 
 
@@ -233,7 +378,8 @@ def should_run_l2_explore(
     """Whether refresh should run full portfolio (L2) vs L0 hand_only.
 
     L0 unless: hard force, missing way, significance flags, batched sticky
-    recalc pending, deferred full resolve, or diagnostic reasons.
+    recalc pending, deferred full resolve, Phase C2 explicit_142_recalc
+    triggers, or diagnostic reasons.
     """
     if player is None and game is not None:
         try:
@@ -252,6 +398,20 @@ def should_run_l2_explore(
         try:
             if bool(getattr(player, "force_strategy_recalc", False)):
                 return True, "force_strategy_recalc"
+        except Exception:
+            pass
+
+        # Phase C2 WP-R3: per-seat explicit_142_recalc triggers force L2
+        try:
+            from core.strategy_explicit_recalc import (
+                evaluate_explicit_triggers,
+                mark_explicit_l2_session,
+            )
+
+            exp = evaluate_explicit_triggers(game, player, reason=reason)
+            if exp.get("active"):
+                mark_explicit_l2_session(player, exp)
+                return True, str(exp.get("reason") or "explicit_142_recalc")
         except Exception:
             pass
 
@@ -281,6 +441,8 @@ def should_run_l2_explore(
         "phase0_baseline",
         "start_execution_phase",
     }:
+        return True, f"reason:{reason}"
+    if "explicit_142_recalc" in r:
         return True, f"reason:{reason}"
 
     return False, "l0_default"
@@ -361,14 +523,33 @@ def portfolio_top_n_for_game(game: Any) -> int:
 
 
 def classify_refresh_kind(reason: str = "", *, kind: Optional[str] = None) -> str:
-    """Map event reason / explicit kind → hand | turn_start | board | milestone | diagnostic."""
+    """Map event reason / explicit kind → hand | turn_start | board | milestone | diagnostic.
+
+    Explicit kinds ``hand`` / ``turn_start`` / ``board`` / ``milestone`` / ``diagnostic``
+    win. ``kind="auto"`` or empty means **infer from reason** (P1 WP3).
+    """
     if kind:
         k = str(kind).strip().lower()
-        if k in ("hand", "turn_start", "board", "milestone", "diagnostic", "auto"):
+        # "auto" is not a final class — fall through to reason inference.
+        if k in ("hand", "turn_start", "board", "milestone", "diagnostic"):
             return k
     r = str(reason or "").lower()
     if any(x in r for x in ("phase0", "f8", "f9", "baseline", "diagnostic")):
         return "diagnostic"
+    # Board shocks that also contain "hand"-like substrings: check before hand.
+    # Knight / robber move the robber tile (geometry); not pure hand.
+    if any(
+        x in r
+        for x in (
+            "knight",
+            "move_robber",
+            "robber_strategy",
+            "set_robber",
+            "steal",
+        )
+    ):
+        # Pre-roll knight still returns to AwaitingDiceRoll; treat as board flag window.
+        return "board"
     if any(
         x in r
         for x in (
@@ -376,7 +557,9 @@ def classify_refresh_kind(reason: str = "", *, kind: Optional[str] = None) -> st
             "roll_to_preview",
             "begin_execution",
             "start_of_turn",
+            "start_execution",
             "turn_start",
+            "non7_roll",
             "after_basic_robber",
             "after_human_robber",
             "after_ai_robber",
@@ -387,6 +570,20 @@ def classify_refresh_kind(reason: str = "", *, kind: Optional[str] = None) -> st
     if any(
         x in r
         for x in (
+            "build_road",
+            "build_settlement",
+            "build_city",
+            "free_road",
+            # AI TFR after roads placed (human card-play uses human_play_tfr → hand)
+            "after_ai_play_tfr",
+            "ai_play_tfr",
+            "milestone",
+        )
+    ):
+        return "milestone"
+    if any(
+        x in r
+        for x in (
             "twp_support",
             "twb_support",
             "after_ai_twp",
@@ -394,24 +591,17 @@ def classify_refresh_kind(reason: str = "", *, kind: Optional[str] = None) -> st
             "after_trade",
             "play_yop",
             "play_monopoly",
-            "play_tfr",
             "buy_dcard",
             "buy_development",
+            "human_play_yop",
+            "human_play_monopoly",
+            "human_play_tfr",  # card consumed; free roads not yet placed
+            "dcard_rejected",
+            "dcard_cancelled",
         )
     ):
         return "hand"
-    if any(
-        x in r
-        for x in (
-            "build_road",
-            "build_settlement",
-            "build_city",
-            "free_road",
-            "milestone",
-        )
-    ):
-        return "milestone"
-    if any(x in r for x in ("structure", "opponent", "knight", "longest", "largest")):
+    if any(x in r for x in ("structure", "opponent", "longest", "largest", "la_lr")):
         return "board"
     return "auto"
 
@@ -425,7 +615,8 @@ def mode_for_refresh_kind(
 ) -> Tuple[Optional[str], bool]:
     """Return (mode, force) kwargs for refresh_strategy_context.
 
-    Never returns force=True except diagnostic.
+    Never returns force=True except diagnostic (Phase0 / F9 / baseline).
+    Hand events with sticky preferred way stay ``hand_only`` unless L2 flags fire.
     """
     k = classify_refresh_kind(reason, kind=kind)
     if k == "diagnostic":

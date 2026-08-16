@@ -891,15 +891,17 @@ def log_ai_knight_plan(game: Any, plan: Dict[str, Any]) -> Dict[str, Any]:
         pass
 
     try:
-        if bool(getattr(game, "execution_debug_print_tf", False)):
-            print(
-                "AI Knight plan "
-                f"[P{plan.get('player_id')}] window={window} "
-                f"legal={plan.get('legal')} play={plan.get('play')} "
-                f"timing={plan.get('timing')} reason={plan.get('reason')} "
-                f"score={plan.get('score')} rule={plan.get('rule')} "
-                f"tile={plan.get('tile_id')} steal={plan.get('steal_opponent_id')}"
-            )
+        from core.console import execution_debug_print
+
+        execution_debug_print(
+            game,
+            "AI Knight plan "
+            f"[P{plan.get('player_id')}] window={window} "
+            f"legal={plan.get('legal')} play={plan.get('play')} "
+            f"timing={plan.get('timing')} reason={plan.get('reason')} "
+            f"score={plan.get('score')} rule={plan.get('rule')} "
+            f"tile={plan.get('tile_id')} steal={plan.get('steal_opponent_id')}",
+        )
     except Exception:
         pass
 
@@ -1124,6 +1126,42 @@ def plan_ai_play_knight(
             except Exception:
                 post_roll_win_hold = {"hold": False, "reason": "scan_error"}
 
+        # Lab soft bias: tip legal hold → play when LA timing window is open
+        la_soft_meta: Optional[Dict[str, Any]] = None
+        try:
+            from core.la_soft_bias import apply_la_knight_ba_bias
+
+            biased = apply_la_knight_ba_bias(
+                game,
+                player,
+                {
+                    "play": play,
+                    "timing": decision.get("timing") if play else None,
+                    "reason": reason,
+                    "legal": True,
+                    "window": resolved,
+                    "score": decision.get("score"),
+                    "rule": rule,
+                },
+                features=features,
+            )
+            la_soft_meta = (
+                dict(biased.get("la_soft_bias") or {})
+                if isinstance(biased, Mapping)
+                else None
+            )
+            if isinstance(biased, Mapping) and biased.get("la_soft_bias", {}).get(
+                "applied"
+            ):
+                play = bool(biased.get("play"))
+                reason = str(biased.get("reason") or reason)
+                rule = biased.get("rule") or rule
+                if play and biased.get("timing") is not None:
+                    decision = dict(decision)
+                    decision["timing"] = biased.get("timing")
+        except Exception:
+            la_soft_meta = None
+
         plan = _empty_plan(
             play=play,
             timing=decision.get("timing") if play else None,
@@ -1143,6 +1181,7 @@ def plan_ai_play_knight(
                 "rule": rule,
                 "dice_independent_desire": decision.get("dice_independent_desire"),
                 "post_roll_win_hold": post_roll_win_hold,
+                "la_soft_bias": la_soft_meta,
                 "winning_post_roll_card": (
                     (post_roll_win_hold or {}).get("winning_card")
                     if post_roll_win_hold
@@ -1352,9 +1391,10 @@ def _resume_after_ai_knight(game: Any, timing: str, *, reason: str = "") -> Dict
         except Exception:
             pass
         try:
+            # Robber tile changed: board (not pure hand) — P1 WP3
             ref = getattr(game, "refresh_strategy_after_event", None)
             if callable(ref):
-                ref("after_ai_knight_pre_roll", kind="hand")
+                ref("after_ai_knight_pre_roll", kind="board")
             else:
                 ref2 = getattr(game, "refresh_strategy_context", None)
                 if callable(ref2):
@@ -1556,6 +1596,17 @@ def execute_ai_play_knight(
             )
     except Exception:
         pass
+    try:
+        from core import mglog
+
+        mglog.log_play_dcard(
+            game,
+            player,
+            "knight",
+            payload=f"timing={gate_window}",
+        )
+    except Exception:
+        pass
 
     # W2: LA award can end the game; skip robber/resume pipeline if so.
     if bool(getattr(game, "game_over", False)):
@@ -1615,14 +1666,16 @@ def execute_ai_play_knight(
         pass
 
     try:
-        if bool(getattr(game, "execution_debug_print_tf", False)):
-            print(
-                "AI Knight EXECUTE "
-                f"[P{result.get('player_id')}] timing={gate_window} "
-                f"reason={result.get('reason')} tile={result.get('tile_id')} "
-                f"steal={result.get('steal_opponent_id')} "
-                f"robber_ok={bool(robber_result.get('ok'))}"
-            )
+        from core.console import execution_debug_print
+
+        execution_debug_print(
+            game,
+            "AI Knight EXECUTE "
+            f"[P{result.get('player_id')}] timing={gate_window} "
+            f"reason={result.get('reason')} tile={result.get('tile_id')} "
+            f"steal={result.get('steal_opponent_id')} "
+            f"robber_ok={bool(robber_result.get('ok'))}",
+        )
     except Exception:
         pass
 

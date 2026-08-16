@@ -1213,6 +1213,31 @@ def execute_twp_trade(
     _record_twp_turn_details(game, active, counter, proposal)
     _play_twp_success_sound(game, proposal)
 
+    try:
+        from core import mglog
+
+        give_v = [0, 0, 0, 0, 0]
+        get_v = [0, 0, 0, 0, 0]
+        try:
+            gi = int(proposal.active_give_index)
+            ri = int(proposal.active_receive_index)
+            if 0 <= gi < 5:
+                give_v[gi] = int(proposal.active_give_count or 0)
+            if 0 <= ri < 5:
+                get_v[ri] = int(proposal.active_receive_count or 0)
+        except Exception:
+            pass
+        mglog.log_twp(
+            game,
+            active,
+            getattr(proposal, "counterparty_id", None),
+            give_v,
+            get_v,
+            source="execute_twp_trade",
+        )
+    except Exception:
+        pass
+
     return TradeDecision(
         accepted=True,
         executed=True,
@@ -1853,6 +1878,20 @@ def execute_human_twp_vector_trade(
         reason=reason,
     )
     _play_twp_success_sound(game, None)
+
+    try:
+        from core import mglog
+
+        mglog.log_twp(
+            game,
+            proposer,
+            int(counterparty_id),
+            give_vec,
+            receive_vec,
+            source=str(source or "human_twp"),
+        )
+    except Exception:
+        pass
 
     result.update({
         "ok": True,

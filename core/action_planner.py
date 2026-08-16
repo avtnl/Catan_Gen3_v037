@@ -2076,6 +2076,7 @@ def _rank_strategy_state_top_n(
     include_debug: bool,
     num_players: int,
     requirements: Optional[Sequence[Any]] = None,
+    game: Any = None,
 ) -> Dict[str, Any]:
     """Rank strategies for a PlayerStrategyState, returning an empty report if unavailable."""
     if not _STRATEGY_TIMING_AVAILABLE or rank_strategies_for_player_state is None or state is None:
@@ -2084,15 +2085,57 @@ def _rank_strategy_state_top_n(
             "settings": {"strategy_timing_available": False},
         }
 
-    return rank_strategies_for_player_state(  # type: ignore[misc]
-        state,
-        requirements=requirements,
-        top_n=top_n,
-        include_all=False,
-        include_debug=include_debug,
-        num_players=num_players,
-        all_player_states=all_states,
-    )
+    prefilter_k = None
+    always_ids: list = []
+    try:
+        from core.l2_profile import profile_from_game
+
+        prof = profile_from_game(game)
+        if prof is not None and str(getattr(prof, "name", "") or "") == "fast":
+            prefilter_k = getattr(prof, "abstract_prefilter_k", None)
+    except Exception:
+        pass
+    # Force sticky/preferred into prefilter set when player available on state
+    try:
+        pid = getattr(state, "player_id", None) or getattr(state, "id", None)
+        if game is not None and pid is not None:
+            for p in list(getattr(game, "players", None) or []):
+                if str(getattr(p, "id", "")) == str(pid) or getattr(p, "id", None) == pid:
+                    for src in (
+                        getattr(p, "sticky_commitment", None),
+                        getattr(p, "strategic_direction", None),
+                    ):
+                        if isinstance(src, dict):
+                            for key in ("locked_way_id", "preferred_way_id", "way_id"):
+                                try:
+                                    wid = int(src.get(key) or 0)
+                                    if wid > 0:
+                                        always_ids.append(wid)
+                                except Exception:
+                                    pass
+                    break
+    except Exception:
+        pass
+
+    kwargs: Dict[str, Any] = {
+        "requirements": requirements,
+        "top_n": top_n,
+        "include_all": False,
+        "include_debug": include_debug,
+        "num_players": num_players,
+        "all_player_states": all_states,
+    }
+    if prefilter_k is not None:
+        kwargs["prefilter_k"] = prefilter_k
+        kwargs["always_include_way_ids"] = always_ids
+
+    try:
+        return rank_strategies_for_player_state(state, **kwargs)  # type: ignore[misc]
+    except TypeError:
+        # Older signature without P4 kwargs
+        kwargs.pop("prefilter_k", None)
+        kwargs.pop("always_include_way_ids", None)
+        return rank_strategies_for_player_state(state, **kwargs)  # type: ignore[misc]
 
 
 def apply_strategy_continuation_layer(
@@ -2176,6 +2219,7 @@ def apply_strategy_continuation_layer(
             include_debug=include_debug,
             num_players=num_players,
             requirements=requirements_cache,
+            game=game,
         )
         baseline_top = list(baseline_report.get("top_strategies", []) or [])
         baseline_best = baseline_top[0] if baseline_top else None
@@ -2224,6 +2268,7 @@ def apply_strategy_continuation_layer(
                     include_debug=include_debug,
                     num_players=num_players,
                     requirements=requirements_cache,
+                    game=game,
                 )
                 cont_rows = list(continuation_report.get("top_strategies", []) or [])[: max(0, int(top_n))]
                 action_turns = finite_or_9999(action.get("action_expected_own_turns", INFINITE_TURNS))
@@ -3443,14 +3488,27 @@ class ActionPlanner:
         if board_audits:
             best_audit = board_audits[0]
             self.game.current_board_way_audit = best_audit
-            print(
-                "FEAS: Way {} exp={:.1f} frag={} rec={}".format(
-                    best_audit.way_id,
-                    best_audit.board_expected_turns,
-                    best_audit.fragility,
-                    best_audit.recommendation,
+            try:
+                from core.console import digin, DEBUG
+
+                digin(
+                    "FEAS: Way {} exp={:.1f} frag={} rec={}".format(
+                        best_audit.way_id,
+                        best_audit.board_expected_turns,
+                        best_audit.fragility,
+                        best_audit.recommendation,
+                    ),
+                    level=DEBUG,
                 )
-            )
+            except Exception:
+                print(
+                    "FEAS: Way {} exp={:.1f} frag={} rec={}".format(
+                        best_audit.way_id,
+                        best_audit.board_expected_turns,
+                        best_audit.fragility,
+                        best_audit.recommendation,
+                    )
+                )
             # Ensure strategic_direction carries board project (4G-B)
             try:
                 from core.ai_way_portfolio import (

@@ -76,12 +76,16 @@ If only its hand of cards changed (for example after a player trade), it usually
 
 ```text
 main.py                 # Entry: pygame loop, hotkeys, phase managers
-core/                   # Rules, AI, strategy, TwP, Phase0, logging
+run_headless.py         # Lab: all-AI headless / multi-game batch (Phase A/B/C2)
+scripts/analyze_cs_setbacks.py      # Lab: Phase C CS strategy probe (offline)
+scripts/analyze_way_reassess.py     # Lab: Phase C2 matched control vs treat
+scripts/run_phase_c2_tests.py       # Lab: Phase C2 unit suite (R0–R8)
+core/                   # Rules, AI, strategy, TwP, Phase0, batch, logging
 gui/                    # Pygame UI, panels (TwB/TwP/DCard/discard/…)
 assets/                 # Images & sounds
 catan_142_ways_…csv     # Victory-Way / resource requirement table
-MANUAL.md               # Configuration: constants + player setup
-docs/                   # Notes & design docs (local; some paths gitignored)
+MANUAL.md               # Configuration: constants, headless, Phase C / C2 lab
+docs/                   # Notes & design docs (incl. PhaseC2 plan)
 ```
 
 Local-only reference (not required to run Gen3): `_ref_Catan_Gen2_v045/` — ignore / do not treat as part of the published Gen3 source.
@@ -148,7 +152,7 @@ For normal play: Set CHECK_MODE=False and you only need the mouse. F8/F9 are for
 
 Strategy / log basenames are configured in `core/constants.py` (see [MANUAL.md](MANUAL.md)).
 
-Slow performance (pipeline) steps can auto-write `Phase0_AI_Baseline_auto_slow_*.json` (often gitignored).
+Slow performance (pipeline) steps can auto-write `Phase0_AI_Baseline_auto_slow_*.json` under **`saved_phase0_files/`** (often gitignored). Full session saves go to **`saved_games/`**.
 
 ## Tools
 

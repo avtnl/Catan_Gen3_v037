@@ -687,6 +687,17 @@ def move_robber_basic(
 
     move_message = f"moved robber to tile {int(tile_id)}"
     _emit_twitter(game, player_id, move_message)
+    try:
+        from core import mglog
+
+        mglog.log_set_robber(
+            game,
+            player,
+            int(tile_id),
+            from_tile_id=before,
+        )
+    except Exception:
+        pass
     _record_turn_event(
         game,
         player=player,
@@ -885,6 +896,13 @@ def steal_random_resource_basic(game: Any, player: Any, opponent_id: Optional[in
     # Repeat/confirm the victim visual at the actual steal moment, especially for AI turns
     # where selecting and stealing can happen in the same action.
     _show_steal_victim_visual(game, _selected_victim_intersections(game, int(opponent_id)))
+
+    try:
+        from core import mglog
+
+        mglog.log_steal(game, player, int(opponent_id), stolen_name)
+    except Exception:
+        pass
 
     # Events: full resource name only in CHECK_MODE; else "a card" (option A).
     try:
@@ -1751,6 +1769,12 @@ def execute_discard(game: Any, player: Any, discard_vector: Sequence[Any], *, so
     pid = _safe_player_id(player)
     parts = [f"{RESOURCE_NAMES[i]}:{vec[i]}" for i in range(5) if vec[i]]
     message = "discarded " + (", ".join(parts) if parts else "nothing")
+    try:
+        from core import mglog
+
+        mglog.log_discard_7(game, player, vec, source=str(source or "discard"))
+    except Exception:
+        pass
     _emit_twitter(game, pid, message)
     _record_turn_event(
         game,

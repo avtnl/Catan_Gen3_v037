@@ -30,7 +30,16 @@ SAVE_PATH: str = os.path.join(
     os.path.expanduser("~"), "Documents", "Projecten", "Python", "Catan_Gen3", "Logs"
 )
 
-"""Directory path for saving game logs and playboards."""
+"""Directory path for saving game logs and screenshots (outside the repo)."""
+
+# Project root = parent of core/ (this file lives in core/constants.py)
+_PROJECT_ROOT: str = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+
+SAVED_GAMES_DIR: str = os.path.join(_PROJECT_ROOT, "saved_games")
+"""Directory for full Saved_Game_*.txt session snapshots (IP end, game over, CHECK_MODE EndRound)."""
+
+SAVED_PHASE0_DIR: str = os.path.join(_PROJECT_ROOT, "saved_phase0_files")
+"""Directory for Phase0_AI_Baseline_*.json dig-in captures (F8/F9 / auto-slow)."""
 
 # Game Configuration Flags
 FNFREQ: str = "N"
@@ -39,15 +48,15 @@ FNFREQ: str = "N"
 NUM_PLAYERS: int = 4
 """Number of players in the game."""
 
-HUMAN_PLAYER: bool = True
-#HUMAN_PLAYER: bool = False
+#HUMAN_PLAYER: bool = True
+HUMAN_PLAYER: bool = False
 """Whether human players are participating."""
 
 INIT_HP: bool = False
 """Whether human player initialization has occurred."""
 
-HP_ID: List[int] = [3]
-#HP_ID: List[int] = []
+#HP_ID: List[int] = [3]
+HP_ID: List[int] = []
 """List of human player IDs (for future multi-human support)."""
 
 VICTORY: int = 10
@@ -56,6 +65,12 @@ VICTORY: int = 10
 GAME_MAX_ROUND: int = 50
 """Maximum number of game rounds."""
 
+GAMES_TO_PLAY: int = 1
+"""Default batch size for headless GameManager / ``run_headless --games``.
+
+CLI ``--games N`` overrides this. Phase A single-game is ``1``; Phase B sets N>1.
+"""
+
 DICEROLL_SET_TF: bool = False
 """Whether to use a fixed dice roll sequence."""
 
@@ -63,12 +78,19 @@ NAME_DR_FILE: str = "DiceRolls_4_Players_13_Mar_2025_00_22_10.txt"
 """File name for dice roll sequence."""
 
 NO_GUI_AT_ALL_TF: bool = False
-"""Whether to disable GUI entirely."""
+"""Headless lab mode: when True, no interactive GUI presentation and no sounds.
 
-LOAD_PLAYBOARD: bool = True
+False → normal product path (GUI + audio).
+True  → no window-driven UI and no sound playback (batch / run_headless).
+"""
+
+LOAD_PLAYBOARD: bool = False
 """Whether to load a saved playboard."""
 
 SAVED_PLAYBOARD: str = "PlayBoard 08_Apr_2026_13_33_06.txt"
+#SAVED_PLAYBOARD: str = "Playboard_LA_lab_WhOSh_07_Aug_2026.txt"
+#SAVED_PLAYBOARD = "Playboard_LR_lab_WdB_07_Aug_2026.txt"
+#SAVED_PLAYBOARD = "Playboard_LR_lab_mild_08_Aug_2026.txt"
 """File name for saved playboard."""
 
 LOAD_GAME: bool = False
@@ -78,19 +100,43 @@ New Game / Settings end-session always start a fresh game and ignore this flag.
 On missing/invalid file the app falls back to Initial Placement with a warning.
 """
 
-#SAVED_GAME: str = "Saved_Game__31_Jul_2026_23_23_09_EndRound5.txt"
+#SAVED_GAME: str = "Saved_Game_31_Jul_2026_23_23_09_EndRound5.txt"
 """File name (or path) for a full saved game created by Game.save_game().
 
-Resolved relative to the process cwd, then the project root (main.py directory).
+Bare basenames resolve under ``saved_games/`` first, then project root / cwd
+(legacy), then SAVE_PATH. Absolute paths are used as-is.
 """
 
-MG: bool = True
-"""Flag for multiple game logging."""
+MG: bool = False
+"""Detailed verbose logging for debugging and code analysis (Gen2-style MG text).
+
+When True, may write high-volume diagnostic lines to FILENAME_MG / related sinks.
+Not required for board re-play; use MGLOG for re-playable event timelines.
+Primarily for debugging, code analysis, and deep digs — keep False in normal play.
+"""
+
+MGLOG: bool = True
+"""Write/update MGlog event timeline so a game can be re-played in a GUI viewer.
+
+When True (GUI or headless / NO_GUI_AT_ALL_TF either way), core mutations append
+ordered CSV rows to FILENAME_MGLOG (or batch_dir/g00N/mglog.csv). A separate
+GUI-only re-play script (no Strategy-Engine) reconstructs the game from
+**playboard file + mglog.csv from the start (IP→end)** — not from a mid-game
+Saved_Game. See docs/MGlog_implementation_plan.md.
+"""
+
+MGLOG_STATS_ON_GAME_OVER: bool = False
+"""When True, Game Over Statistics prefer offline MGlog aggregation
+(``collect_endgame_statistics_from_mglog``) if a usable mglog.csv exists;
+falls back to live ledger stats on failure. Default False keeps current
+ledger-based Game Over tables. Offline digs still use ``scripts/mglog_stats.py``.
+See docs/MGlog_statistics_plan.md S8.
+"""
 
 # MEM_TWP removed: HP TwP rejection bag always persists (former MEM_TWP=True).
 # See TurnDetails.clear_turn_details — does not reset list_of_TwP_rejected_by_HP.
 
-CHECK_MODE: bool = True
+CHECK_MODE: bool = False
 """When False: normal play UI — hide opponent RCard breakdowns,
 AI-hand leaks in TwP counter, Execution Debug panel, DBG/steal-detail Events,
 opponent unplayed DCard triplets, and opponent DCard buy types in Events.
@@ -131,6 +177,168 @@ EXPECTED_HAND_STORE_PLAYER_DEBUG: bool = True
 
 EXPECTED_HAND_DEBUG_TOP_N: int = 20
 """Number of EH-ranked candidates written to MG debug logging."""
+
+# ── Phase C2 / product: explicit Victory-Way / L2 reassess ───────────────────
+# Product (new games): AI seats [2, [4, 4]] (setback OR every 4 own turns);
+# human seats [0] (sticky + closed-table L2 only). Applied by is_human in
+# core/explicit_142_recalc.apply_product_defaults_to_players.
+# Lab sticky baseline: run_headless --arm control (all [0]).
+# Mixed list: ints and [4, n]. Codes: 0=none 1=vp 2=setback 3=hard 4=[4,n] 5=milestones
+# CLI: --explicit-recalc / --arm  (MANUAL.md Phase C2)
+
+EXPLICIT_RECALC_SETBACK_THR: float = 1.0
+"""ETA rise (own turns) to fire code 2 (on_eta_setback)."""
+
+EXPLICIT_RECALC_EVERY_N_DEFAULT: int = 2
+"""Default n when code 4 is bare ``4`` (prefer ``[4, n]`` explicitly)."""
+
+EXPLICIT_RECALC_MILESTONE_VPS: tuple = (2, 4, 6, 8)
+"""VP milestones for code 5."""
+
+EXPLICIT_142_RECALC_PRODUCT_AI: list = [2, [4, 4]]
+"""Default explicit_142_recalc for AI seats (setback + every 4 own turns)."""
+
+EXPLICIT_142_RECALC_PRODUCT_HUMAN: list = [0]
+"""Humans: no explicit extra L2 (sticky + P1–P3 closed-table gates only)."""
+
+EXPLICIT_142_RECALC_BY_SEAT: dict = {
+    1: [2, [4, 4]],
+    2: [2, [4, 4]],
+    3: [2, [4, 4]],
+    4: [2, [4, 4]],
+}
+"""Documentation / all-AI template seat map (same as product AI).
+
+Live Game init uses **is_human** via ``apply_product_defaults_to_players`` when
+no CLI seat map is passed — humans get ``EXPLICIT_142_RECALC_PRODUCT_HUMAN``.
+CLI ``--arm`` / ``--explicit-recalc`` still override by seat id.
+"""
+
+EXPLICIT_WAY_PICK: str = "sticky"
+"""On explicit L2: ``sticky`` keeps sticky + min-ETA-gain (product default).
+
+Use ``best`` for lab explore (always adopt rank-1 way on explicit L2).
+"""
+
+LOG_WAY_COMPARE: bool = True
+"""Phase C2 WP-R4: write WayReassessCompare JSONL on L2 (lab default).
+
+Seats with non-zero ``explicit_142_recalc`` always log regardless.
+Batch path: ``batch_dir/way_reassess.jsonl`` via GameManager.
+"""
+
+LOG_LA_LR_PROBE: bool = True
+"""Phase L WP-L1: god-view LA/LR race probe JSONL (lab default on).
+
+Batch path: ``batch_dir/la_lr_probe.jsonl`` via GameManager.
+Does not change Strategy-Engine policy (observe only).
+"""
+
+LA_SOFT_BIAS_MODE: str = "off"
+"""Lab soft bias toward LA Victory-Ways + knight BA preference.
+
+Values: ``off`` | ``early`` | ``mid`` | ``late``
+  - early: bias from Execution start
+  - mid: when max VP >= 4 or round >= 8
+  - late: when max VP >= 6 or round >= 12
+CLI: ``run_headless --la-soft-bias early`` overrides per run.
+Does not ban non-LA ways (soft rank/ETA boost + knight hold→play tip).
+"""
+
+# ---------------------------------------------------------------------------
+# Phase L FT6 — LA give-up → L2 (lab freeze; Strategy-Engine wiring = L6 later)
+# Source of truth details: core/la_giveup_config.py, docs/PhaseL_LA_theta_lock.md
+# Domain A only: Playboard_LA_lab_WhOSh_07_Aug_2026.txt (+ product sticky).
+# ---------------------------------------------------------------------------
+LA_GIVEUP_L2_ENABLED: bool = True
+"""When True, SE fires god-view LA give-up → clear ambition + L2 (L6).
+
+Lab default **True** for Domain A A/B batches (Wh/O/Sh lab board).
+Set **False** for product / standard-map runs until Domain B is re-fit.
+"""
+
+LA_GIVEUP_PROFILE: str = "safe"
+"""Named profile: ``safe`` (θ=0.6) | ``balanced`` (0.5) | ``aggressive`` (0.4)."""
+
+LA_GIVEUP_THETA: float = 0.6
+"""Hopeless-score threshold for give-up fire. Override profile if set intentionally.
+
+Freeze defaults: safe=0.6, balanced=0.5, aggressive=0.4.
+"""
+
+LA_GIVEUP_DWELL: int = 1
+"""Consecutive own-turn needs samples with score≥θ before fire (FT5: D=1)."""
+
+LA_GIVEUP_CLAIM_WINDOW_K: int = 4
+"""Offline FGU window (own-turn samples after fire). Not a live SE timer."""
+
+LA_GIVEUP_LATCH_FIRST: bool = True
+"""Latch first fire per needs episode (do not multi-fire on re-cross)."""
+
+# ---------------------------------------------------------------------------
+# Phase L FT6 — LR give-up → L2 (Domain C LR lab freeze + SE wiring)
+# Source: core/lr_giveup_config.py, docs/PhaseL_LR_theta_lock.md
+# Domain C: Playboard_LR_lab_WdB_07_Aug_2026.txt (+ product sticky).
+# ---------------------------------------------------------------------------
+LR_GIVEUP_L2_ENABLED: bool = True
+"""When True, SE fires god-view LR give-up → clear ambition + L2 (L6).
+
+Lab default **True** for Domain C (Wd/B lab board). Set **False** on LA lab
+or standard product maps unless you intentionally want dual specials.
+"""
+
+LR_GIVEUP_PROFILE: str = "safe"
+"""Named profile: ``safe`` (θ=0.75) | ``balanced`` (0.65) | ``aggressive`` (0.55)."""
+
+LR_GIVEUP_THETA: float = 0.75
+"""Hopeless-score threshold for LR give-up fire."""
+
+LR_GIVEUP_DWELL: int = 1
+"""Consecutive own-turn needs samples with score≥θ before fire (FT5 LR: D=1)."""
+
+LR_GIVEUP_CLAIM_WINDOW_K: int = 4
+"""Offline FGU window (own-turn samples after fire). Not a live SE timer."""
+
+LR_GIVEUP_LATCH_FIRST: bool = True
+"""Latch first fire per needs episode (LR thrash high without latch)."""
+
+# ---------------------------------------------------------------------------
+# Phase L give-up escape (WP0–WP2): specials-dead episode + portfolio filter
+# See docs/PhaseL_giveup_escape_plan.md
+# ---------------------------------------------------------------------------
+GIVEUP_ESCAPE_ENABLED: bool = True
+"""When True, after LA/LR give-up fire set a specials-dead episode and filter
+portfolio ways that still need the dead special (hard filter; soft demote if
+empty). Lab default **True**. Set **False** to restore pre-escape re-lock
+behavior (smoke A/B control). Does not change θ / dwell freezes.
+"""
+
+GIVEUP_FORCE_DIVERT: bool = True
+"""WP3: when escape is on and a specials-dead episode is active, force S5.5
+divert with episode kill_la/kill_lr (even if S5.5 assess is still soft). Also
+gates sticky from re-locking dead-special ways. Requires GIVEUP_ESCAPE_ENABLED.
+"""
+
+# ---------------------------------------------------------------------------
+# Phase L partial Victory-Way salvage (S0 frozen; S1+ not wired)
+# Spec: docs/PhaseL_partial_way_salvage_plan.md
+# ---------------------------------------------------------------------------
+GIVEUP_SALVAGE_PARTIAL: bool = False
+"""When True (S3+), after dead components rank T1 non-dead-component ways, else
+T2 residual (strip dead components, min own-turns).
+
+Default **False**. S1 helpers always available; S2 T1 eval expand runs when this
+**or** ``GIVEUP_ESCAPE_ENABLED`` is True and a specials-dead episode is active.
+Fair-play: never use god-view DCard-deck VP counts for VP-DCard death.
+"""
+
+GIVEUP_SALVAGE_T1_EXPAND_N: int = 6
+"""S2: max non-LR/non-LA Victory-Ways injected into L2 portfolio eval when
+specials-dead episode has kill_lr / kill_la. 0 disables expand.
+"""
+
+USE_NUMPY_EH: bool = True
+"""P5: use NumPy Expected-Hand kernel when available; falls back to pure Python."""
 
 # Window Dimensions
 WIN_WIDTH: int = 800
@@ -206,16 +414,20 @@ FILENAME_CS: str = f"{FILENAME_HELP}_CS.txt"
 """Change strategy log file."""
 
 FILENAME_MG: str = f"{FILENAME_HELP}_MG.txt"
-"""Multiple games log file."""
+"""Path for detailed MG debug text log when MG=True (not the re-play timeline)."""
 
 FILENAME_MG2: str = f"{FILENAME_HELP}_MG2.txt"
-"""Secondary multiple games log file."""
+"""Secondary MG debug log file (legacy Gen2 naming)."""
 
-FILENAME_MGLOG: str = f"{FILENAME_HELP}_MGlog.txt"
-"""Log for games with NO_GUI_AT_ALL_TF=True."""
+FILENAME_MGLOG: str = f"{FILENAME_HELP}_MGlog.csv"
+"""Re-playable MGlog event timeline (CSV) when MGLOG=True.
 
-FILENAME_MGLOG2: str = f"{FILENAME_HELP}_MGlog2.txt"
-"""Secondary log for games with NO_GUI_AT_ALL_TF=True."""
+Headless batches should prefer per-game files under batch_dir/g00N/ so game 67
+of n=100 is addressable alone. See docs/MGlog_implementation_plan.md.
+"""
+
+FILENAME_MGLOG2: str = f"{FILENAME_HELP}_MGlog2.csv"
+"""Optional secondary MGlog export (legacy Gen2 MGlog2-style columns); v0 may use one CSV only."""
 
 FILENAME_SUM: str = f"{FILENAME_HELP}_Sum.txt"
 """Summary log file."""

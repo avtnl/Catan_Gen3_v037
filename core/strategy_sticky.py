@@ -228,10 +228,11 @@ def flag_opponents_after_structure(
     *,
     target_id: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Flag every non-builder player after an opponent settlement/city.
+    """Flag non-builder seats for whom the structure site is *plan-relevant* (P2).
 
     Multiple opponent builds only keep ``pending=True`` with accumulated
     reasons/builders — strategy re-rank happens once when the flag is consumed.
+    Always invalidates portfolio geometry cache (board fingerprint).
     """
     kind = str(structure or "structure").lower()
     if "city" in kind:
@@ -242,17 +243,31 @@ def flag_opponents_after_structure(
         reason = "opponent_structure"
     builder_id = _safe_int(getattr(builder, "id", None), None)
     flagged: List[int] = []
+    skipped_irrelevant: List[int] = []
+    try:
+        from core.strategy_dirty import structure_relevant_to_player
+    except Exception:
+        structure_relevant_to_player = None  # type: ignore
     for p in list(getattr(game, "players", None) or []):
         pid = _safe_int(getattr(p, "id", None), None)
         if pid is None or (builder_id is not None and pid == builder_id):
+            continue
+        relevant = True
+        if structure_relevant_to_player is not None:
+            try:
+                relevant = bool(structure_relevant_to_player(p, target_id, game))
+            except Exception:
+                relevant = True
+        if not relevant:
+            skipped_irrelevant.append(int(pid))
             continue
         flag_strategy_recalc(
             p,
             reason,
             builder_id=builder_id,
-            detail={"target_id": target_id, "structure": kind},
+            detail={"target_id": target_id, "structure": kind, "relevant": True},
         )
-        flagged.append(pid)
+        flagged.append(int(pid))
     # P2-B: board piece change → drop portfolio cache for all seats
     try:
         from core.ai_way_portfolio import invalidate_board_way_portfolio_cache
@@ -264,6 +279,7 @@ def flag_opponents_after_structure(
         "reason": reason,
         "builder_id": builder_id,
         "flagged_player_ids": flagged,
+        "skipped_irrelevant_player_ids": skipped_irrelevant,
         "structure": kind,
         "target_id": target_id,
     }
@@ -322,30 +338,41 @@ def flag_opponents_after_road(
     road_id: Any = None,
     only_lr_pursuers: bool = True,
 ) -> Dict[str, Any]:
-    """S1 extension: batch-flag after opponent road (LR landscape).
+    """P2: batch-flag after opponent road only if plan-edge or LR-project relevant.
 
-    Default: only flag players whose way still pursues Longest Road (less noise
-    than settle/city global flags). Multiple roads still collapse to one re-rank
-    when the flag is consumed.
+    ``only_lr_pursuers`` kept for API compat; relevance is via
+    ``road_relevant_to_player`` (plan roads / LR project, not every map edge).
     """
     reason = "opponent_road"
     builder_id = _safe_int(getattr(builder, "id", None), None)
     flagged: List[int] = []
     skipped: List[int] = []
+    try:
+        from core.strategy_dirty import road_relevant_to_player
+    except Exception:
+        road_relevant_to_player = None  # type: ignore
     for p in list(getattr(game, "players", None) or []):
         pid = _safe_int(getattr(p, "id", None), None)
         if pid is None or (builder_id is not None and pid == builder_id):
             continue
-        if only_lr_pursuers and not _player_pursues_longest_road(p):
-            skipped.append(pid)
+        relevant = False
+        if road_relevant_to_player is not None:
+            try:
+                relevant = bool(road_relevant_to_player(p, road_id, game))
+            except Exception:
+                relevant = only_lr_pursuers and _player_pursues_longest_road(p)
+        else:
+            relevant = (not only_lr_pursuers) or _player_pursues_longest_road(p)
+        if not relevant:
+            skipped.append(int(pid))
             continue
         flag_strategy_recalc(
             p,
             reason,
             builder_id=builder_id,
-            detail={"road_id": road_id, "structure": "road"},
+            detail={"road_id": road_id, "structure": "road", "relevant": True},
         )
-        flagged.append(pid)
+        flagged.append(int(pid))
     # P2-B: road mutates board connectivity / LR landscape
     try:
         from core.ai_way_portfolio import invalidate_board_way_portfolio_cache
@@ -357,7 +384,8 @@ def flag_opponents_after_road(
         "reason": reason,
         "builder_id": builder_id,
         "flagged_player_ids": flagged,
-        "skipped_non_lr_player_ids": skipped,
+        "skipped_irrelevant_player_ids": skipped,
+        "skipped_non_lr_player_ids": skipped,  # legacy key
         "road_id": road_id,
         "only_lr_pursuers": bool(only_lr_pursuers),
     }
@@ -370,34 +398,43 @@ def flag_opponents_after_knight(
     only_la_pursuers: bool = True,
     army_size: Any = None,
 ) -> Dict[str, Any]:
-    """S1 extension: batch-flag after a knight is played (LA gap, even pre-steal).
-
-    Default: only flag players whose way still pursues Largest Army.
-    Holder flips still also set lost_largest_army / own_largest_army separately.
-    """
+    """P2: batch-flag after knight only for LA-relevant seats."""
     reason = "opponent_knight"
     actor_id = _safe_int(getattr(player, "id", None), None)
     flagged: List[int] = []
     skipped: List[int] = []
+    try:
+        from core.strategy_dirty import player_pursues_la
+    except Exception:
+        player_pursues_la = None  # type: ignore
     for p in list(getattr(game, "players", None) or []):
         pid = _safe_int(getattr(p, "id", None), None)
         if pid is None or (actor_id is not None and pid == actor_id):
             continue
-        if only_la_pursuers and not _player_pursues_largest_army(p):
-            skipped.append(pid)
+        la = False
+        if player_pursues_la is not None:
+            try:
+                la = bool(player_pursues_la(p))
+            except Exception:
+                la = _player_pursues_largest_army(p)
+        else:
+            la = _player_pursues_largest_army(p)
+        if only_la_pursuers and not la:
+            skipped.append(int(pid))
             continue
         flag_strategy_recalc(
             p,
             reason,
             builder_id=actor_id,
-            detail={"army_size": army_size, "structure": "knight"},
+            detail={"army_size": army_size, "structure": "knight", "relevant": True},
         )
-        flagged.append(pid)
+        flagged.append(int(pid))
     return {
         "reason": reason,
         "builder_id": actor_id,
         "flagged_player_ids": flagged,
         "skipped_non_la_player_ids": skipped,
+        "skipped_irrelevant_player_ids": skipped,
         "army_size": army_size,
         "only_la_pursuers": bool(only_la_pursuers),
     }
@@ -409,34 +446,46 @@ def flag_opponents_after_dcard_buy(
     *,
     only_la_pursuers: bool = True,
 ) -> Dict[str, Any]:
-    """Weak S1 extension: opp bought a DCard (deck thins toward LA).
-
-    Only flags LA-pursuing opponents by default. Prefer knight-play flags for
-    strong army-gap updates.
-    """
+    """P2-7: opp DCard buy → dirty only if LA-relevant (or thin-deck + LA care)."""
     reason = "opponent_dcard_buy"
     buyer_id = _safe_int(getattr(buyer, "id", None), None)
     flagged: List[int] = []
     skipped: List[int] = []
+    try:
+        from core.strategy_dirty import dcard_buy_relevant_to_player
+    except Exception:
+        dcard_buy_relevant_to_player = None  # type: ignore
     for p in list(getattr(game, "players", None) or []):
         pid = _safe_int(getattr(p, "id", None), None)
         if pid is None or (buyer_id is not None and pid == buyer_id):
             continue
-        if only_la_pursuers and not _player_pursues_largest_army(p):
-            skipped.append(pid)
+        relevant = False
+        if dcard_buy_relevant_to_player is not None:
+            try:
+                relevant = bool(dcard_buy_relevant_to_player(p, game, buyer))
+            except Exception:
+                relevant = (not only_la_pursuers) or _player_pursues_largest_army(p)
+        else:
+            relevant = (not only_la_pursuers) or _player_pursues_largest_army(p)
+        if only_la_pursuers and not relevant:
+            skipped.append(int(pid))
+            continue
+        if not relevant:
+            skipped.append(int(pid))
             continue
         flag_strategy_recalc(
             p,
             reason,
             builder_id=buyer_id,
-            detail={"structure": "dcard_buy"},
+            detail={"structure": "dcard_buy", "relevant": True},
         )
-        flagged.append(pid)
+        flagged.append(int(pid))
     return {
         "reason": reason,
         "builder_id": buyer_id,
         "flagged_player_ids": flagged,
         "skipped_non_la_player_ids": skipped,
+        "skipped_irrelevant_player_ids": skipped,
         "only_la_pursuers": bool(only_la_pursuers),
     }
 
@@ -1072,6 +1121,23 @@ def commit_from_direction(
     }
     if lr_proj:
         out_c["lr_project"] = lr_proj
+    # S4: persist partial_plan / ignored_components on sticky for dig + re-lock gates
+    try:
+        from core.partial_way_salvage import stamp_commitment_partial_plan
+
+        stamp_commitment_partial_plan(out_c, direction_local, None, game)
+    except Exception:
+        pass
+    if isinstance(direction_local, Mapping):
+        if direction_local.get("partial_plan"):
+            out_c["partial_plan"] = True
+        ign = direction_local.get("ignored_components")
+        if ign:
+            out_c["ignored_components"] = list(ign)
+            if "LR" in ign or "lr" in {str(x).upper() for x in ign}:
+                out_c.pop("lr_project", None)
+            if "LA" in ign or "la" in {str(x).lower() for x in ign}:
+                out_c.pop("la_progress", None)
     return out_c
 
 
@@ -1307,6 +1373,291 @@ def record_last_sticky_switch(
     except Exception:
         pass
     return payload
+
+
+def _achieve_kind_from_invalidate(inv_reason: str) -> Optional[str]:
+    r = str(inv_reason or "").lower()
+    if "own_rec_settle_complete" in r or "settle_complete" in r:
+        return "settle"
+    if "own_rec_city_complete" in r or "city_complete" in r:
+        return "city"
+    return None
+
+
+def _sticky_apply_action(
+    meta: Mapping[str, Any],
+    *,
+    prev_way: Optional[int],
+    cur_way: Optional[int],
+    prev_tid: Optional[int],
+    cur_tid: Optional[int],
+    prev_roads_fp: Optional[str],
+    cur_roads_fp: Optional[str],
+) -> str:
+    """Phase C: coarse sticky apply outcome for CS dig-in."""
+    if bool(meta.get("held")):
+        if (
+            prev_tid is not None
+            and cur_tid is not None
+            and prev_tid == cur_tid
+            and prev_roads_fp is not None
+            and cur_roads_fp is not None
+            and prev_roads_fp != cur_roads_fp
+        ):
+            return "repath"
+        return "hold"
+    if bool(meta.get("invalidated")) and cur_way is None and cur_tid is None:
+        if not bool(meta.get("committed")):
+            return "clear"
+    if bool(meta.get("committed")) or cur_way is not None or cur_tid is not None:
+        if prev_way is None and cur_way is not None:
+            return "new_commitment"
+        if prev_way is not None and cur_way is not None and prev_way != cur_way:
+            return "way_switch"
+        if prev_tid is not None and cur_tid is not None and prev_tid != cur_tid:
+            return "retarget"
+        if prev_tid is None and cur_tid is not None:
+            return "retarget"
+        return "new_commitment"
+    if bool(meta.get("invalidated")):
+        return "clear"
+    return str(meta.get("reason") or "none") or "none"
+
+
+def publish_last_sticky_cs_meta(
+    player: Any,
+    game: Any,
+    meta: Optional[Mapping[str, Any]] = None,
+    *,
+    prev_commitment: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Phase C WP-C1: publish ``player.last_sticky_meta`` for CS schema v2.
+
+    Safe no-op bag when inputs are thin. Call after every sticky apply outcome.
+    """
+    meta = meta if isinstance(meta, Mapping) else {}
+    prev_c = prev_commitment if isinstance(prev_commitment, Mapping) else None
+    cur_c = get_sticky_commitment(player)
+
+    try:
+        from core.batch.strategy_change_taxonomy import (
+            roads_fingerprint,
+            suggest_target_switch_cause_from_invalidate,
+            suggest_way_switch_cause_from_invalidate,
+        )
+    except Exception:  # pragma: no cover
+        def roads_fingerprint(roads: Any) -> Optional[str]:  # type: ignore[misc]
+            return None
+
+        def suggest_way_switch_cause_from_invalidate(*_a: Any, **_k: Any) -> str:  # type: ignore[misc]
+            return "unknown"
+
+        def suggest_target_switch_cause_from_invalidate(*_a: Any, **_k: Any) -> str:  # type: ignore[misc]
+            return "unknown"
+
+    prev_way = _safe_int((prev_c or {}).get("locked_way_id"), None)
+    prev_tid = _safe_int((prev_c or {}).get("locked_rec_target_id"), None)
+    prev_kind = str((prev_c or {}).get("locked_target_kind") or "") or None
+    prev_roads_fp = roads_fingerprint((prev_c or {}).get("locked_roads_to_build"))
+
+    cur_way = _safe_int(
+        meta.get("locked_way_id"),
+        _safe_int((cur_c or {}).get("locked_way_id"), None),
+    )
+    cur_tid = _safe_int(
+        meta.get("locked_rec_target_id"),
+        _safe_int((cur_c or {}).get("locked_rec_target_id"), None),
+    )
+    cur_kind = str(
+        (cur_c or {}).get("locked_target_kind")
+        or meta.get("locked_target_kind")
+        or ""
+    ) or None
+    cur_roads = list(
+        meta.get("locked_roads_to_build")
+        or ((cur_c or {}).get("locked_roads_to_build") if cur_c else None)
+        or []
+    )
+    cur_roads_fp = roads_fingerprint(cur_roads)
+
+    inv = str(meta.get("invalidate_reason") or "")
+    achieve_kind = _achieve_kind_from_invalidate(inv)
+
+    is_first_way = prev_way is None and cur_way is not None
+    is_first_target = prev_tid is None and cur_tid is not None
+    way_changed = bool(
+        (prev_way is None and cur_way is not None)
+        or (prev_way is not None and cur_way is not None and prev_way != cur_way)
+    )
+    # first lock counts as way_changed=False for switch rates; flag separately
+    target_changed = bool(
+        (prev_tid is None and cur_tid is not None)
+        or (prev_tid is not None and cur_tid is not None and prev_tid != cur_tid)
+        or (prev_kind and cur_kind and prev_kind != cur_kind and prev_tid == cur_tid)
+    )
+    roads_changed = bool(
+        prev_tid is not None
+        and cur_tid is not None
+        and prev_tid == cur_tid
+        and prev_roads_fp is not None
+        and cur_roads_fp is not None
+        and prev_roads_fp != cur_roads_fp
+    )
+
+    q1_offway = bool(meta.get("s14_offway")) or "s14_2" in inv.lower() or "offway" in inv.lower()
+    way_kill = "way_kill" in inv.lower() or "infeasible" in inv.lower()
+
+    apply_action = _sticky_apply_action(
+        meta,
+        prev_way=prev_way,
+        cur_way=cur_way,
+        prev_tid=prev_tid,
+        cur_tid=cur_tid,
+        prev_roads_fp=prev_roads_fp,
+        cur_roads_fp=cur_roads_fp,
+    )
+
+    way_switch_cause = None
+    if is_first_way:
+        way_switch_cause = "first_lock"
+    elif way_changed and prev_way is not None:
+        way_switch_cause = suggest_way_switch_cause_from_invalidate(
+            inv,
+            is_first_lock=False,
+            q1_offway=q1_offway,
+            way_kill=way_kill,
+        )
+
+    target_switch_cause = None
+    if is_first_target:
+        target_switch_cause = "first_lock"
+    elif target_changed:
+        target_switch_cause = suggest_target_switch_cause_from_invalidate(
+            inv,
+            is_first_lock=False,
+            achieve_kind=str(achieve_kind or ""),
+            way_changed=way_changed and prev_way is not None,
+            q1_offway=q1_offway,
+        )
+
+    # L2 dig-in (optional)
+    l2_bucket = None
+    l2_force_reason = None
+    try:
+        st = getattr(player, "last_strategy_context_status", None) if player is not None else None
+        if not isinstance(st, Mapping) and game is not None:
+            st = getattr(game, "last_strategy_context_status", None)
+        if isinstance(st, Mapping):
+            pol = st.get("l2_policy")
+            if isinstance(pol, Mapping):
+                l2_bucket = str(pol.get("bucket") or "") or None
+                l2_force_reason = str(pol.get("reason") or pol.get("force_reason") or "") or None
+    except Exception:
+        pass
+
+    way_kill_kind = None
+    try:
+        wk = getattr(player, "last_way_kill", None) if player is not None else None
+        if isinstance(wk, Mapping):
+            way_kill_kind = str(wk.get("kind") or wk.get("type") or "") or None
+    except Exception:
+        pass
+
+    switch_eta_gain = None  # filled by CS row when turns known
+
+    bag: Dict[str, Any] = {
+        "sticky_way_id": cur_way,
+        "sticky_target_id": cur_tid,
+        "sticky_target_kind": cur_kind,
+        "sticky_roads_fp": cur_roads_fp,
+        "prev_sticky_way_id": prev_way,
+        "prev_sticky_target_id": prev_tid,
+        "prev_sticky_target_kind": prev_kind,
+        "prev_sticky_roads_fp": prev_roads_fp,
+        "way_changed": bool(way_changed and prev_way is not None),
+        "target_changed": bool(target_changed and not is_first_target),
+        "roads_changed": roads_changed,
+        "is_first_way_lock": is_first_way,
+        "is_first_target_lock": is_first_target,
+        "sticky_invalidate_reason": inv or None,
+        "sticky_apply_action": apply_action,
+        "way_switch_cause": way_switch_cause,
+        "target_switch_cause": target_switch_cause,
+        "switch_eta_gain": switch_eta_gain,
+        "l2_bucket": l2_bucket,
+        "l2_force_reason": l2_force_reason,
+        "way_kill_kind": way_kill_kind,
+        "q1_offway": bool(q1_offway) or None,
+        "achieve_kind": achieve_kind,
+        "held": bool(meta.get("held")),
+        "committed": bool(meta.get("committed")),
+        "invalidated": bool(meta.get("invalidated")),
+        "sticky_reason": str(meta.get("reason") or "") or None,
+        "round": _safe_int(getattr(game, "round", None), None) if game is not None else None,
+        "turn": _safe_int(getattr(game, "turn", None), None) if game is not None else None,
+        "player_id": _safe_int(getattr(player, "id", None), None) if player is not None else None,
+    }
+
+    try:
+        if player is not None:
+            setattr(player, "last_sticky_meta", dict(bag))
+    except Exception:
+        pass
+
+    # Phase C2 dig: stamp refresh gate on sticky meta (for CS target-renew attribution)
+    if game is not None:
+        try:
+            bag["refresh_mode"] = str(getattr(game, "_strategy_refresh_mode", None) or "") or None
+            bag["refresh_mode_detail"] = (
+                str(getattr(game, "_strategy_refresh_mode_detail", None) or "") or None
+            )
+            st = getattr(game, "last_strategy_context_status", None)
+            if isinstance(st, Mapping):
+                pol = st.get("l2_policy") if isinstance(st.get("l2_policy"), Mapping) else {}
+                if pol:
+                    bag["l2_bucket"] = bag.get("l2_bucket") or pol.get("bucket")
+                    bag["l2_force_reason"] = bag.get("l2_force_reason") or pol.get("gate")
+        except Exception:
+            pass
+        try:
+            meta_live = getattr(player, "last_sticky_meta", None)
+            if isinstance(meta_live, dict):
+                meta_live["refresh_mode"] = bag.get("refresh_mode")
+                meta_live["refresh_mode_detail"] = bag.get("refresh_mode_detail")
+                if bag.get("l2_bucket") is not None:
+                    meta_live["l2_bucket"] = bag.get("l2_bucket")
+                if bag.get("l2_force_reason") is not None:
+                    meta_live["l2_force_reason"] = bag.get("l2_force_reason")
+                setattr(player, "last_sticky_meta", meta_live)
+        except Exception:
+            pass
+
+    # Phase C2 WP-R5: snapshot first-way fit once at first Victory-Way lock
+    if is_first_way and player is not None:
+        try:
+            from core.first_way_fit import maybe_snapshot_on_first_lock
+
+            fit = maybe_snapshot_on_first_lock(
+                game, player, is_first_way=True, way_id=cur_way
+            )
+            if isinstance(fit, Mapping):
+                bag["first_way_fit"] = {
+                    "way_id": fit.get("way_id"),
+                    "fit_total": fit.get("fit_total"),
+                    "fit_own": fit.get("fit_own"),
+                    "fit_board": fit.get("fit_board"),
+                    "fit_expand": fit.get("fit_expand"),
+                }
+                try:
+                    meta_out = getattr(player, "last_sticky_meta", None)
+                    if isinstance(meta_out, dict):
+                        meta_out["first_way_fit"] = bag["first_way_fit"]
+                        setattr(player, "last_sticky_meta", meta_out)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return bag
 
 
 def _apply_target_fields(
@@ -1595,11 +1946,41 @@ def _apply_sticky_layer_impl(
     elif consume_flag:
         meta["recalc_mode"] = "recalc_now"
 
+    # Phase C2 WP-R3: explicit L2 always-best — do not sticky-hold a worse way
+    explicit_best = False
+    try:
+        from core.strategy_explicit_recalc import should_adopt_best_way
+
+        explicit_best = bool(should_adopt_best_way(player))
+    except Exception:
+        explicit_best = False
+    meta["explicit_best_way"] = bool(explicit_best)
+
     commitment = get_sticky_commitment(player)
     # S19: keep a copy before invalidate clears sticky (for last_sticky_switch)
     prev_commitment_snapshot: Optional[Dict[str, Any]] = (
         dict(commitment) if isinstance(commitment, Mapping) else None
     )
+
+    # WP3: specials-dead episode — clear sticky still locked on dead LA/LR ways
+    try:
+        from core.specials_dead_episode import (
+            commitment_blocked_by_episode,
+            is_giveup_escape_enabled,
+        )
+
+        if is_giveup_escape_enabled() and commitment is not None:
+            blocked, why = commitment_blocked_by_episode(commitment, player)
+            if blocked:
+                clear_sticky_commitment(player)
+                commitment = None
+                meta["invalidated"] = True
+                meta["invalidate_reason"] = f"specials_dead_episode:{why}"
+                meta["specials_dead_gate"] = True
+                meta["specials_dead_gate_why"] = why
+    except Exception as _sde_gate_exc:
+        meta["specials_dead_gate_error"] = str(_sde_gate_exc)
+
     if commitment is not None:
         invalidate, inv_reason = should_invalidate_sticky(
             game,
@@ -1610,6 +1991,25 @@ def _apply_sticky_layer_impl(
             flag_reason=consume_reason,
         )
         if invalidate:
+            # Phase C2 WP-R3: hard-invalid sticky may latch explicit code 3
+            try:
+                inv_l = str(inv_reason or "").lower()
+                if any(
+                    n in inv_l
+                    for n in (
+                        "occupied",
+                        "race_impossible",
+                        "route",
+                        "infeasible",
+                        "hard_invalid",
+                        "illegal",
+                    )
+                ):
+                    from core.strategy_explicit_recalc import note_hard_invalid
+
+                    note_hard_invalid(player, reason=str(inv_reason or ""))
+            except Exception:
+                pass
             # S-LR-A2: structure complete/occupied → strip structure, keep LR if any
             if inv_reason in (
                 "own_rec_city_complete",
@@ -1636,158 +2036,249 @@ def _apply_sticky_layer_impl(
                 meta["invalidated"] = True
                 meta["invalidate_reason"] = inv_reason
         if commitment is not None and not invalidate:
-            # S14-2: off-way opportunity with lower win-ETA → force one full re-solve
-            try:
-                offway, off_reason, off_meta = should_offway_opportunity_resolve(
-                    game, player, audits, direction_out
-                )
-            except Exception:
-                offway, off_reason, off_meta = False, "", {}
-            if offway:
-                clear_sticky_commitment(player)
+            # Phase C2 WP-R3: adopt L2 best way — skip hold when best ≠ locked
+            if explicit_best:
                 try:
-                    setattr(player, "force_strategy_recalc", True)
-                    setattr(
+                    from core.strategy_explicit_recalc import (
+                        audit_way_id,
+                        find_audit_eta_for_way,
+                        record_way_reassess_compare,
+                    )
+
+                    locked_w = _safe_int(commitment.get("locked_way_id"), None)
+                    best_w = None
+                    if audits:
+                        best_w = audit_way_id(audits[0])
+                    if best_w is None:
+                        best_w = _safe_int(
+                            direction_out.get("preferred_way_id")
+                            or direction_out.get("way_id"),
+                            None,
+                        )
+                    eta_locked = find_audit_eta_for_way(audits, locked_w)
+                    eta_best = find_audit_eta_for_way(audits, best_w)
+                    switched = (
+                        locked_w is not None
+                        and best_w is not None
+                        and int(locked_w) != int(best_w)
+                    )
+                    if switched:
+                        clear_sticky_commitment(player)
+                        commitment = None
+                        meta["invalidated"] = True
+                        meta["invalidate_reason"] = "explicit_142_recalc_best_way"
+                        meta["explicit_switch"] = True
+                        # fall through to re-commit from direction (already best)
+                    else:
+                        # same way — normal hold path below
+                        pass
+                    try:
+                        rt = getattr(player, "explicit_recalc_runtime", None) or {}
+                        trig = str(rt.get("session_reason") or "explicit_142_recalc")
+                    except Exception:
+                        trig = "explicit_142_recalc"
+                    record_way_reassess_compare(
                         player,
-                        "pending_full_resolve",
-                        {"reason": off_reason, "trigger": "s14_2", "detail": dict(off_meta or {})},
+                        game,
+                        locked_way=locked_w,
+                        best_alt_way=best_w,
+                        eta_locked=eta_locked,
+                        eta_alt=eta_best,
+                        switched=bool(switched),
+                        switch_reason=(
+                            "switched_best"
+                            if switched
+                            else ("same_way" if best_w is not None else "no_alt")
+                        ),
+                        trigger=trig,
+                    )
+                    if not switched and commitment is not None:
+                        # continue into normal hold
+                        pass
+                    elif switched:
+                        # skip hold / offway; fall through to commit
+                        pass
+                except Exception as exp_exc:
+                    meta["explicit_best_error"] = str(exp_exc)
+
+            # S14-2: off-way opportunity with lower win-ETA → force one full re-solve
+            # (skip when we already cleared sticky for explicit best switch)
+            if commitment is not None:
+                try:
+                    offway, off_reason, off_meta = should_offway_opportunity_resolve(
+                        game, player, audits, direction_out
                     )
                 except Exception:
-                    pass
-                commitment = None
-                meta["invalidated"] = True
-                meta["invalidate_reason"] = off_reason or "s14_2_offway"
-                meta["s14_offway"] = dict(off_meta or {})
-                # fall through to re-commit from current direction
-            else:
-                # S-LR-A2: refresh/invalidate LR project independently
-                try:
-                    from core.ai_lr_project import (
-                        clear_lr_project_from_sticky,
-                        ensure_lr_project_sticky,
-                        get_stored_lr_project,
-                        should_invalidate_lr_project,
-                    )
-
-                    lr_meta = ensure_lr_project_sticky(game, player)
-                    meta["lr"] = dict(lr_meta)
-                    if lr_meta.get("invalidated") and not get_stored_lr_project(player, game):
-                        # LR gone; if no structure lock left, fall through
-                        commitment = get_sticky_commitment(player)
-                        if commitment is None:
-                            # fall through to commit
-                            pass
-                except Exception as lr_exc:
-                    meta["lr_error"] = str(lr_exc)
-
-                # S-LA-A: refresh/invalidate LA progress independently
-                try:
-                    from core.ai_la_progress import ensure_la_progress_sticky
-
-                    la_meta = ensure_la_progress_sticky(game, player)
-                    meta["la"] = dict(la_meta)
-                except Exception as la_exc:
-                    meta["la_error"] = str(la_exc)
-
-                commitment = get_sticky_commitment(player)
-                if commitment is None:
-                    pass  # fall through to commit
+                    offway, off_reason, off_meta = False, "", {}
+                if offway:
+                    clear_sticky_commitment(player)
+                    try:
+                        setattr(player, "force_strategy_recalc", True)
+                        setattr(
+                            player,
+                            "pending_full_resolve",
+                            {
+                                "reason": off_reason,
+                                "trigger": "s14_2",
+                                "detail": dict(off_meta or {}),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    commitment = None
+                    meta["invalidated"] = True
+                    meta["invalidate_reason"] = off_reason or "s14_2_offway"
+                    meta["s14_offway"] = dict(off_meta or {})
+                    # fall through to re-commit from current direction
                 else:
-                    direction_out = force_sticky_on_direction(
-                        direction_out, commitment, audits, game, player
-                    )
-                    commitment = refresh_commitment_roads(
-                        commitment, audits, player, game=game
-                    )
-                    # Re-attach refreshed lr_project / la_progress onto commitment
+                    # S-LR-A2: refresh/invalidate LR project independently
                     try:
-                        from core.ai_lr_project import get_stored_lr_project
-
-                        lr_now = get_stored_lr_project(player, game)
-                        if lr_now:
-                            commitment["lr_project"] = lr_now
-                        elif "lr_project" in commitment:
-                            commitment.pop("lr_project", None)
-                    except Exception:
-                        pass
-                    try:
-                        from core.ai_la_progress import (
-                            apply_la_progress_to_direction,
-                            get_stored_la_progress,
+                        from core.ai_lr_project import (
+                            clear_lr_project_from_sticky,
+                            ensure_lr_project_sticky,
+                            get_stored_lr_project,
+                            should_invalidate_lr_project,
                         )
 
-                        la_now = get_stored_la_progress(player, game)
-                        if la_now:
-                            commitment["la_progress"] = la_now
-                            direction_out = apply_la_progress_to_direction(
-                                direction_out, player, game
+                        lr_meta = ensure_lr_project_sticky(game, player)
+                        meta["lr"] = dict(lr_meta)
+                        if lr_meta.get("invalidated") and not get_stored_lr_project(
+                            player, game
+                        ):
+                            # LR gone; if no structure lock left, fall through
+                            commitment = get_sticky_commitment(player)
+                            if commitment is None:
+                                # fall through to commit
+                                pass
+                    except Exception as lr_exc:
+                        meta["lr_error"] = str(lr_exc)
+
+                    # S-LA-A: refresh/invalidate LA progress independently
+                    try:
+                        from core.ai_la_progress import ensure_la_progress_sticky
+
+                        la_meta = ensure_la_progress_sticky(game, player)
+                        meta["la"] = dict(la_meta)
+                    except Exception as la_exc:
+                        meta["la_error"] = str(la_exc)
+
+                    commitment = get_sticky_commitment(player)
+                    if commitment is None:
+                        pass  # fall through to commit
+                    else:
+                        direction_out = force_sticky_on_direction(
+                            direction_out, commitment, audits, game, player
+                        )
+                        commitment = refresh_commitment_roads(
+                            commitment, audits, player, game=game
+                        )
+                        # Re-attach refreshed lr_project / la_progress onto commitment
+                        try:
+                            from core.ai_lr_project import get_stored_lr_project
+
+                            lr_now = get_stored_lr_project(player, game)
+                            if lr_now:
+                                commitment["lr_project"] = lr_now
+                            elif "lr_project" in commitment:
+                                commitment.pop("lr_project", None)
+                        except Exception:
+                            pass
+                        try:
+                            from core.ai_la_progress import (
+                                apply_la_progress_to_direction,
+                                get_stored_la_progress,
                             )
-                        elif "la_progress" in commitment:
-                            commitment.pop("la_progress", None)
-                    except Exception:
-                        pass
-                    # Refresh board snapshot so diagnostics stay current, but do not
-                    # use snap-diff as an invalidator (flag owns board-shock batching).
-                    tid = _safe_int(commitment.get("locked_rec_target_id"), None)
-                    if tid is not None:
-                        snap = snapshot_opponent_board(game, player, target_id=tid)
-                        commitment["opp_structures"] = list(snap.get("opp_structures") or [])
-                        commitment["opp_roads_near"] = list(snap.get("opp_roads_near") or [])
-                    # S13 refresh multi-target list on hold
-                    try:
-                        from core.strategy_target_format import (
-                            collect_display_targets,
-                            format_targets_line,
-                        )
 
-                        commitment["display_targets"] = collect_display_targets(
-                            direction_out, player=player
-                        )
-                        direction_out["display_targets"] = list(commitment["display_targets"])
-                        direction_out["display_targets_line"] = format_targets_line(
-                            direction_out, player=player
-                        )
-                    except Exception:
-                        pass
-                    # Turn focus (A2 + S-LR-C race/dense flags)
-                    try:
-                        from core.ai_lr_project import pick_turn_focus
+                            la_now = get_stored_la_progress(player, game)
+                            if la_now:
+                                commitment["la_progress"] = la_now
+                                direction_out = apply_la_progress_to_direction(
+                                    direction_out, player, game
+                                )
+                            elif "la_progress" in commitment:
+                                commitment.pop("la_progress", None)
+                        except Exception:
+                            pass
+                        # Refresh board snapshot so diagnostics stay current, but do not
+                        # use snap-diff as an invalidator (flag owns board-shock batching).
+                        tid = _safe_int(commitment.get("locked_rec_target_id"), None)
+                        if tid is not None:
+                            snap = snapshot_opponent_board(game, player, target_id=tid)
+                            commitment["opp_structures"] = list(
+                                snap.get("opp_structures") or []
+                            )
+                            commitment["opp_roads_near"] = list(
+                                snap.get("opp_roads_near") or []
+                            )
+                        # S13 refresh multi-target list on hold
+                        try:
+                            from core.strategy_target_format import (
+                                collect_display_targets,
+                                format_targets_line,
+                            )
 
-                        focus_info = pick_turn_focus(game, player)
-                        direction_out["turn_focus"] = focus_info.get("focus")
-                        direction_out["turn_focus_reason"] = focus_info.get("reason")
-                        direction_out["dense_pack"] = bool(focus_info.get("dense_pack"))
-                        direction_out["la_race"] = bool(focus_info.get("la_race"))
-                        direction_out["lr_race"] = bool(focus_info.get("lr_race"))
-                        direction_out["defer_optional_claim"] = bool(
-                            focus_info.get("defer_optional_claim")
+                            commitment["display_targets"] = collect_display_targets(
+                                direction_out, player=player
+                            )
+                            direction_out["display_targets"] = list(
+                                commitment["display_targets"]
+                            )
+                            direction_out["display_targets_line"] = format_targets_line(
+                                direction_out, player=player
+                            )
+                        except Exception:
+                            pass
+                        # Turn focus (A2 + S-LR-C race/dense flags)
+                        try:
+                            from core.ai_lr_project import pick_turn_focus
+
+                            focus_info = pick_turn_focus(game, player)
+                            direction_out["turn_focus"] = focus_info.get("focus")
+                            direction_out["turn_focus_reason"] = focus_info.get("reason")
+                            direction_out["dense_pack"] = bool(
+                                focus_info.get("dense_pack")
+                            )
+                            direction_out["la_race"] = bool(focus_info.get("la_race"))
+                            direction_out["lr_race"] = bool(focus_info.get("lr_race"))
+                            direction_out["defer_optional_claim"] = bool(
+                                focus_info.get("defer_optional_claim")
+                            )
+                            commitment["turn_focus"] = focus_info.get("focus")
+                            commitment["turn_focus_reason"] = focus_info.get("reason")
+                            meta["turn_focus"] = focus_info.get("focus")
+                            meta["dense_pack"] = bool(focus_info.get("dense_pack"))
+                            meta["la_race"] = bool(focus_info.get("la_race"))
+                            meta["lr_race"] = bool(focus_info.get("lr_race"))
+                        except Exception:
+                            pass
+                        set_sticky_commitment(player, commitment)
+                        meta["applied"] = True
+                        meta["held"] = True
+                        meta["reason"] = "sticky_hold"
+                        meta["locked_way_id"] = commitment.get("locked_way_id")
+                        meta["locked_rec_target_id"] = commitment.get(
+                            "locked_rec_target_id"
                         )
-                        commitment["turn_focus"] = focus_info.get("focus")
-                        commitment["turn_focus_reason"] = focus_info.get("reason")
-                        meta["turn_focus"] = focus_info.get("focus")
-                        meta["dense_pack"] = bool(focus_info.get("dense_pack"))
-                        meta["la_race"] = bool(focus_info.get("la_race"))
-                        meta["lr_race"] = bool(focus_info.get("lr_race"))
-                    except Exception:
-                        pass
-                    set_sticky_commitment(player, commitment)
-                    meta["applied"] = True
-                    meta["held"] = True
-                    meta["reason"] = "sticky_hold"
-                    meta["locked_way_id"] = commitment.get("locked_way_id")
-                    meta["locked_rec_target_id"] = commitment.get("locked_rec_target_id")
-                    meta["locked_roads_to_build"] = list(commitment.get("locked_roads_to_build") or [])
-                    direction_out["sticky_meta"] = {
-                        "held": True,
-                        "reason": "sticky_hold",
-                        "flag_deferred": meta["flag_deferred"],
-                        "flag_reasons": meta["flag_reasons"],
-                        "locked_way_id": meta["locked_way_id"],
-                        "locked_rec_target_id": meta["locked_rec_target_id"],
-                        "lr_project": bool(commitment.get("lr_project")),
-                        "turn_focus": direction_out.get("turn_focus"),
-                    }
-                    return direction_out, meta
+                        meta["locked_roads_to_build"] = list(
+                            commitment.get("locked_roads_to_build") or []
+                        )
+                        direction_out["sticky_meta"] = {
+                            "held": True,
+                            "reason": "sticky_hold",
+                            "flag_deferred": meta["flag_deferred"],
+                            "flag_reasons": meta["flag_reasons"],
+                            "locked_way_id": meta["locked_way_id"],
+                            "locked_rec_target_id": meta["locked_rec_target_id"],
+                            "lr_project": bool(commitment.get("lr_project")),
+                            "turn_focus": direction_out.get("turn_focus"),
+                        }
+                        publish_last_sticky_cs_meta(
+                            player,
+                            game,
+                            meta,
+                            prev_commitment=prev_commitment_snapshot,
+                        )
+                        return direction_out, meta
 
     # Own milestone with no legal actions: clear sticky already, but do not
     # re-lock a thrashy provisional target until flag is consumed later.
@@ -1801,6 +2292,9 @@ def _apply_sticky_layer_impl(
             "flag_reasons": meta["flag_reasons"],
             "reason": meta["reason"],
         }
+        publish_last_sticky_cs_meta(
+            player, game, meta, prev_commitment=prev_commitment_snapshot
+        )
         return direction_out, meta
 
     # Hard invalidate while flag deferred (e.g. own rec complete, no legal acts):
@@ -1816,6 +2310,9 @@ def _apply_sticky_layer_impl(
             "flag_reasons": meta["flag_reasons"],
             "reason": meta["reason"],
         }
+        publish_last_sticky_cs_meta(
+            player, game, meta, prev_commitment=prev_commitment_snapshot
+        )
         return direction_out, meta
 
     # S11: enrich city target before commit when rec blank
@@ -1833,6 +2330,85 @@ def _apply_sticky_layer_impl(
             prev_for_switch = get_sticky_commitment(player)
         except Exception:
             prev_for_switch = None
+
+    # WP3: do not sticky-commit a way that still needs a dead special
+    try:
+        from core.specials_dead_episode import (
+            direction_blocked_by_episode,
+            is_giveup_escape_enabled,
+        )
+
+        if is_giveup_escape_enabled():
+            blocked_dir, why_dir = direction_blocked_by_episode(direction_out, player)
+            if blocked_dir:
+                # Prefer first non-blocked audit as commit source
+                try:
+                    from core.specials_dead_episode import (
+                        filter_audits_for_specials_dead,
+                        get_specials_dead_episode,
+                    )
+                    from core.ai_way_portfolio import board_audit_to_strategic_direction
+
+                    ep = get_specials_dead_episode(player)
+                    filtered, fmeta = filter_audits_for_specials_dead(
+                        audits, episode=ep, player=player
+                    )
+                    if filtered and fmeta.get("mode") == "hard_filter":
+                        alt_dir = board_audit_to_strategic_direction(
+                            filtered[0],
+                            abstract_preferred=direction_out,
+                            override_applied=True,
+                            override_reason="specials_dead_sticky_gate",
+                        )
+                        direction_out = dict(alt_dir)
+                        direction_out["preference_source"] = (
+                            str(direction_out.get("preference_source") or "")
+                            + "+specials_dead_sticky_gate"
+                        ).lstrip("+")
+                        meta["specials_dead_sticky_rewrote"] = True
+                        meta["specials_dead_sticky_to_way"] = direction_out.get(
+                            "preferred_way_id"
+                        )
+                    else:
+                        meta["specials_dead_block_commit"] = True
+                        meta["specials_dead_block_why"] = why_dir
+                        # Leave unlocked rather than re-lock dead special
+                        new_c = None
+                        meta["reason"] = f"specials_dead_block_commit:{why_dir}"
+                        direction_out["sticky_meta"] = {
+                            "held": False,
+                            "committed": False,
+                            "specials_dead_gate": True,
+                            "reason": meta["reason"],
+                        }
+                        publish_last_sticky_cs_meta(
+                            player,
+                            game,
+                            meta,
+                            prev_commitment=prev_commitment_snapshot,
+                        )
+                        return direction_out, meta
+                except Exception as _rew_exc:
+                    meta["specials_dead_rewrite_error"] = str(_rew_exc)
+                    meta["specials_dead_block_commit"] = True
+                    clear_sticky_commitment(player)
+                    new_c = None
+                    meta["reason"] = f"specials_dead_block_commit:{why_dir}"
+                    direction_out["sticky_meta"] = {
+                        "held": False,
+                        "committed": False,
+                        "specials_dead_gate": True,
+                        "reason": meta["reason"],
+                    }
+                    publish_last_sticky_cs_meta(
+                        player,
+                        game,
+                        meta,
+                        prev_commitment=prev_commitment_snapshot,
+                    )
+                    return direction_out, meta
+    except Exception as _gate_exc:
+        meta["specials_dead_commit_gate_error"] = str(_gate_exc)
 
     # Commit from current direction (fresh, force, or post-invalidate with consume)
     new_c = commit_from_direction(direction_out, game, player)
@@ -1870,6 +2446,28 @@ def _apply_sticky_layer_impl(
         meta["lr_error"] = str(lr_exc)
         lr_meta = {}
 
+    # WP3: do not re-arm LR project while kill_lr episode is active
+    try:
+        from core.specials_dead_episode import episode_kill_flags, is_giveup_escape_enabled
+
+        if is_giveup_escape_enabled():
+            _kla, klr = episode_kill_flags(player)
+            if klr:
+                try:
+                    from core.ai_lr_project import clear_lr_project_from_sticky
+
+                    clear_lr_project_from_sticky(player, game)
+                except Exception:
+                    pass
+                try:
+                    direction_out.pop("lr_project", None)
+                    direction_out["longest_road"] = False
+                except Exception:
+                    pass
+                meta["lr_suppressed_specials_dead"] = True
+    except Exception:
+        pass
+
     # S-LA-A: arm LA progress alongside structure / LR
     la_meta: Dict[str, Any] = {}
     try:
@@ -1881,24 +2479,77 @@ def _apply_sticky_layer_impl(
         meta["la_error"] = str(la_exc)
         la_meta = {}
 
+    # WP3: suppress LA progress while kill_la episode active
+    try:
+        from core.specials_dead_episode import episode_kill_flags, is_giveup_escape_enabled
+
+        if is_giveup_escape_enabled():
+            kla, _klr = episode_kill_flags(player)
+            if kla:
+                try:
+                    from core.ai_la_progress import clear_la_progress_from_sticky
+
+                    clear_la_progress_from_sticky(player, game)
+                except Exception:
+                    pass
+                try:
+                    player.la_progress = None
+                except Exception:
+                    pass
+                try:
+                    direction_out["biggest_army"] = False
+                    direction_out["largest_army"] = False
+                except Exception:
+                    pass
+                meta["la_suppressed_specials_dead"] = True
+    except Exception:
+        pass
+
+    # S4: suppress LR/LA projects for any ignored_components (episode + expansion + stamp)
+    try:
+        from core.partial_way_salvage import (
+            apply_s4_project_suppress,
+            stamp_commitment_partial_plan,
+        )
+
+        if not isinstance(direction_out, dict):
+            direction_out = dict(direction_out or {})
+        s4_meta = apply_s4_project_suppress(
+            player, game, direction_out, meta
+        )
+        meta["s4"] = dict(s4_meta)
+    except Exception as _s4_exc:
+        meta["s4_error"] = str(_s4_exc)
+
     if new_c is not None:
         # Merge any LR project / LA progress into the new structure commitment
         try:
             from core.ai_lr_project import get_stored_lr_project
 
             lr_now = get_stored_lr_project(player, game)
-            if lr_now:
+            if lr_now and not meta.get("lr_suppressed_specials_dead"):
                 new_c["lr_project"] = lr_now
                 new_c["sticky_version"] = max(3, int(new_c.get("sticky_version") or 0) or 3)
+            elif meta.get("lr_suppressed_specials_dead"):
+                new_c.pop("lr_project", None)
         except Exception:
             pass
         try:
             from core.ai_la_progress import get_stored_la_progress
 
             la_now = get_stored_la_progress(player, game)
-            if la_now:
+            if la_now and not meta.get("la_suppressed_specials_dead"):
                 new_c["la_progress"] = la_now
                 new_c["sticky_version"] = max(3, int(new_c.get("sticky_version") or 0) or 3)
+            elif meta.get("la_suppressed_specials_dead"):
+                new_c.pop("la_progress", None)
+        except Exception:
+            pass
+        # S4: stamp partial_plan / ignored_components on committed sticky
+        try:
+            from core.partial_way_salvage import stamp_commitment_partial_plan
+
+            stamp_commitment_partial_plan(new_c, direction_out, player, game)
         except Exception:
             pass
         # S19: log way/target switch when locks change
@@ -1942,6 +2593,24 @@ def _apply_sticky_layer_impl(
         except Exception:
             pass
         set_sticky_commitment(player, new_c)
+        # Phase C2 WP-R3: track distinct ways used this game
+        try:
+            from core.strategy_explicit_recalc import track_way_used
+
+            prev_w = None
+            if isinstance(prev_for_switch, Mapping):
+                prev_w = _safe_int(prev_for_switch.get("locked_way_id"), None)
+            new_w = _safe_int(new_c.get("locked_way_id"), None)
+            switched_way = (
+                prev_w is not None and new_w is not None and int(prev_w) != int(new_w)
+            )
+            track_way_used(
+                player,
+                new_w,
+                switched=bool(switched_way) if prev_w is not None else False,
+            )
+        except Exception:
+            pass
         if consume_flag or flag_before.get("pending"):
             # One re-rank absorbs all batched opponent builds / milestones
             consume_strategy_recalc_flag(player)
@@ -1957,7 +2626,9 @@ def _apply_sticky_layer_impl(
             pass
         meta["applied"] = True
         meta["committed"] = True
-        if meta["invalidated"] and meta.get("flag_consumed"):
+        if meta.get("explicit_switch"):
+            meta["reason"] = "explicit_142_recalc_best_way"
+        elif meta["invalidated"] and meta.get("flag_consumed"):
             meta["reason"] = "sticky_recommit_after_flag"
         elif meta["invalidated"]:
             meta["reason"] = "sticky_recommit_after_invalidate"
@@ -2090,6 +2761,9 @@ def _apply_sticky_layer_impl(
                 if consume_flag or flag_before.get("pending"):
                     consume_strategy_recalc_flag(player)
                     meta["flag_consumed"] = True
+                publish_last_sticky_cs_meta(
+                    player, game, meta, prev_commitment=prev_commitment_snapshot
+                )
                 return direction_out, meta
         except Exception:
             pass
@@ -2099,4 +2773,7 @@ def _apply_sticky_layer_impl(
         if consume_flag:
             consume_strategy_recalc_flag(player)
             meta["flag_consumed"] = True
+    publish_last_sticky_cs_meta(
+        player, game, meta, prev_commitment=prev_commitment_snapshot
+    )
     return direction_out, meta

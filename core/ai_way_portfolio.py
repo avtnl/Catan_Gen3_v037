@@ -35,12 +35,26 @@ PORTFOLIO_CACHE_ENABLED = True
 
 
 def _resolve_portfolio_top_n(game: Any = None, limit: Optional[int] = None) -> int:
-    """Early 3 / Mid 6 / End 9 (policy D); explicit limit wins when provided."""
+    """Early 3 / Mid 6 / End 9 (policy D); explicit limit wins when provided.
+
+    P4 fast L2: ``game._l2_profile.portfolio_top_n`` (default 3) overrides stage table.
+    """
     if limit is not None:
         try:
             return max(1, int(limit))
         except Exception:
             pass
+    # P4: fast explore profile caps board audits
+    try:
+        from core.l2_profile import profile_from_game
+
+        prof = profile_from_game(game)
+        if prof is not None and str(getattr(prof, "name", "") or "") == "fast":
+            pt = getattr(prof, "portfolio_top_n", None)
+            if pt is not None:
+                return max(1, int(pt))
+    except Exception:
+        pass
     try:
         from core.strategy_reconsider import portfolio_top_n_for_game
 
@@ -1464,7 +1478,29 @@ def evaluate_top_ways_board_feasibility(
         except Exception:
             pass
 
-    eval_ids = list(way_ids[: int(top_cap)])
+    # S2: inject non-dead-special ways so T1 filter has candidates after LR/LA give-up
+    salvage_t1_meta: Dict[str, Any] = {"expanded": False, "reason": "not_run"}
+    try:
+        from core.partial_way_salvage import expand_eval_way_ids_for_salvage_t1
+
+        way_ids, salvage_t1_meta = expand_eval_way_ids_for_salvage_t1(
+            way_ids,
+            player,
+            game,
+            abstract_turns_by_way=abs_map,
+        )
+    except Exception as _s2_exc:
+        salvage_t1_meta = {"expanded": False, "reason": f"error:{_s2_exc}"}
+
+    # Cap = stage top_n, but never drop S2 extras already merged into way_ids
+    eval_cap = max(int(top_cap), len(way_ids))
+    eval_ids = list(way_ids[: int(eval_cap)])
+    try:
+        # Stash for dig-in on game (report settings filled by caller)
+        if game is not None and isinstance(salvage_t1_meta, dict):
+            game._last_salvage_t1_expand = dict(salvage_t1_meta)
+    except Exception:
+        pass
     score_key = None
     geo_key = None
     if use_cache and PORTFOLIO_CACHE_ENABLED and game is not None:
@@ -1603,6 +1639,27 @@ def evaluate_top_ways_board_feasibility(
             })
 
     audits.sort(key=lambda a: (a.rank_key, a.board_expected_turns, a.way_id))
+    # Lab: soft bias toward LA-component Victory-Ways (timing modes early/mid/late)
+    # Skip when specials-dead episode kill_la is active (give-up escape WP2).
+    try:
+        skip_la_bias = False
+        try:
+            from core.specials_dead_episode import (
+                episode_kill_flags,
+                is_giveup_escape_enabled,
+            )
+
+            if is_giveup_escape_enabled():
+                kla, _klr = episode_kill_flags(player)
+                skip_la_bias = bool(kla)
+        except Exception:
+            skip_la_bias = False
+        if not skip_la_bias:
+            from core.la_soft_bias import apply_la_way_rank_bias
+
+            audits = apply_la_way_rank_bias(game, audits, player=player)
+    except Exception:
+        pass
     if game is not None:
         try:
             game.current_board_way_audit = audits[0] if audits else None
@@ -1718,9 +1775,9 @@ def collect_top_way_ids_from_report(report, game, player, *, limit=None):
     return way_ids[:limit]
 
 
-def collect_l0_way_ids(report, game, player, *, limit: int = 3) -> List[int]:
-    """P3-C L0: sticky + preferred way only (optionally a couple of alts)."""
-    limit = max(1, min(int(limit or 3), _resolve_portfolio_top_n(game)))
+def collect_l0_way_ids(report, game, player, *, limit: int = 1) -> List[int]:
+    """P1 / P3-C L0: sticky first, else preferred (default single way for true-light)."""
+    limit = max(1, min(int(limit or 1), _resolve_portfolio_top_n(game)))
     way_ids: List[int] = []
     seen = set()
 
@@ -1738,12 +1795,269 @@ def collect_l0_way_ids(report, game, player, *, limit: int = 3) -> List[int]:
     if isinstance(direction, Mapping):
         _add(direction.get("preferred_way_id") or direction.get("way_id"))
     # Report preferred / first baseline as last-resort seed
-    if not way_ids:
+    if not way_ids and report is not None:
         for wid in collect_top_way_ids_from_report(report, game, player, limit=1):
             _add(wid)
     return way_ids[:limit]
 
 
+def build_l0_hand_strategy_report(
+    game: Any,
+    player: Any,
+    *,
+    reason: str = "",
+) -> Dict[str, Any]:
+    """P1 true-light L0: single sticky-way ETA rescore; no Stage1–4 / 142 rank.
+
+    Does not switch way, does not run S14-2 / specials divert / preference re-pick.
+    Reuses prior ``strategic_direction`` and patches board ETA fields only.
+    """
+    try:
+        from core.performance_trace import attach_span_meta, timed_span
+    except Exception:
+        timed_span = None  # type: ignore
+        attach_span_meta = None  # type: ignore
+    from contextlib import nullcontext
+
+    pid_raw = getattr(player, "id", None) if player is not None else None
+    try:
+        pid = str(int(pid_raw)) if pid_raw is not None else str(pid_raw or "")
+    except Exception:
+        pid = str(pid_raw or "")
+
+    skipped = [
+        "stage1_all_seats",
+        "player_trades",
+        "action_projections",
+        "continuation_strategies",
+        "risk_assessment",
+        "strategy_preference",
+        "multi_way_portfolio",
+        "s14_2_offway",
+        "specials_divert",
+    ]
+    report: Dict[str, Any] = {
+        "round": getattr(game, "round", None),
+        "turn": getattr(game, "turn", None),
+        "phase": getattr(game, "phase", None),
+        "state": getattr(game, "state", None),
+        "stage": 0,
+        "purpose": "l0_true_light_sticky_way_eta_only",
+        "settings": {
+            "strategy_refresh_mode": "hand_only",
+            "l0_true_light": True,
+            "board_way_portfolio_hand_only": True,
+            "board_way_portfolio_stage": "P1_L0_true_light",
+            "skipped_layers": list(skipped),
+            "reason": str(reason or ""),
+        },
+        "by_player": {},
+        "board_way_audits": [],
+        "l0_hand_only": {
+            "ways": [],
+            "matched_way": -1,
+            "board_expected_turns": INFINITE_TURNS,
+            "path": "true_light",
+            "geo_cache_hit": False,
+            "hand_rescore": False,
+        },
+    }
+
+    if player is None:
+        report["board_way_audit_error"] = "no_player"
+        return report
+
+    way_ids = collect_l0_way_ids(None, game, player, limit=1)
+    direction: Dict[str, Any] = {}
+    raw_dir = getattr(player, "strategic_direction", None)
+    if isinstance(raw_dir, Mapping):
+        direction = dict(raw_dir)
+
+    # Seed preferred keys from sticky if direction empty but way known
+    if way_ids:
+        wid0 = int(way_ids[0])
+        if not direction.get("preferred_way_id") and not direction.get("way_id"):
+            direction["preferred_way_id"] = wid0
+            direction["way_id"] = wid0
+        elif direction.get("preferred_way_id") is None and direction.get("way_id") is not None:
+            direction["preferred_way_id"] = direction.get("way_id")
+        elif direction.get("way_id") is None and direction.get("preferred_way_id") is not None:
+            direction["way_id"] = direction.get("preferred_way_id")
+        # Ensure patch target exists as a real dict on the player
+        try:
+            setattr(player, "strategic_direction", dict(direction))
+        except Exception:
+            pass
+
+    abs_map: Dict[int, float] = {}
+    if way_ids:
+        wid0 = int(way_ids[0])
+        for key in (
+            "board_expected_turns",
+            "realistic_expected_turns",
+            "expected_turns",
+            "turns",
+            "rank_key",
+        ):
+            if direction.get(key) is not None:
+                abs_map[wid0] = _safe_float(direction.get(key), INFINITE_TURNS)
+                break
+
+    span_cm = (
+        timed_span(
+            game,
+            "l0_strategy_update",
+            meta={
+                "reason": str(reason or ""),
+                "ways": list(way_ids),
+                "way_count": len(way_ids),
+                "path": "true_light",
+                "l0_true_light": True,
+            },
+        )
+        if timed_span is not None
+        else nullcontext({"meta": {}})
+    )
+
+    match = None
+    audits: List[Any] = []
+    with span_cm as span_bag:
+        if way_ids:
+            try:
+                audits = list(
+                    evaluate_top_ways_board_feasibility(
+                        game,
+                        player,
+                        way_ids,
+                        abstract_turns_by_way=abs_map,
+                        use_cache=True,
+                    )
+                    or []
+                )
+            except Exception as exc:
+                report["board_way_audit_error"] = str(exc)
+                audits = []
+
+        if audits:
+            match = audits[0]
+            # Prefer audit matching the single L0 way id
+            want = int(way_ids[0]) if way_ids else -1
+            for a in audits:
+                if _safe_int(_audit_get(a, "way_id"), -1) == want:
+                    match = a
+                    break
+            try:
+                _patch_direction_eta_from_audit(player, match)
+            except Exception:
+                pass
+            raw_dir = getattr(player, "strategic_direction", None)
+            if isinstance(raw_dir, Mapping):
+                direction = dict(raw_dir)
+
+        cache_meta = dict(getattr(game, "_board_way_portfolio_cache_meta", None) or {})
+        # Distinguish full score cache hit vs geometry-only hand rescore when possible
+        full_hit = bool(cache_meta.get("hit")) and not bool(cache_meta.get("hand_rescore"))
+        geo_hit = bool(cache_meta.get("geo_cache_hit") or cache_meta.get("hit"))
+        hand_rescore = bool(cache_meta.get("hand_rescore"))
+        matched_way = (
+            _safe_int(_audit_get(match, "way_id"), -1)
+            if match is not None
+            else (int(way_ids[0]) if way_ids else -1)
+        )
+        # P1 WP4: meta must live under bag["meta"] to be recorded
+        span_meta_payload = {
+            "geo_cache_hit": geo_hit,
+            "full_cache_hit": full_hit,
+            "hand_rescore": hand_rescore,
+            "matched_way": matched_way,
+            "way_count": len(way_ids),
+            "ways": [int(w) for w in way_ids],
+            "audit_count": len(audits),
+            "path": "true_light",
+            "l0_true_light": True,
+        }
+        if attach_span_meta is not None:
+            try:
+                attach_span_meta(span_bag, **span_meta_payload)
+            except Exception:
+                pass
+        elif isinstance(span_bag, dict):
+            meta = span_bag.get("meta")
+            if not isinstance(meta, dict):
+                meta = {}
+                span_bag["meta"] = meta
+            meta.update(span_meta_payload)
+
+        report["l0_hand_only"] = {
+            "ways": [int(w) for w in way_ids],
+            "matched_way": matched_way,
+            "board_expected_turns": _safe_float(
+                _audit_get(match, "board_expected_turns") if match is not None else direction.get("board_expected_turns"),
+                INFINITE_TURNS,
+            ),
+            "path": "true_light",
+            "geo_cache_hit": geo_hit,
+            "full_cache_hit": full_hit,
+            "hand_rescore": hand_rescore,
+            "audit_count": len(audits),
+            "way_count": len(way_ids),
+        }
+
+    # Mark direction as L0 true-light without changing way
+    if direction:
+        direction["l0_true_light"] = True
+        direction["l0_hand_rescore"] = True
+        direction["strategy_refresh_mode"] = "hand_only"
+        if way_ids:
+            # Never switch: force sticky/preferred id to stay the L0 way
+            keep = int(way_ids[0])
+            direction["preferred_way_id"] = keep
+            direction["way_id"] = keep
+
+    report["by_player"][pid] = {
+        "player": {
+            "player_id": pid_raw,
+            "color": getattr(player, "color", ""),
+        },
+        "preferred_strategy": dict(direction) if direction else {},
+        "baseline_top_strategies": [],
+        "l0_true_light": True,
+    }
+    report["board_way_audits"] = []
+    for a in audits:
+        try:
+            if hasattr(a, "as_dict"):
+                report["board_way_audits"].append(a.as_dict())
+            elif isinstance(a, Mapping):
+                report["board_way_audits"].append(dict(a))
+        except Exception:
+            pass
+
+    if match is not None:
+        report["board_feasibility"] = _audit_get(match, "feasibility")
+        report["board_expected_turns"] = _safe_float(
+            _audit_get(match, "board_expected_turns"), INFINITE_TURNS
+        )
+        report["board_realistic_turns"] = _safe_float(
+            _audit_get(match, "realistic_expected_turns"), INFINITE_TURNS
+        )
+        report["board_recommendation"] = _audit_get(match, "recommendation")
+        try:
+            game.current_board_way_audit = match
+            game.current_board_way_audits = list(audits)
+        except Exception:
+            pass
+    elif not way_ids:
+        report["board_way_audit_error"] = report.get("board_way_audit_error") or "no_l0_way_id"
+
+    # Persist patched direction if we only mutated via patch (already done) or seeded
+    if direction and player is not None:
+        try:
+            setattr(player, "strategic_direction", dict(direction))
+        except Exception:
+            pass
+
+    return report
 
 
 def _audit_get(audit, key, default=None):
@@ -2100,6 +2414,69 @@ def apply_board_behavior_override(report, game, player, audits, *, persist=True)
     if not audits:
         report["board_way_override"] = {"applied": False, "reason": "no_audits"}
         return report
+
+    # WP2: after give-up, prefer ways that do not need the dead special
+    audits = list(audits)
+    specials_dead_meta: Dict[str, Any] = {
+        "applied": False,
+        "reason": "not_run",
+        "n_before": len(audits),
+        "n_after": len(audits),
+    }
+    salvage_meta: Dict[str, Any] = {"applied": False, "reason": "not_run"}
+    try:
+        from core.partial_way_salvage import (
+            collect_all_dead_components,
+            filter_audits_for_dead_components,
+            is_salvage_t1_expand_enabled,
+        )
+        from core.specials_dead_episode import (
+            filter_audits_for_specials_dead,
+            is_giveup_escape_enabled,
+        )
+
+        dead_all = collect_all_dead_components(player, game)
+        # S5: unified dead-component filter when expansion and/or specials dead
+        if dead_all and is_salvage_t1_expand_enabled():
+            audits, specials_dead_meta = filter_audits_for_dead_components(
+                audits, dead_all, player=player
+            )
+        elif is_giveup_escape_enabled():
+            audits, specials_dead_meta = filter_audits_for_specials_dead(
+                audits, player=player
+            )
+    except Exception as _sde_exc:
+        specials_dead_meta = {
+            "applied": False,
+            "reason": f"error:{_sde_exc}",
+            "n_before": len(audits),
+            "n_after": len(audits),
+        }
+    # S3: T1 tag or T2 residual rank when hard filter empty (soft demote)
+    try:
+        from core.partial_way_salvage import (
+            apply_salvage_tier_to_audits,
+            collect_all_dead_components,
+        )
+
+        audits, salvage_meta = apply_salvage_tier_to_audits(
+            audits,
+            player,
+            game,
+            specials_dead_meta=specials_dead_meta,
+            dead_set=collect_all_dead_components(player, game),
+        )
+    except Exception as _s3_exc:
+        salvage_meta = {"applied": False, "reason": f"error:{_s3_exc}", "s3": True}
+    if not audits:
+        report["board_way_override"] = {
+            "applied": False,
+            "reason": "no_audits_after_specials_dead_filter",
+            "specials_dead_filter": specials_dead_meta,
+            "salvage": salvage_meta,
+        }
+        return report
+
     winner = audits[0]
     pid = str(getattr(player, "id", ""))
     block = (report.get("by_player") or {}).get(pid)
@@ -2113,19 +2490,142 @@ def apply_board_behavior_override(report, game, player, audits, *, persist=True)
         direction_now = getattr(player, "strategic_direction", None) or {}
         if isinstance(direction_now, Mapping):
             abstract = dict(direction_now)
-    apply, reason = should_override_abstract_preferred(winner, abstract, audits)
+    # Phase C2 WP-R3: on explicit L2, always adopt L2 rank-1 (no min-gain gate)
+    explicit_best = False
+    try:
+        from core.strategy_explicit_recalc import should_adopt_best_way
+
+        explicit_best = bool(should_adopt_best_way(player))
+    except Exception:
+        explicit_best = False
+    if explicit_best:
+        apply, reason = True, "explicit_142_recalc_best_way"
+    else:
+        apply, reason = should_override_abstract_preferred(winner, abstract, audits)
+
+    # WP2.1 / S3: specials-dead or salvage T1/T2 must win over keep-abstract
+    if specials_dead_meta.get("applied") or salvage_meta.get("applied"):
+        win_id = _safe_int(_audit_get(winner, "way_id"), -1)
+        # S7a D2: pre-adopt identity sticky → direction → report (not report alone)
+        pre_source = "none"
+        abs_way_pre = -1
+        try:
+            from core.partial_way_salvage import resolve_pre_adopt_way_id
+
+            pre = resolve_pre_adopt_way_id(
+                player, report=report, abstract=abstract
+            )
+            abs_way_pre = _safe_int(pre.get("way_id"), -1)
+            pre_source = str(pre.get("source") or "none")
+        except Exception:
+            abs_way_pre = _safe_int(
+                abstract.get("preferred_way_id") or abstract.get("way_id"), -1
+            )
+            pre_source = "report_preferred" if abs_way_pre >= 0 else "none"
+        mode = str(specials_dead_meta.get("mode") or "")
+        force_escape = False
+        if mode == "hard_filter" or salvage_meta.get("tier") in ("t1", "t2"):
+            force_escape = True
+        elif win_id >= 0 and abs_way_pre >= 0 and int(win_id) != int(abs_way_pre):
+            force_escape = True
+        elif win_id >= 0 and abs_way_pre < 0:
+            force_escape = True
+        if force_escape:
+            apply = True
+            if salvage_meta.get("tier") == "t2":
+                reason = "salvage_t2_residual"
+            elif salvage_meta.get("tier") == "t1":
+                reason = "salvage_t1_nonspecial"
+            else:
+                reason = "specials_dead_escape"
+            before_id = abs_way_pre if abs_way_pre >= 0 else None
+            specials_dead_meta["forced_adopt"] = True
+            specials_dead_meta["forced_adopt_way"] = win_id
+            specials_dead_meta["abstract_way_before"] = before_id
+            specials_dead_meta["abstract_way_before_source"] = pre_source
+            salvage_meta["forced_adopt"] = True
+            salvage_meta["forced_adopt_way"] = win_id
+            salvage_meta["abstract_way_before"] = before_id
+            salvage_meta["abstract_way_before_source"] = pre_source
+            if salvage_meta.get("winner_way_id") is None and win_id >= 0:
+                salvage_meta["winner_way_id"] = win_id
+            # S7/S7a dig: count/log T1/T2 (or specials-dead escape as t1-class) adopt
+            try:
+                from core.partial_way_salvage import log_salvage_adopt_event
+
+                dig_meta = dict(salvage_meta)
+                if not dig_meta.get("applied") and specials_dead_meta.get("applied"):
+                    dig_meta["applied"] = True
+                    dig_meta["tier"] = dig_meta.get("tier") or "t1"
+                    dig_meta["salvage_mode"] = dig_meta.get("salvage_mode") or "t1_nonspecial"
+                    dig_meta["dead_components"] = dig_meta.get("dead_components") or (
+                        (["LR"] if specials_dead_meta.get("kill_lr") else [])
+                        + (["LA"] if specials_dead_meta.get("kill_la") else [])
+                    )
+                log_salvage_adopt_event(
+                    game,
+                    player,
+                    salvage_meta=dig_meta,
+                    abstract_way_before=before_id,
+                    abstract_way_before_source=pre_source,
+                    forced_adopt=True,
+                    reason=reason,
+                )
+            except Exception:
+                pass
+
     # Always build board direction; mark whether override of way_id applies
+    # Synthetic T2 audits are plain mappings — board_audit_to_strategic_direction
+    # must tolerate them (uses _audit_get).
     direction = board_audit_to_strategic_direction(
         winner,
         abstract_preferred=abstract,
         override_applied=apply,
         override_reason=reason,
     )
+    if specials_dead_meta.get("applied"):
+        direction["specials_dead_filter"] = dict(specials_dead_meta)
+        direction["preference_source"] = (
+            str(direction.get("preference_source") or "") + "+specials_dead_filter"
+        ).lstrip("+")
+        if specials_dead_meta.get("forced_adopt"):
+            direction["preference_source"] = (
+                str(direction.get("preference_source") or "") + "+specials_dead_escape"
+            ).lstrip("+")
+    try:
+        from core.partial_way_salvage import patch_direction_for_salvage
+
+        direction = patch_direction_for_salvage(direction, salvage_meta)
+    except Exception:
+        pass
+    if explicit_best:
+        direction["explicit_best_way"] = True
+        direction["preference_source"] = (
+            str(direction.get("preference_source") or "") + "+explicit_best_way"
+        ).lstrip("+")
     if not apply:
         # enrichment: keep abstract way if present, still attach board project
         abs_way = _safe_int(abstract.get("preferred_way_id") or abstract.get("way_id"), -1)
         board_way = _safe_int(_audit_get(winner, "way_id"), -1)
-        if abs_way >= 0:
+        # WP2.1 belt: never restore abstract if it still needs a dead special
+        skip_keep_abstract = False
+        if specials_dead_meta.get("applied") and abs_way >= 0:
+            try:
+                from core.strategy_specials_divert import (
+                    audit_or_dir_needs_la,
+                    audit_or_dir_needs_lr,
+                )
+
+                kla = bool(specials_dead_meta.get("kill_la"))
+                klr = bool(specials_dead_meta.get("kill_lr"))
+                if (kla and audit_or_dir_needs_la(abstract)) or (
+                    klr and audit_or_dir_needs_lr(abstract)
+                ):
+                    skip_keep_abstract = True
+                    specials_dead_meta["blocked_keep_abstract"] = True
+            except Exception:
+                skip_keep_abstract = bool(specials_dead_meta.get("forced_adopt"))
+        if abs_way >= 0 and not skip_keep_abstract:
             direction["preferred_way_id"] = abs_way
             direction["way_id"] = abs_way
             direction["preference_source"] = "4G-B_board_enrichment_keep_abstract_way"
@@ -2177,13 +2677,34 @@ def apply_board_behavior_override(report, game, player, audits, *, persist=True)
         from core.strategy_way_kill import (
             apply_way_feasibility_kills,
             format_way_kill_dbg,
+            pick_audit_excluding_specials,
             pick_audit_excluding_way,
         )
 
         way_kill_meta = apply_way_feasibility_kills(game, player, direction)
         if way_kill_meta.get("killed"):
             blocked = way_kill_meta.get("way_id")
-            alt = pick_audit_excluding_way(audits, blocked)
+            alt = None
+            # WP2: prefer class-level specials exclusion when episode is active
+            try:
+                from core.specials_dead_episode import (
+                    episode_kill_flags,
+                    is_giveup_escape_enabled,
+                )
+
+                if is_giveup_escape_enabled():
+                    kla, klr = episode_kill_flags(player)
+                    if kla or klr:
+                        alt = pick_audit_excluding_specials(
+                            audits,
+                            kill_la=kla,
+                            kill_lr=klr,
+                            blocked_way_id=blocked,
+                        )
+            except Exception:
+                alt = None
+            if alt is None:
+                alt = pick_audit_excluding_way(audits, blocked)
             if alt is not None:
                 direction = board_audit_to_strategic_direction(
                     alt,
@@ -2283,6 +2804,22 @@ def apply_board_behavior_override(report, game, player, audits, *, persist=True)
     except Exception as sticky_exc:
         sticky_meta = {"applied": False, "reason": "sticky_error", "error": str(sticky_exc)}
 
+    # Phase C2 WP-R4: WayReassessCompare JSONL + player bag on every L2 (when enabled)
+    way_reassess_bag = None
+    try:
+        from core.way_reassess_log import maybe_emit_way_reassess_after_l2
+
+        way_reassess_bag = maybe_emit_way_reassess_after_l2(
+            game,
+            player,
+            audits,
+            direction,
+            sticky_meta=sticky_meta if isinstance(sticky_meta, Mapping) else None,
+            abstract=abstract,
+        )
+    except Exception:
+        way_reassess_bag = None
+
     report["board_way_override"] = {
         "applied": bool(apply),
         "reason": reason,
@@ -2295,6 +2832,10 @@ def apply_board_behavior_override(report, game, player, audits, *, persist=True)
         "supporting_action_type": direction.get("supporting_action_type"),
         "sticky": dict(sticky_meta) if isinstance(sticky_meta, Mapping) else sticky_meta,
         "way_kill": dict(way_kill_meta) if isinstance(way_kill_meta, Mapping) else way_kill_meta,
+        "specials_dead_filter": dict(specials_dead_meta)
+        if isinstance(specials_dead_meta, Mapping)
+        else specials_dead_meta,
+        "salvage": dict(salvage_meta) if isinstance(salvage_meta, Mapping) else salvage_meta,
         "specials_divert": {
             "fired": bool(s55_meta.get("fired")),
             "skipped": bool(s55_meta.get("skipped")),
@@ -2304,7 +2845,10 @@ def apply_board_behavior_override(report, game, player, audits, *, persist=True)
             "dbg": s55_meta.get("dbg"),
             "phase": s55_meta.get("phase"),
         },
+        "way_reassess": dict(way_reassess_bag) if isinstance(way_reassess_bag, Mapping) else None,
     }
+    if isinstance(way_reassess_bag, Mapping):
+        report["way_reassess_compare"] = dict(way_reassess_bag)
     report["s55_specials_divert"] = {
         k: v
         for k, v in dict(s55_meta).items()
@@ -2500,7 +3044,8 @@ def _apply_board_way_portfolio_layer_impl(
             settings["portfolio_top_n"] = int(stage_top_n)
         report["settings"] = settings
         if hand_only:
-            top_ways = collect_l0_way_ids(report, game, player, limit=3)
+            # P1: single sticky/preferred way (true-light); multi-way is L2 explore.
+            top_ways = collect_l0_way_ids(report, game, player, limit=1)
         else:
             top_ways = collect_top_way_ids_from_report(
                 report, game, player, limit=int(stage_top_n)
@@ -2520,6 +3065,25 @@ def _apply_board_way_portfolio_layer_impl(
                     if d.get(key) is not None:
                         abs_map[wid] = _safe_float(d.get(key), INFINITE_TURNS)
                         break
+        # S2 T1 expand on L2 only (not L0 single-way true-light)
+        salvage_t1_meta: Dict[str, Any] = {"expanded": False, "reason": "l0_skip"}
+        if not hand_only:
+            try:
+                from core.partial_way_salvage import expand_eval_way_ids_for_salvage_t1
+
+                top_ways, salvage_t1_meta = expand_eval_way_ids_for_salvage_t1(
+                    top_ways,
+                    player,
+                    game,
+                    abstract_turns_by_way=abs_map,
+                )
+            except Exception as _s2_exc:
+                salvage_t1_meta = {"expanded": False, "reason": f"error:{_s2_exc}"}
+        try:
+            settings["salvage_t1_expand"] = dict(salvage_t1_meta)
+            report["settings"] = settings
+        except Exception:
+            pass
         audits = evaluate_top_ways_board_feasibility(
             game, player, top_ways, abstract_turns_by_way=abs_map, use_cache=True
         )

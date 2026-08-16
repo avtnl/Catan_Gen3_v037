@@ -182,8 +182,18 @@ class Board:
     ]
     ALL_TILE_IDS = set(range(0, 46))
 
-    def __init__(self, board_name: str = "Base_Random") -> None:
-        """Initialize the Board."""
+    def __init__(self, board_name: str = "Base_Random", *, load_map: bool = True) -> None:
+        """Initialize the Board.
+
+        Args:
+            board_name: Map mode name (e.g. ``Base_Random``) when generating.
+            load_map: When True (default), apply ``LOAD_PLAYBOARD`` / random
+                generation as today. When False, build a blank topology only
+                and **do not** load ``SAVED_PLAYBOARD`` or generate a random
+                map — caller must ``load_board(path)`` once (MGlog re-play /
+                offline stats). Avoids the double-load print and wrong first
+                map when ``LOAD_PLAYBOARD=True`` in constants.
+        """
         self.board_name = board_name
         self.round = -2
         self.turn = 1
@@ -197,6 +207,13 @@ class Board:
         self.tiles = [None] * self.NUM_TILES
         self.roads = []
         self.list_of_roads_connected_to_intersection = [[] for _ in range(67)]
+
+        # ──────────────────────────────────────────────────────────────
+        # Deferred map load (re-play / stats): blank topology only
+        # ──────────────────────────────────────────────────────────────
+        if not load_map:
+            self._init_blank_topology_for_file_load()
+            return
 
         # ──────────────────────────────────────────────────────────────
         # LOAD SAVED PLAYBOARD or generate random
@@ -254,6 +271,22 @@ class Board:
         if MG:
             with open(FILENAME_MG, "a") as f:
                 f.write(f"board.py | __init__ completed | Loaded {len(self.tiles)} tiles and {sum(1 for i in self.intersections if i and i.port_tf)} ports\n")
+
+    def _init_blank_topology_for_file_load(self) -> None:
+        """Create tile/intersection/road shells without reading any playboard file.
+
+        Used when ``load_map=False`` so callers can ``load_board(explicit_path)``
+        once without first loading ``constants.SAVED_PLAYBOARD``.
+        """
+        self._add_tiles()
+        self._add_empty_edges_and_corners()
+        self._add_intersections()
+        self._complete_edges()
+        self._add_roads()
+        self._create_list_of_roads_connected_to_intersection()
+        self._update_intersection_types()
+        self._add_three_intersection_ids()
+        self._add_two_tile_attributes()
 
     def _initialize_board(self) -> None:
         """Initialize the board based on the board name."""
@@ -1106,6 +1139,13 @@ class Board:
                     f"⚠️  Expected 18 port entries, loaded {ports_loaded}. "
                     "Check the PlayBoard file if this is unexpected."
                 )
+
+            # Refresh intersection pip/type aggregates after tile types change
+            # (needed after blank topology + explicit playboard load).
+            try:
+                self._add_intersections()
+            except Exception:
+                pass
 
             # Re-run necessary post-load steps. These methods are now safe to
             # call repeatedly because _add_three_intersection_ids clears before

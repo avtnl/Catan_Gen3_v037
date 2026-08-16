@@ -1008,6 +1008,8 @@ def maybe_specials_divert_on_turn_start(
     store: bool = True,
     force: bool = False,
     apply_direction: bool = False,
+    force_kill_la: Optional[bool] = None,
+    force_kill_lr: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """S5.5-C: run specials divert at most once per (round, turn, player).
 
@@ -1018,6 +1020,9 @@ def maybe_specials_divert_on_turn_start(
     When ``apply_direction`` and divert fires with ``direction_out``, persists the
     new preferred way on the player (used from ``refresh_strategy_context``).
     Portfolio override passes ``apply_direction=False`` and applies itself.
+
+    WP3: when give-up escape episode is active and ``GIVEUP_FORCE_DIVERT``, auto
+    set ``force`` + episode kill flags unless the caller overrides them.
     """
     if player is None:
         return {
@@ -1028,6 +1033,30 @@ def maybe_specials_divert_on_turn_start(
             "reason": "no_player",
             "fired": False,
         }
+
+    # WP3: episode-driven force divert (θ desync with S5.5 assess)
+    try:
+        from core.specials_dead_episode import (
+            episode_kill_flags,
+            get_specials_dead_episode,
+            is_giveup_force_divert_enabled,
+        )
+
+        if is_giveup_force_divert_enabled():
+            ep = get_specials_dead_episode(player)
+            if ep.get("active"):
+                kla_ep, klr_ep = episode_kill_flags(player)
+                if force_kill_la is None:
+                    force_kill_la = kla_ep
+                if force_kill_lr is None:
+                    force_kill_lr = klr_ep
+                if kla_ep or klr_ep:
+                    force = True
+    except Exception:
+        pass
+
+    fk_la = bool(force_kill_la) if force_kill_la is not None else False
+    fk_lr = bool(force_kill_lr) if force_kill_lr is not None else False
 
     key = specials_divert_turn_key(game, player)
     if not force and is_specials_divert_checked_this_turn(game, player):
@@ -1104,6 +1133,8 @@ def maybe_specials_divert_on_turn_start(
             abstract_preferred=abstract_preferred,
             phase=phase,
             store=store,
+            force_kill_la=fk_la,
+            force_kill_lr=fk_lr,
         )
 
     meta = dict(meta) if isinstance(meta, Mapping) else {"fired": False, "reason": "run_failed"}
@@ -1112,6 +1143,9 @@ def maybe_specials_divert_on_turn_start(
     meta["skipped"] = False
     meta["turn_key"] = list(key)
     meta["audit_count"] = len(resolved)
+    meta["force"] = bool(force)
+    meta["force_kill_la"] = fk_la
+    meta["force_kill_lr"] = fk_lr
     if "dbg" not in meta or not meta.get("dbg"):
         meta["dbg"] = format_specials_divert_dbg(meta)
 
@@ -1162,6 +1196,8 @@ def run_specials_divert(
     abstract_preferred: Optional[Mapping[str, Any]] = None,
     phase: str = "portfolio_override",
     store: bool = True,
+    force_kill_la: bool = False,
+    force_kill_lr: bool = False,
 ) -> Dict[str, Any]:
     """S5.5-B: if preferred needs a dead special, pick best non-special way.
 
@@ -1170,6 +1206,9 @@ def run_specials_divert(
     post-filters existing audits (locked strategy B).
 
     Prefer :func:`maybe_specials_divert_on_turn_start` for live cadence (S5.5-C).
+
+    ``force_kill_la`` / ``force_kill_lr`` (WP3 give-up escape): treat preferred
+    specials as dead even when S5.5 assess is still soft (θ desync).
     """
     d = _direction_of(player, direction)
     assess = assess_specials_for_player(game, player, d, store=store)
@@ -1178,8 +1217,33 @@ def run_specials_divert(
 
     pref_needs_la = audit_or_dir_needs_la(d)
     pref_needs_lr = audit_or_dir_needs_lr(d)
-    kill_la = bool(pref_needs_la and (la.get("hopeless") or la.get("unstoppable_opp")))
-    kill_lr = bool(pref_needs_lr and (lr.get("hopeless") or lr.get("unstoppable_opp")))
+    # Way-table backup when direction flags stripped after give-up but way_id remains
+    if not pref_needs_la or not pref_needs_lr:
+        try:
+            from core.specials_dead_episode import way_id_needs_specials
+
+            wid = _way_id_of(d)
+            t_la, t_lr = way_id_needs_specials(wid)
+            pref_needs_la = pref_needs_la or t_la
+            pref_needs_lr = pref_needs_lr or t_lr
+        except Exception:
+            pass
+    kill_la = bool(
+        pref_needs_la
+        and (
+            bool(force_kill_la)
+            or la.get("hopeless")
+            or la.get("unstoppable_opp")
+        )
+    )
+    kill_lr = bool(
+        pref_needs_lr
+        and (
+            bool(force_kill_lr)
+            or lr.get("hopeless")
+            or lr.get("unstoppable_opp")
+        )
+    )
 
     pref_id = _way_id_of(d)
     meta: Dict[str, Any] = {
@@ -1189,6 +1253,8 @@ def run_specials_divert(
         "fired": False,
         "kill_la": kill_la,
         "kill_lr": kill_lr,
+        "force_kill_la": bool(force_kill_la),
+        "force_kill_lr": bool(force_kill_lr),
         "reason_la": la.get("reason"),
         "reason_lr": lr.get("reason"),
         "preferred_way_before": pref_id,

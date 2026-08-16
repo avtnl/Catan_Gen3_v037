@@ -135,18 +135,65 @@ def make_strategy_history_sample(
     except Exception:
         board_way_i = None
 
+    # Phase C WP-C1: sticky target subset for STR / CS-3 alignment
+    def _opt_int(value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        try:
+            return int(float(value))
+        except Exception:
+            return None
+
+    sticky_target_id = None
+    sticky_way_id = None
+    sticky_invalidate_reason = None
+    target_changed = None
+    way_changed = None
+    try:
+        meta = getattr(player, "last_sticky_meta", None) if player is not None else None
+        if isinstance(meta, Mapping):
+            sticky_target_id = _opt_int(meta.get("sticky_target_id"))
+            sticky_way_id = _opt_int(meta.get("sticky_way_id"))
+            sticky_invalidate_reason = (
+                str(meta.get("sticky_invalidate_reason") or "")[:80] or None
+            )
+            if meta.get("target_changed") is not None:
+                target_changed = bool(meta.get("target_changed"))
+            if meta.get("way_changed") is not None:
+                way_changed = bool(meta.get("way_changed"))
+        if sticky_target_id is None:
+            sticky_target_id = _opt_int(
+                preferred.get("locked_rec_target_id")
+                or preferred.get("recommendation_target_id")
+            )
+        if sticky_way_id is None:
+            sticky_way_id = _way_id_from(preferred)
+    except Exception:
+        pass
+
+    kind = str(sample_kind or "refresh")
+    if way_changed and kind in ("refresh", "post_dice", "end_turn"):
+        kind = "way_change"
+    elif target_changed and kind in ("refresh", "post_dice", "end_turn"):
+        kind = "target_change"
+
     return {
         "round": _safe_int(getattr(game, "round", 0), 0),
         "turn": _safe_int(getattr(game, "turn", 0), 0),
         "state": str(getattr(game, "state", "") or ""),
         "reason": _short_reason(reason),
-        "sample_kind": str(sample_kind or "refresh"),
+        "sample_kind": kind,
         "way_id": _way_id_from(preferred),
         "board_way_id": board_way_i,
         "turns": display_turns,
         "abstract_turns": abstract_turns,
         "supporting_target_id": preferred.get("supporting_action_target_id")
         or preferred.get("supporting_action_future_settlement_target_id"),
+        "sticky_way_id": sticky_way_id,
+        "sticky_target_id": sticky_target_id,
+        "sticky_invalidate_reason": sticky_invalidate_reason,
+        "target_changed": target_changed,
+        "way_changed": way_changed,
         "ts": datetime.now().isoformat(timespec="seconds"),
     }
 

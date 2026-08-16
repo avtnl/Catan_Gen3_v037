@@ -93,7 +93,12 @@ class MarkovEvaluator:
         self.verbose = verbose
 
         if self.verbose:
-            print(f"✅ MarkovEvaluator using {str(self.device).upper()}")
+            try:
+                from core.console import digin, DEBUG
+
+                digin(f"✅ MarkovEvaluator using {str(self.device).upper()}", level=DEBUG)
+            except Exception:
+                print(f"✅ MarkovEvaluator using {str(self.device).upper()}")
 
         self.resource_poss: List[List[int]] = self._generate_states()
         self.state_to_index: Dict[Tuple[int, int, int, int, int], int] = {
@@ -323,10 +328,19 @@ class MarkovEvaluator:
         start_time = time.time()
 
         if self.verbose:
-            print(
-                f"🚀 Precomputing Markov roll profiles for {len(vertex_to_rolls)} vertices... "
-                f"started at {time.strftime('%H:%M:%S')}"
-            )
+            try:
+                from core.console import digin, DEBUG
+
+                digin(
+                    f"🚀 Precomputing Markov roll profiles for {len(vertex_to_rolls)} vertices... "
+                    f"started at {time.strftime('%H:%M:%S')}",
+                    level=DEBUG,
+                )
+            except Exception:
+                print(
+                    f"🚀 Precomputing Markov roll profiles for {len(vertex_to_rolls)} vertices... "
+                    f"started at {time.strftime('%H:%M:%S')}"
+                )
 
         self.vertex_rolls.clear()
         self.precomp_cache.clear()
@@ -341,11 +355,24 @@ class MarkovEvaluator:
 
         if self.verbose:
             duration = time.time() - start_time
-            print(
-                f"✅ Precomputation finished at {time.strftime('%H:%M:%S')} — "
-                f"Duration: {duration:.1f} seconds"
-            )
-            print(f"   {len(self.vertex_rolls)} vertices ready (roll profiles cached)")
+            try:
+                from core.console import digin, DEBUG
+
+                digin(
+                    f"✅ Precomputation finished at {time.strftime('%H:%M:%S')} — "
+                    f"Duration: {duration:.1f} seconds",
+                    level=DEBUG,
+                )
+                digin(
+                    f"   {len(self.vertex_rolls)} vertices ready (roll profiles cached)",
+                    level=DEBUG,
+                )
+            except Exception:
+                print(
+                    f"✅ Precomputation finished at {time.strftime('%H:%M:%S')} — "
+                    f"Duration: {duration:.1f} seconds"
+                )
+                print(f"   {len(self.vertex_rolls)} vertices ready (roll profiles cached)")
 
     def _combine_vertex_rolls(self, vertices: Sequence[int]) -> List[List[int]]:
         """Combine production rolls from the full duplicate-preserving vertex multiset."""
@@ -816,13 +843,19 @@ class MarkovEvaluator:
                 use_light_port_bonus=use_light_port_bonus,
             )
             if print_details:
-                print(
+                line = (
                     f"   Markov INIT {key} | target=opening_site "
                     f"| quality={details['weighted_pips']:.2f} "
                     f"| total_pips={details['total_pips']:.1f} "
                     f"| coverage={details['distinct_early']}/4 "
                     f"| final={score:.2f}"
                 )
+                try:
+                    from core.console import digin, TRACE
+
+                    digin(line, level=TRACE)
+                except Exception:
+                    print(line)
             return float(score)
 
         effective_hand, added_initial_hand = self._maybe_add_initial_resources(
@@ -859,7 +892,7 @@ class MarkovEvaluator:
             if unreachable:
                 if fallback_details is None:
                     fallback_details = {}
-                print(
+                line = (
                     f"   Markov INIT {key} | target={target} "
                     f"| base=9999.00 | unreachable=True"
                     f" | missing={fallback_details.get('missing_resource_count', 0)}"
@@ -869,11 +902,17 @@ class MarkovEvaluator:
                 )
             else:
                 port_bonus = self._light_port_presence_bonus(vertices, player_ports) if use_light_port_bonus else 0.0
-                print(
+                line = (
                     f"   Markov INIT {key} | target={target} "
                     f"| base={base_score:.2f} | port_bonus={port_bonus:.2f}"
                     f"{added_txt} | final={final_score:.2f}"
                 )
+            try:
+                from core.console import digin, TRACE
+
+                digin(line, level=TRACE)
+            except Exception:
+                print(line)
 
         return float(final_score)
 

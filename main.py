@@ -286,7 +286,15 @@ def _create_fresh_game_session(gui=None):
 
 
 def resolve_saved_game_path(filename: str) -> Optional[Path]:
-    """Locate a Saved_Game file (cwd, project root, optional SAVE_PATH)."""
+    """Locate a Saved_Game file.
+
+    Search order for relative names:
+      1. as given under cwd (supports ``saved_games/foo.txt`` or legacy root)
+      2. ``saved_games/<basename>`` under cwd and project root (new default)
+      3. project root / basename (legacy location)
+      4. optional SAVE_PATH (Logs) for older copies
+    Absolute paths are used as-is.
+    """
     name = str(filename or "").strip()
     if not name:
         return None
@@ -295,15 +303,23 @@ def resolve_saved_game_path(filename: str) -> Optional[Path]:
     if p.is_absolute():
         candidates.append(p)
     else:
-        candidates.append(Path.cwd() / name)
+        basename = p.name
+        cwd = Path.cwd()
+        candidates.append(cwd / name)
+        candidates.append(cwd / "saved_games" / basename)
         try:
-            candidates.append(Path(__file__).resolve().parent / name)
+            root = Path(__file__).resolve().parent
+            candidates.append(root / name)
+            candidates.append(root / "saved_games" / basename)
+            candidates.append(root / basename)  # legacy root dumps
         except Exception:
             pass
         try:
-            from core.constants import SAVE_PATH
+            from core.constants import SAVE_PATH, SAVED_GAMES_DIR
 
+            candidates.append(Path(SAVED_GAMES_DIR) / basename)
             candidates.append(Path(SAVE_PATH) / name)
+            candidates.append(Path(SAVE_PATH) / basename)
         except Exception:
             pass
     seen: set[str] = set()

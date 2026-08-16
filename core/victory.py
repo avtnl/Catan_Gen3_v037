@@ -228,6 +228,20 @@ def reveal_all_vp_cards(game: Any, player: Any) -> Dict[str, Any]:
         except Exception:
             pass
 
+    # MGlog: exact-type play_vp when VPs are revealed at claim-win
+    if owned > 0 and game is not None:
+        try:
+            from core import mglog
+
+            mglog.log_play_dcard(
+                game,
+                player,
+                "victory_point",
+                payload=f"revealed={int(owned)}",
+            )
+        except Exception:
+            pass
+
     return out
 
 
@@ -355,6 +369,44 @@ def check_and_declare_winner(
     result["win_result"] = win_result
     result["effective_vp"] = total_after
     result["reason"] = "declared_winner"
+
+    # MGlog: terminal game_over keyframe (MGlog-only stats / re-play end cursor)
+    try:
+        from core import mglog
+
+        mglog.log_game_over(
+            game,
+            player,
+            win_result=win_result,
+            reason=str(reason or "reached_victory_points"),
+        )
+    except Exception:
+        pass
+
+    # Always snapshot final state (GUI and headless / NO_GUI_AT_ALL_TF).
+    # Independent of CHECK_MODE end-of-round cadence.
+    try:
+        saver = getattr(game, "_auto_save_game_over", None)
+        if callable(saver):
+            path = saver(win_result=win_result)
+            if path:
+                result["saved_game_path"] = path
+        else:
+            # Fallback if method missing on partial Game stubs
+            save = getattr(game, "save_game", None)
+            if callable(save):
+                from datetime import datetime as _dt
+
+                wid = win_result.get("winner_id")
+                ts = _dt.now().strftime("%d_%b_%Y_%H_%M_%S")
+                name = (
+                    f"Saved_Game_{ts}_GameOver_P{int(wid)}.txt"
+                    if wid is not None
+                    else f"Saved_Game_{ts}_GameOver.txt"
+                )
+                result["saved_game_path"] = save(name)
+    except Exception:
+        pass
 
     if emit_events:
         try:

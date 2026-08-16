@@ -22,11 +22,17 @@ try:
 except Exception:  # pragma: no cover
     FILENAME_CS = "Catan_CS.txt"
 
-CS_SCHEMA_VERSION = 1
+# Phase C WP-C1: schema 2 sticky snapshot / switch-cause (additive).
+# Phase C2 dig: schema 3 adds refresh gate + compact BA fields (still additive).
+CS_SCHEMA_VERSION = 3
 RESOURCE_ORDER = ("Wheat", "Ore", "Wood", "Brick", "Sheep")
 
 # Module-level: ensure header written once per process/path
 _header_written_paths: set = set()
+
+# Phase C WP-C4: process-wide CS path override (batch_dir/cs.jsonl).
+# When set, cs_log_path() and append_strategy_cs_line() use this file.
+_cs_log_path_override: Optional[str] = None
 
 
 def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
@@ -61,9 +67,47 @@ def _json_default(obj: Any) -> Any:
     return str(obj)
 
 
+def get_cs_log_path_override() -> Optional[str]:
+    """Return active process-wide CS path override, if any (WP-C4)."""
+    return _cs_log_path_override
+
+
+def set_cs_log_path(path: Optional[str]) -> Optional[str]:
+    """Set process-wide CS log path for batch isolation (WP-C4).
+
+    Pass ``None`` or empty string to clear and resume ``FILENAME_CS``.
+    Returns the previous override (may be None).
+    """
+    global _cs_log_path_override
+    prev = _cs_log_path_override
+    text = str(path).strip() if path is not None else ""
+    if not text:
+        _cs_log_path_override = None
+        return prev
+    abs_path = text if os.path.isabs(text) else os.path.abspath(text)
+    parent = os.path.dirname(abs_path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except Exception:
+            pass
+    _cs_log_path_override = abs_path
+    return prev
+
+
 def cs_log_path(filename: Optional[str] = None) -> str:
-    """Absolute path for the CS log (cwd / project, same style as other FILENAME_*)."""
-    name = str(filename or FILENAME_CS or "Catan_CS.txt")
+    """Absolute path for the CS log (cwd / project, same style as other FILENAME_*).
+
+    Explicit ``filename`` wins; else process override (WP-C4); else ``FILENAME_CS``.
+    """
+    if filename is not None and str(filename).strip():
+        name = str(filename).strip()
+        if os.path.isabs(name):
+            return name
+        return os.path.abspath(name)
+    if _cs_log_path_override:
+        return str(_cs_log_path_override)
+    name = str(FILENAME_CS or "Catan_CS.txt")
     if os.path.isabs(name):
         return name
     return os.path.abspath(name)
@@ -401,6 +445,412 @@ def _target_pack_summary(preferred: Mapping[str, Any], game: Any) -> Dict[str, A
     return out
 
 
+def _sticky_cs_enrichment(
+    game: Any,
+    player: Any,
+    preferred: Mapping[str, Any],
+    prev_sample: Mapping[str, Any],
+    *,
+    turns: Optional[float] = None,
+    prev_turns: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Phase C WP-C1: sticky snapshot + switch-cause fields for CS schema v2.
+
+    Prefer ``player.last_sticky_meta`` (published by sticky apply). Fall back to
+    live sticky commitment + prev_sample sticky fields. Missing keys stay None.
+    """
+    out: Dict[str, Any] = {
+        "batch_id": None,
+        "sticky_way_id": None,
+        "sticky_target_id": None,
+        "sticky_target_kind": None,
+        "sticky_roads_fp": None,
+        "prev_sticky_way_id": None,
+        "prev_sticky_target_id": None,
+        "prev_sticky_target_kind": None,
+        "prev_sticky_roads_fp": None,
+        "way_changed": None,
+        "target_changed": None,
+        "roads_changed": None,
+        "is_first_way_lock": None,
+        "is_first_target_lock": None,
+        "sticky_invalidate_reason": None,
+        "sticky_apply_action": None,
+        "way_switch_cause": None,
+        "target_switch_cause": None,
+        "switch_eta_gain": None,
+        "l2_bucket": None,
+        "l2_force_reason": None,
+        "way_kill_kind": None,
+        "q1_offway": None,
+        "achieve_kind": None,
+        # WP-R4 way reassess compare (filled below)
+        "locked_way": None,
+        "best_alt_way": None,
+        "eta_locked": None,
+        "eta_alt": None,
+        "way_switched": None,
+        "way_compare_trigger": None,
+        "eta_gain_if_switch": None,
+        # WP-R5 first-way fit
+        "first_way_id": None,
+        "first_way_fit_own": None,
+        "first_way_fit_board": None,
+        "first_way_fit_expand": None,
+        "first_way_fit_total": None,
+        "first_way_fit_d2_count": None,
+    }
+
+    try:
+        out["batch_id"] = (
+            str(getattr(game, "batch_id", None) or "") or None
+            if game is not None
+            else None
+        )
+    except Exception:
+        out["batch_id"] = None
+
+    meta: Dict[str, Any] = {}
+    try:
+        raw = getattr(player, "last_sticky_meta", None) if player is not None else None
+        if isinstance(raw, Mapping):
+            meta = dict(raw)
+    except Exception:
+        meta = {}
+
+    # Live sticky commitment (authoritative current lock)
+    commitment: Optional[Mapping[str, Any]] = None
+    try:
+        from core.strategy_sticky import get_sticky_commitment
+
+        commitment = get_sticky_commitment(player) if player is not None else None
+    except Exception:
+        commitment = None
+    if not isinstance(commitment, Mapping):
+        # Fall back to preferred locks
+        commitment = {
+            "locked_way_id": preferred.get("locked_way_id")
+            or preferred.get("preferred_way_id")
+            or preferred.get("way_id"),
+            "locked_rec_target_id": preferred.get("locked_rec_target_id")
+            or preferred.get("recommendation_target_id")
+            or preferred.get("target_id"),
+            "locked_target_kind": preferred.get("locked_target_kind")
+            or preferred.get("target_kind"),
+            "locked_roads_to_build": preferred.get("locked_roads_to_build")
+            or preferred.get("roads_to_build"),
+        }
+
+    try:
+        from core.batch.strategy_change_taxonomy import roads_fingerprint
+    except Exception:  # pragma: no cover
+        def roads_fingerprint(roads: Any) -> Optional[str]:  # type: ignore[misc]
+            return None
+
+    sticky_way = _safe_int(
+        meta.get("sticky_way_id"),
+        _safe_int(commitment.get("locked_way_id") if commitment else None),
+    )
+    sticky_tid = _safe_int(
+        meta.get("sticky_target_id"),
+        _safe_int(commitment.get("locked_rec_target_id") if commitment else None),
+    )
+    sticky_kind = (
+        str(meta.get("sticky_target_kind") or "")
+        or str((commitment or {}).get("locked_target_kind") or "")
+        or None
+    )
+    if sticky_kind == "":
+        sticky_kind = None
+    sticky_fp = meta.get("sticky_roads_fp")
+    if sticky_fp is None:
+        sticky_fp = roads_fingerprint((commitment or {}).get("locked_roads_to_build"))
+
+    prev_way = _safe_int(
+        meta.get("prev_sticky_way_id"),
+        _safe_int(
+            prev_sample.get("sticky_way_id"),
+            _safe_int(prev_sample.get("way_id") or prev_sample.get("preferred_way_id")),
+        ),
+    )
+    prev_tid = _safe_int(
+        meta.get("prev_sticky_target_id"),
+        _safe_int(
+            prev_sample.get("sticky_target_id"),
+            _safe_int(prev_sample.get("rec_target_id")),
+        ),
+    )
+    prev_kind = (
+        str(meta.get("prev_sticky_target_kind") or "")
+        or str(prev_sample.get("sticky_target_kind") or "")
+        or None
+    )
+    if prev_kind == "":
+        prev_kind = None
+    prev_fp = meta.get("prev_sticky_roads_fp")
+    if prev_fp is None:
+        prev_fp = prev_sample.get("sticky_roads_fp")
+
+    # Reconcile first-lock / change flags with prev_sample so stale
+    # last_sticky_meta (from an earlier first commit) does not stick forever.
+    is_first_way = prev_way is None and sticky_way is not None
+    is_first_target = prev_tid is None and sticky_tid is not None
+
+    if prev_way is not None and sticky_way is not None and prev_way == sticky_way:
+        way_changed = False
+    elif meta.get("way_changed") is True:
+        way_changed = True
+    else:
+        way_changed = bool(
+            prev_way is not None and sticky_way is not None and prev_way != sticky_way
+        )
+
+    if prev_tid is not None and sticky_tid is not None and prev_tid == sticky_tid:
+        # same id — only kind flip counts as change
+        if prev_kind and sticky_kind and prev_kind != sticky_kind:
+            target_changed = True
+        elif meta.get("target_changed") is True and prev_tid != sticky_tid:
+            target_changed = True
+        else:
+            target_changed = False
+    elif meta.get("target_changed") is True:
+        target_changed = True
+    else:
+        target_changed = bool(
+            (prev_tid is not None and sticky_tid is not None and prev_tid != sticky_tid)
+            or (prev_tid is None and sticky_tid is not None and not is_first_target)
+            or (
+                prev_tid is not None
+                and sticky_tid is not None
+                and prev_kind
+                and sticky_kind
+                and prev_kind != sticky_kind
+            )
+        )
+
+    if meta.get("roads_changed") is not None:
+        roads_changed = bool(meta.get("roads_changed"))
+    else:
+        roads_changed = bool(
+            prev_tid is not None
+            and sticky_tid is not None
+            and prev_tid == sticky_tid
+            and prev_fp is not None
+            and sticky_fp is not None
+            and prev_fp != sticky_fp
+        )
+
+    switch_eta_gain = _safe_float(meta.get("switch_eta_gain"))
+    if switch_eta_gain is None and way_changed and turns is not None and prev_turns is not None:
+        # Positive = better (fewer turns) after switch
+        switch_eta_gain = round(float(prev_turns) - float(turns), 3)
+
+    out.update(
+        {
+            "sticky_way_id": sticky_way,
+            "sticky_target_id": sticky_tid,
+            "sticky_target_kind": sticky_kind,
+            "sticky_roads_fp": sticky_fp,
+            "prev_sticky_way_id": prev_way,
+            "prev_sticky_target_id": prev_tid,
+            "prev_sticky_target_kind": prev_kind,
+            "prev_sticky_roads_fp": prev_fp,
+            "way_changed": way_changed if (prev_way is not None or sticky_way is not None) else None,
+            "target_changed": target_changed
+            if (prev_tid is not None or sticky_tid is not None)
+            else None,
+            "roads_changed": roads_changed if prev_fp is not None or sticky_fp is not None else None,
+            "is_first_way_lock": is_first_way if sticky_way is not None else None,
+            "is_first_target_lock": is_first_target if sticky_tid is not None else None,
+            "sticky_invalidate_reason": (
+                str(meta.get("sticky_invalidate_reason") or "") or None
+            ),
+            "sticky_apply_action": (
+                str(meta.get("sticky_apply_action") or "") or None
+            ),
+            "way_switch_cause": (
+                None
+                if (not way_changed and not is_first_way)
+                else (
+                    "first_lock"
+                    if is_first_way
+                    else (str(meta.get("way_switch_cause") or "") or None)
+                )
+            ),
+            "target_switch_cause": (
+                None
+                if (not target_changed and not is_first_target)
+                else (
+                    "first_lock"
+                    if is_first_target
+                    else (str(meta.get("target_switch_cause") or "") or None)
+                )
+            ),
+            "switch_eta_gain": switch_eta_gain,
+            "l2_bucket": str(meta.get("l2_bucket") or "") or None,
+            "l2_force_reason": str(meta.get("l2_force_reason") or "") or None,
+            "way_kill_kind": str(meta.get("way_kill_kind") or "") or None,
+            "q1_offway": meta.get("q1_offway"),
+            "achieve_kind": str(meta.get("achieve_kind") or "") or None,
+        }
+    )
+    # Phase C2 WP-R4: way reassess compare fields (additive)
+    try:
+        from core.way_reassess_log import cs_fields_from_compare
+
+        out.update(cs_fields_from_compare(player))
+    except Exception:
+        out.setdefault("locked_way", None)
+        out.setdefault("best_alt_way", None)
+        out.setdefault("eta_locked", None)
+        out.setdefault("eta_alt", None)
+        out.setdefault("way_switched", None)
+        out.setdefault("way_compare_trigger", None)
+        out.setdefault("eta_gain_if_switch", None)
+    # Phase C2 WP-R5: first-way fit (additive)
+    try:
+        from core.first_way_fit import cs_fields_from_first_way_fit
+
+        out.update(cs_fields_from_first_way_fit(player))
+    except Exception:
+        pass
+    return out
+
+
+def _cs_gate_and_ba_fields(game: Any, player: Any) -> Dict[str, Any]:
+    """Phase C2 dig: L2 gate attribution + compact Best-Action snapshot.
+
+    BA is whatever ``game.current_best_action`` holds at CS write time (often the
+    last viable-action scan — may lag one rescan after strategy refresh).
+    """
+    out: Dict[str, Any] = {
+        "refresh_mode": None,
+        "refresh_mode_detail": None,
+        "l2_gate": None,
+        "l2_bucket_live": None,
+        "explicit_codes": None,
+        "explicit_trigger": None,
+        "sticky_apply_reason": None,
+        "sticky_invalidate_reason_live": None,
+        "ba_action": None,
+        "ba_target_id": None,
+        "ba_label": None,
+        "ba_source": None,
+        "ba_roads_fp": None,
+    }
+    if game is not None:
+        try:
+            out["refresh_mode"] = str(getattr(game, "_strategy_refresh_mode", None) or "") or None
+            out["refresh_mode_detail"] = (
+                str(getattr(game, "_strategy_refresh_mode_detail", None) or "") or None
+            )
+        except Exception:
+            pass
+        try:
+            st = getattr(game, "last_strategy_context_status", None)
+            if isinstance(st, Mapping):
+                if not out["refresh_mode"]:
+                    out["refresh_mode"] = str(st.get("refresh_mode") or "") or None
+                if not out["refresh_mode_detail"]:
+                    out["refresh_mode_detail"] = str(st.get("refresh_mode_detail") or "") or None
+                pol = st.get("l2_policy")
+                if isinstance(pol, Mapping):
+                    out["l2_gate"] = str(pol.get("gate") or "") or None
+                    out["l2_bucket_live"] = str(pol.get("bucket") or "") or None
+        except Exception:
+            pass
+        # CS often runs before last_strategy_context_status is finalized — recompute gate
+        if not out["l2_gate"] or not out["l2_bucket_live"]:
+            try:
+                from core.strategy_reconsider import build_l2_policy_status
+
+                pol = build_l2_policy_status(
+                    game,
+                    player,
+                    reason=str(out.get("refresh_mode_detail") or ""),
+                    mode=str(out.get("refresh_mode") or ""),
+                    mode_detail=str(out.get("refresh_mode_detail") or ""),
+                )
+                if isinstance(pol, Mapping):
+                    if not out["l2_gate"]:
+                        out["l2_gate"] = str(pol.get("gate") or "") or None
+                    if not out["l2_bucket_live"]:
+                        out["l2_bucket_live"] = str(pol.get("bucket") or "") or None
+            except Exception:
+                pass
+        # Compact BA
+        try:
+            ba = getattr(game, "current_best_action", None)
+            if isinstance(ba, Mapping):
+                out["ba_action"] = str(
+                    ba.get("action") or ba.get("name") or ba.get("type") or ""
+                ) or None
+                tid = ba.get("target_id")
+                if tid is None:
+                    tid = ba.get("intersection_id") or ba.get("road_id")
+                try:
+                    out["ba_target_id"] = int(tid) if tid is not None and tid != "" else None
+                except Exception:
+                    out["ba_target_id"] = None
+                out["ba_label"] = str(
+                    ba.get("label")
+                    or ba.get("best_action_label")
+                    or ba.get("text")
+                    or ba.get("best_action_text")
+                    or ""
+                )[:80] or None
+                out["ba_source"] = str(ba.get("source") or "") or None
+                try:
+                    from core.batch.strategy_change_taxonomy import roads_fingerprint
+
+                    roads = (
+                        ba.get("roads_to_build")
+                        or ba.get("road_path")
+                        or ba.get("path")
+                    )
+                    out["ba_roads_fp"] = roads_fingerprint(roads)
+                except Exception:
+                    out["ba_roads_fp"] = None
+        except Exception:
+            pass
+
+    if player is not None:
+        try:
+            rt = getattr(player, "explicit_recalc_runtime", None)
+            if isinstance(rt, Mapping):
+                codes = list(rt.get("session_codes") or rt.get("pending_codes") or [])
+                if codes:
+                    out["explicit_codes"] = [int(c) for c in codes if c is not None]
+                reason = str(rt.get("session_reason") or "") or None
+                if reason:
+                    out["explicit_trigger"] = reason
+            last_tr = getattr(player, "last_explicit_trigger", None)
+            if isinstance(last_tr, Mapping):
+                if not out["explicit_trigger"]:
+                    out["explicit_trigger"] = str(last_tr.get("reason") or "") or None
+                if not out["explicit_codes"] and last_tr.get("codes"):
+                    out["explicit_codes"] = list(last_tr.get("codes") or [])
+        except Exception:
+            pass
+        try:
+            meta = getattr(player, "last_sticky_meta", None)
+            if isinstance(meta, Mapping):
+                out["sticky_apply_reason"] = (
+                    str(meta.get("sticky_apply_action") or meta.get("sticky_reason") or meta.get("reason") or "")
+                    or None
+                )
+                inv = str(meta.get("sticky_invalidate_reason") or meta.get("invalidate_reason") or "") or None
+                out["sticky_invalidate_reason_live"] = inv
+                # Prefer sticky-published L2 dig-in if live gate empty
+                if not out["l2_bucket_live"] and meta.get("l2_bucket"):
+                    out["l2_bucket_live"] = str(meta.get("l2_bucket") or "") or None
+                if not out["l2_gate"] and meta.get("l2_force_reason"):
+                    out["l2_gate"] = str(meta.get("l2_force_reason") or "") or None
+        except Exception:
+            pass
+    return out
+
+
 def build_strategy_cs_row(
     game: Any,
     player: Any,
@@ -446,6 +896,29 @@ def build_strategy_cs_row(
     hand = _hand_vector(player) if player is not None else None
     pips = _production_pips(game, player) if player is not None else None
 
+    sticky_pack = _sticky_cs_enrichment(
+        game, player, preferred, prev_sample, turns=turns, prev_turns=prev_turns
+    )
+
+    # Prefer sticky locked target when present for rec_target_id dig-in
+    rec_tid = sticky_pack.get("sticky_target_id")
+    if rec_tid is None:
+        rec_tid = target_pack.get("rec_target_id")
+
+    # sample_kind: promote only when sticky apply published a real change flag
+    # (do not infer solely from preferred way vs prev_sample — callers set kind).
+    kind = str(sample_kind or "refresh")
+    try:
+        meta_raw = getattr(player, "last_sticky_meta", None) if player is not None else None
+        meta_has = isinstance(meta_raw, Mapping) and bool(meta_raw)
+        if meta_has and kind in ("refresh", "post_dice", "end_turn"):
+            if sticky_pack.get("way_changed"):
+                kind = "way_change"
+            elif sticky_pack.get("target_changed"):
+                kind = "target_change"
+    except Exception:
+        pass
+
     row: Dict[str, Any] = {
         "schema": CS_SCHEMA_VERSION,
         "ts": datetime.now().isoformat(timespec="seconds"),
@@ -461,7 +934,7 @@ def build_strategy_cs_row(
         "color": str(getattr(player, "color", "") or "") if player is not None else None,
         "is_human": bool(getattr(player, "is_human", False)) if player is not None else None,
         "reason": str(reason or preferred.get("strategy_context_reason") or "") or None,
-        "sample_kind": str(sample_kind or "refresh"),
+        "sample_kind": kind,
         # Strategy
         "way_id": way,
         "prev_way_id": prev_way if prev_way != way else None,
@@ -503,7 +976,7 @@ def build_strategy_cs_row(
         # Supporting / risk pack summary
         "supporting_action_type": target_pack.get("supporting_action_type"),
         "supporting_target_id": target_pack.get("supporting_target_id"),
-        "rec_target_id": target_pack.get("rec_target_id"),
+        "rec_target_id": rec_tid,
         "self_eta": target_pack.get("self_eta"),
         "risk_level": target_pack.get("risk_level"),
         "threat_summary": target_pack.get("threat_summary"),
@@ -511,6 +984,15 @@ def build_strategy_cs_row(
         "priority_score": target_pack.get("priority_score"),
         "priority_reason": target_pack.get("priority_reason"),
     }
+
+    # Phase C WP-C1 sticky / switch fields
+    row.update(sticky_pack)
+
+    # Phase C2 dig: L2 gate attribution + compact BA (schema 3 additive)
+    try:
+        row.update(_cs_gate_and_ba_fields(game, player))
+    except Exception:
+        pass
 
     # DCard played this turn
     try:
@@ -699,6 +1181,8 @@ def filter_cs_rows_for_player(
 __all__ = [
     "CS_SCHEMA_VERSION",
     "cs_log_path",
+    "set_cs_log_path",
+    "get_cs_log_path_override",
     "build_strategy_cs_row",
     "append_strategy_cs_line",
     "log_strategy_cs",
