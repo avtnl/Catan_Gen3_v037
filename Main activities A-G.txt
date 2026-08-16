@@ -989,7 +989,6 @@ M-stats implementation:
 | **S8** | Optional: Game Over / dig path can call mglog aggregator when offline flag set | later |
 
 M_GUI implementation:
-## 6. Work packages
 
 | WP | Deliverable | Est. |
 |----|-------------|------|
@@ -1006,3 +1005,144 @@ M_GUI implementation:
 
 **Suggested order:** G1 → G2 → G3 → G4 → G5 → G8 → G6 → G7 → G9.
 
+Adding CS_fields to MGlog | Requirments:
+Based on your info, we keep the original batch untouched.
+When the CS-probe is executed off-line, I like to add 3 attributes to MGlog: "cs_tf" and "cs_cat1" and "cs_cat2".
+Q1) Based on CS JSONL can you retrieve all individual MGlogs? Both "cs_cat1" and "cs_cat2" are lists of integers.
+Example  "cs_cat1" = [3, 5] and "cs_cat2" = [353, 39, 51, 53] Note combinations might not be possible in reality; purpose is to demonstrate how these list can look like.
+ 
+cs_cat1:
+1. first_lock (applies to Way-change and Target-change classes only)
+2. setback — ETA setback
+3. way_change — Victory-Way change
+4. target_change — sticky target change
+5. anomaly — any of the anomaly codes below
+
+cs_cat2:
+11. first_lock (applies to Way-change and Target-change classes only)
+
+Way-change classes (way_change_class):
+20. unknown
+211. race_road
+212. race_settle
+23. target_blocked
+24. offway_opportunity
+25. way_kill
+26. specials_shock
+27. soft_eta_switch
+28. hard_invalid
+29. endgame_reshape
+
+Target-change classes (target_change_class):
+30. unknown
+311. race_road
+312. race_settle
+313. race_impossible
+33. target_blocked
+34. offway_opportunity
+351. achieve_settle
+352. achieve_city
+353. achieve_component
+36. route_illegal
+37. same_way_rerank
+38. specials_project
+39. way_switch_cascade
+
+Setback classes (setback_class):
+40. unknown
+41. way_switch
+421. specials_la
+422. specials_lr
+431. robber
+432. discard_7
+44. monopoly,
+45. dcard_draw_noise
+46. trade_reprice
+47. build_spent
+48. progress_paradox
+49. estimator_jump
+
+Anomaly classes:
+51. anomaly_way_change_on_achieve
+52. anomaly_way_change_hand_only,
+53. anomaly_q2_way_change
+54. anomaly_target_thrash
+
+Should we integrate this in current CS-probe or is it better to define a standalone script?
+
+Q2) Challenge my outlined idea.
+
+For later:
+Draft an implementation plan to add "cs_tf" and "cs_cat1" and "cs_cat2". No amendment of  replay_catan_game.py yet.
+
+Adding CS_fields to MGlog | Implementation:
+W0 - Lock attach B, encoding, first_lock policy, out dir layout (this plan)
+W1 - cs_mglog_codes.py + unit tests for maps
+W2 - cs_interest.py from CS stream (reuse taxonomy); golden samples
+W3 - cs_mglog_annotate.py path resolve + attach + write
+W4 - CLI + manifest
+W5 - Smoke on a real small batch dir; document in MANUAL one short section
+W6 - (Optional) --annotate-mglog on existing analyze script | Not implemented!
+
+REPLAY_DIG | Requirements:
+I matched fields (cs) to below primary and secondary | Q1: Check if done correctly?
+Always show (if present):
+1. Way: sticky_way_id / way_id + short tags -> way_id / sticky_way_id, way_tags, way_la / way_lr
+2. Sticky target: id + kind ->  sticky_target_id / rec_target_id, kind
+3. Plan ETA: turns (+ delta if setback) ->  turns, prev_turns, delta_turns
+4. Target ETA: self_eta -> self_eta
+5. BA: ba_label or ba_action @ ba_target_id ->  ba_action, ba_target_id, ba_label, ba_source
+6. Supporting ->  supporting_action_type, supporting_target_id 
+7. Causes: way/target switch cause or setback class from annotate codes -> reason, sample_kind, switch causes, sticky_ invalidate_reason, achieve_kind, way_changed / target_changed
+
+Secondary (expand / tooltip):
+• abstract_turns, win_span -> abstract_turns, "baseline_win_turns → win_turns_if_target"
+• risk_level, priority -> risk_level, priority_score, priority_reason, (optional threat_summary)
+• prev_way / prev_target -> prev_sticky_way_id, prev_sticky_target_id, prev_sticky_target_kind, (prev_way_id when way id changed)
+• optional -> ba_roads_fp, sticky_roads_fp, refresh_mode, l2_gate, … Q1) List all "L2 dig fields".
+• cat1/cat2 codes on the hit
+
+I suggest to kind mimic the "Execution Debug"-panel and rename "Data"-panel.
+Slightly smaller to make sure we do not overrwite "10 older wheel Ratio- PgDn . 22 total" located just below the bottom border of the Event-panel.
+Have 4 buttons Str1, Str2, Str3, Str4. Q2) If you have better names, let me know (appreciate any suggestion here).
+Fit as much data listed as "Always show (if present)" 1-7 in Str1. Keep things organized and readable. Whatever doesn't fit -> move to Str2.
+Fit as much data listed as "Secondary (expand / tooltip)" in Str3. Keep things organized and readable. Whatever doesn't fit -> move to Str4.
+Q3) Same thing here. If you have a better suggestion for look & feel, happy to hear/ learn.
+
+Make sure fields are always on the same location (if not omitted)!
+
+Top row of navigation buttons: "<<G", "<R", "<T", "<",">", ">T", ">R", ">>G" (irst record MGlog, previous Round, previous Turn, previous row in MGlog, next roe in MGlog, next Turn, next Round, last record MGlog 
+Below this row and above the dices user can specify cat1 and cat2. All entries should be viable, adding tekst to "cat1" should instantly clear "cat2" and vice versa. If not a single row in MGlog meets user specification add correponding text in Data-panel.
+
+We need to discuss how we enrich annotatted MGlog:
+- All fields in primary and secondary should be listed as colum in MGlog
+- cs_tf = True, for the slightest update of any fields listed as primary or secondary; cleaning a files is perceived as an update (how to capture as none, deleted, …?
+- Most updates are at turn start, which is an existing row in MGlog, meaning we can sync timing of MGlog and CS data exactly.
+- If updates are made after achieving …, should a) the update be part of the this MGlog, b) should we create a new entry in the log (identified as SE update) or c) should update be part of the next row in MGlog? Whatever we choose should apply to all CS-updates!
+- Initial Placement has an empty "Data"-panel. Should we add a line here clarifying data is only available once starting Execution Phase?
+- Data in red, if updated in this MGlog-row; color schema only works for "<" and ">". "Deleted" if data has been cleared!
+- Data in blue, if updated in MGlog-row in same turn; color schema only works for "<" and ">". "Deleted" if data has been cleared!
+- Data in black,  if updated in MGlog-row in previous turn and default when navigating via other buttons than "<" and ">". "Deleted" is not applicable here. Somehow I like to reference R/T where last update occured.
+  Can we do so by adding (*) R4T4 and (**) R2T4 - max 2 and adding either (*), (**) or (RxTy) beyond the value of each field (if not omitted, of course).
+- Do we need to add an index and/or reference to index in annotatted MGlog?
+
+Navigation buttons below dices: "Previous" and "Next" move to applicable occurance in MGlog meeting user specification. Note only one of "cat1" or "cat2", never both!
+
+Expected navigation behaviour 1) "Next", 2) "combination of multiple ">" and or ">" to find turn start, 3) one ">" at a time to review SE details during the turn.
+
+Did I forget something? Any questions?
+
+REPLAY_DIG | Implementation:
+| WP | Deliverable | Exit criteria |
+|----|-------------|---------------|
+| **SE0** | This plan saved; schema name `cs_mglog_se_v2` | Review |
+| **SE1** | `cs_se_snapshot.py`: CS row → SE dict; diff; `__DEL__` | Unit tests |
+| **SE2** | Annotate dual emit dense+sparse + `se_update` insert + `se_tf` | Mini-batch fixture; originals untouched |
+| **SE3** | Probe still on same rows (`cs_tf`/cats) via interest pipeline | Cats match W1 on fixtures |
+| **SE4** | CLI annotate writes both files + manifest v2 | subprocess test |
+| **SE5** | Re-play: load enriched file; `event_index` land; sparse fill | Unit + smoke |
+| **SE6** | Dig hit list XOR cats; Prev/Next below dice | Tests |
+| **SE7** | SE Dig panel PLAN/ACT/WHY/MORE fixed slots | Visual smoke |
+| **SE8** | Colors red/blue/black + Deleted + (*)(**) | Fixture walkthrough test |
+| **SE9** | CLI `--dig` / `--mglog-cs` / cats; normal path unchanged | Regression |
+| **SE10** | MANUAL + dig one-pager; lab smoke n=5 both variants | Doc + timing note (file sizes) |

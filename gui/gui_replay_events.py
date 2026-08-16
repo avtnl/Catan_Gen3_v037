@@ -165,12 +165,13 @@ def draw_event_strip(
     slice_lines, sc = visible_slice(lines, scroll=scroll, visible=vis)
     n = len(lines)
 
-    # Scroll hint just below the panel's bottom border (outside the box)
+    # Scroll hint just below Events bottom border; raised 5 px vs old +3
+    # (pairs with SE Dig panel top lowered 5 px to clear overlap)
     if n > vis:
         hint = f"↑{sc} older · wheel · {n} total"
         screen.blit(
             line_font.render(hint, True, dim),
-            (pane.x + PAD, pane.bottom + 3),
+            (pane.x + PAD, pane.bottom - 2),
         )
 
     if not lines:

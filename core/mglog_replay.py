@@ -929,6 +929,47 @@ def set_cursor(
     )
 
 
+def find_cursor_for_event_index(
+    session: ReplaySession, event_index: int
+) -> int:
+    """SE5: map enriched ``event_index`` column → list index for ``set_cursor``.
+
+    Prefers matching ``row['event_index']``; falls back to treating
+    ``event_index`` as a list index when in range.
+    """
+    target = int(event_index)
+    rows = list(getattr(session, "rows", None) or [])
+    for i, row in enumerate(rows):
+        raw = row.get("event_index")
+        if raw is None or raw == "":
+            continue
+        try:
+            if int(float(raw)) == target:
+                return i
+        except Exception:
+            continue
+    if 0 <= target < len(rows):
+        return target
+    return int(getattr(session, "cursor", 0) or 0)
+
+
+def set_cursor_to_event_index(
+    session: ReplaySession,
+    event_index: int,
+    *,
+    nav_kind: str = "",
+    refresh_highlight: bool = True,
+) -> ReplayState:
+    """SE5: land re-play on the row with the given ``event_index``."""
+    idx = find_cursor_for_event_index(session, event_index)
+    return set_cursor(
+        session,
+        idx,
+        nav_kind=nav_kind,
+        refresh_highlight=refresh_highlight,
+    )
+
+
 def empty_turn_highlight(nav_kind: str = "") -> TurnHighlight:
     return TurnHighlight(
         nav_kind=str(nav_kind or ""),
@@ -2012,6 +2053,8 @@ __all__ = [
     "load_replay_session",
     "apply_through",
     "set_cursor",
+    "find_cursor_for_event_index",
+    "set_cursor_to_event_index",
     "empty_state",
     "empty_turn_highlight",
     "compute_turn_highlight",

@@ -266,6 +266,7 @@ py -3.13 run_headless.py --games 3 --batch-dir batch_runs/my_experiment
 | Per-game **playboard** (map snapshot) | `batch_runs/…/g00N/Playboard_g00N.txt` — written for **random and fixed** maps so re-play is self-contained; pointer **`playboard_path`** in `result.json` |
 | Batch summary | `batch_runs/<ts>_batch/batch_summary.json` |
 | **Batch CS log** (WP-C4) | `batch_runs/<ts>_batch/cs.jsonl` |
+| **CS-annotated MGlog** (offline) | `batch_runs/<ts>_batch/cs_annot/g00N/mglog_cs.csv` + `manifest.json` (originals untouched) |
 | **Way reassess log** (Phase C2) | `batch_runs/<ts>_batch/way_reassess.jsonl` |
 
 **Re-play a batch game** (e.g. game 3) after a headless run:
@@ -347,6 +348,72 @@ py -3.13 -m pytest tests/test_strategy_change_taxonomy_c0.py tests/test_strategy
 
 Example lab run (2026-08-05): 3-game batch → 805 CS v2 rows → probe  
 `batch_runs/phase_c_wp_c6_validation/`. Write-up: **`docs/PhaseC_wp_c6_validation.md`**.
+
+### CS → MGlog annotation (offline dig labels)
+
+After a batch with **CS** (`cs.jsonl`) **and** per-game **MGlog** (`g00N/mglog.csv`), you can stamp **annotated copies** with multi-label CS-probe codes for later dig / re-play filters. **Original batch files stay read-only.**
+
+**Plan:** `docs/CS_mglog_annotate_plan.md`  
+**Code:** `core/batch/cs_mglog_codes.py`, `core/batch/cs_interest.py`, `core/batch/cs_mglog_annotate.py`, `scripts/annotate_mglog_cs.py`
+
+#### Columns (on annotated CSV only)
+
+| Column | Meaning |
+|--------|---------|
+| **`cs_tf`** | `1` if this row has any CS interest tag (else empty) |
+| **`cs_cat1`** | Coarse multi-label ints, `;`-joined (e.g. `2;3`) — first_lock / setback / way_change / target_change / anomaly |
+| **`cs_cat2`** | Fine multi-label ints (setback/way/target/anomaly class codes; **11** = way/target first_lock only) |
+
+Attachment **Policy B:** codes land on the **last MGlog event** of that seat-turn `(round, turn, player_id)`. Same classifiers as `analyze_cs_setbacks.py` (setback threshold default **1.0**, thrash default **3**).
+
+#### Run
+
+```bash
+# Default out: batch_runs/<ts>_batch/cs_annot/
+py -3.13 scripts/annotate_mglog_cs.py --batch-dir batch_runs/<ts>_batch
+
+py -3.13 scripts/annotate_mglog_cs.py --batch-dir batch_runs/<ts>_batch --out-dir path/to/cs_annot
+py -3.13 scripts/annotate_mglog_cs.py --batch-dir batch_runs/<ts>_batch --game-ids <id1>,<id2> -q
+```
+
+| Output | Path |
+|--------|------|
+| Manifest | `…/cs_annot/manifest.json` (thresholds, games annotated/skipped, paths) |
+| Annotated MGlog | `…/cs_annot/g00N/mglog_cs.csv` |
+
+Games without `mglog.csv` are **skipped** (listed in the manifest); CS-only batches produce a valid empty annotate. Requires **`MGLOG=True`** during the batch if you want dig labels later.
+
+**Need both artifacts:** batch `cs.jsonl` (always for GameManager) + per-game MGlog (`mglog_path` in `result.json` when `MGLOG` on).
+
+#### Related tests
+
+```bash
+py -3.13 -m pytest tests/test_cs_mglog_codes_w0.py tests/test_cs_interest_w1.py tests/test_cs_mglog_annotate_w2w3.py tests/test_annotate_mglog_cs_cli_w4.py tests/test_cs_mglog_annotate_w5_smoke.py -q
+```
+
+Lab smoke batch with CS + MGlog: `batch_runs/mglog_replay_n5` (optional; test skips if absent).
+
+#### SE Dig (re-play enriched MGlog)
+
+After annotate (`cs_annot/g00N/mglog_cs.csv` dense):
+
+```bash
+py -3.13 scripts/replay_catan_game.py --playboard <PlayBoard.txt> --dig \
+  --mglog-cs batch_runs/<batch>/cs_annot/g001/mglog_cs.csv --cat2 311,312
+
+# Or with game-dir (prefers cs_annot when --dig):
+py -3.13 scripts/replay_catan_game.py --dig --game-dir batch_runs/<batch>/g001 --cat1 2,3
+```
+
+| Control | Role |
+|---------|------|
+| **cat1 / cat2** (above dice) | XOR filter lists; typing one clears the other |
+| **Previous / Next** (below dice) | Jump to previous/next probe hit |
+| **SE Dig panel** (right) | PLAN / ACT / WHY / MORE — fixed SE field slots |
+| **Continue** (`>`) | Step rows; field colors red/blue (this row / earlier same seat-turn) |
+| Other nav | Black text; optional `(*)` R/T last-update refs |
+
+Normal re-play (no `--dig`) still uses original `mglog.csv` only.
 
 ### Matched dice + Victory-Way reassess (Phase C2)
 

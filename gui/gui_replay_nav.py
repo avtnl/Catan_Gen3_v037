@@ -1,12 +1,9 @@
 """M-GUI re-play navigation buttons + dice (match live human button chrome).
 
-F7–F8 layout/colors:
-  Panel fill LGRAY + BLACK border (gui_human_player panel frame).
-  Enabled: GREEN border + WHITE text (Play/Continue/Roll pattern).
-  Disabled: GRAY border + GRAY text.
-  Row A (3): Font.LARGE — same as live Play / Continue / Roll labels.
-  Row B (4): Font.SMALL — compact labels.
-  Equal row heights; top row flush to panel top + pad.
+Layout (SE Dig product):
+  **One top row (8):** <<G  <R  <T  <  >  >T  >R  >>G
+  Dig Previous/Next live in ``gui_replay_dig`` below the dice (not here).
+  Panel fill LGRAY + BLACK border; enabled GREEN/WHITE, disabled GRAY/GRAY.
   Dice: live show_dices positions (20 / 110, y=380) in LEFT_DICE_PANEL_RECT.
 """
 
@@ -41,29 +38,32 @@ except Exception:  # pragma: no cover
     }
     Font = None  # type: ignore
 
-_LARGE_SPECS: Tuple[Tuple[str, str], ...] = (
-    ("first", "<<"),
-    ("continue", "Continue"),
-    ("last", ">>"),
+# Single top row: first / prev round / prev turn / prev row / next row / next turn / next round / last
+_TOP_SPECS: Tuple[Tuple[str, str], ...] = (
+    ("first", "<<G"),
+    ("previous_round", "<R"),
+    ("previous_turn", "<T"),
+    ("previous", "<"),
+    ("continue", ">"),
+    ("next_turn", ">T"),
+    ("next_round", ">R"),
+    ("last", ">>G"),
 )
 
-_SMALL_SPECS: Tuple[Tuple[str, str], ...] = (
-    ("previous_turn", "Previous Turn"),
-    ("next_turn", "Next Turn"),
-    ("previous_round", "Previous Round"),
-    ("next_round", "Next Round"),
-)
+# Legacy names kept empty so dig layer owns bottom row
+_SMALL_SPECS: Tuple[Tuple[str, str], ...] = ()
 
-_BTN_SPECS: Tuple[Tuple[str, str], ...] = _LARGE_SPECS + _SMALL_SPECS
+_BTN_SPECS: Tuple[Tuple[str, str], ...] = _TOP_SPECS
 
 _CAP_KEY = {
     "first": "can_first",
-    "continue": "can_continue",
-    "last": "can_last",
-    "previous_turn": "can_previous_turn",
-    "next_turn": "can_next_turn",
     "previous_round": "can_previous_round",
+    "previous_turn": "can_previous_turn",
+    "previous": "can_previous",
+    "continue": "can_continue",
+    "next_turn": "can_next_turn",
     "next_round": "can_next_round",
+    "last": "can_last",
 }
 
 _FORWARD_IDS = frozenset({"continue", "next_turn", "next_round", "last"})
@@ -86,49 +86,28 @@ def button_rects(
     panel: pygame.Rect = PANEL,
     dice: pygame.Rect = DICE_PANEL,
 ) -> Dict[str, pygame.Rect]:
-    """Equal-height rows; top row aligned to panel top + pad (F8)."""
-    pad, gap = 8, 6
-    avail_top = max(0, int(dice.y - panel.y - pad - gap))
-    bot_y = int(dice.bottom + gap)
-    avail_bot = max(0, int(panel.bottom - pad - bot_y))
-    # Shared height for both rows
-    if avail_top > 0 and avail_bot > 0:
-        row_h = max(28, min(avail_top, avail_bot))
-    else:
-        row_h = max(28, avail_top or avail_bot or 32)
-
+    """Single top row of 8 nav buttons (above dice). Bottom row reserved for dig."""
+    pad, gap = 6, 4
+    # Leave room for cat fields between nav and dice (~36 px)
+    max_bottom = int(dice.y - pad - 40)
+    top_y = panel.y + pad
+    row_h = max(26, min(36, max_bottom - top_y))
     top_band = pygame.Rect(
         panel.x + pad,
-        panel.y + pad,
-        max(40, panel.width - 2 * pad),
-        row_h,
-    )
-    bot_band = pygame.Rect(
-        panel.x + pad,
-        bot_y,
+        top_y,
         max(40, panel.width - 2 * pad),
         row_h,
     )
 
     out: Dict[str, pygame.Rect] = {}
-    n_large = len(_LARGE_SPECS)
-    lw = (top_band.width - gap * (n_large - 1)) // n_large
-    for i, (bid, _) in enumerate(_LARGE_SPECS):
+    n = len(_TOP_SPECS)
+    bw = max(28, (top_band.width - gap * (n - 1)) // n)
+    for i, (bid, _) in enumerate(_TOP_SPECS):
         out[bid] = pygame.Rect(
-            top_band.x + i * (lw + gap),
+            top_band.x + i * (bw + gap),
             top_band.y,
-            lw,
+            bw,
             top_band.height,
-        )
-
-    n_small = len(_SMALL_SPECS)
-    sw = (bot_band.width - gap * (n_small - 1)) // n_small
-    for i, (bid, _) in enumerate(_SMALL_SPECS):
-        out[bid] = pygame.Rect(
-            bot_band.x + i * (sw + gap),
-            bot_band.y,
-            sw,
-            bot_band.height,
         )
     return out
 
@@ -216,33 +195,20 @@ def draw_nav_panel(
     screen.blit(title, (panel.x + 10, panel.y - 22))
 
     labels = {bid: lab for bid, lab in _BTN_SPECS}
-    large_ids = {bid for bid, _ in _LARGE_SPECS}
 
     for bid, rect in rects.items():
         en = button_enabled(bid, cap)
-        # Live text buttons sit on LGRAY; only border + text change
         pygame.draw.rect(screen, lgray, rect)
         border_col = green if en else gray
         text_col = white if en else gray
         pygame.draw.rect(screen, border_col, rect, 2)
 
         lab = labels.get(bid, bid)
-        use_font = font_large if bid in large_ids else font_sm
+        # Compact labels: prefer SMALL so 8 fit; fall back shrink
+        use_font = font_sm
         text = use_font.render(lab, True, text_col)
-        if text.get_width() > rect.width - 6:
-            text = use_font.render(lab.replace("Previous", "Prev"), True, text_col)
-        if text.get_width() > rect.width - 6 and bid not in large_ids:
-            parts = lab.split()
-            if len(parts) >= 2:
-                t1 = use_font.render(parts[0], True, text_col)
-                t2 = use_font.render(" ".join(parts[1:]), True, text_col)
-                screen.blit(
-                    t1, t1.get_rect(centerx=rect.centerx, centery=rect.centery - 7)
-                )
-                screen.blit(
-                    t2, t2.get_rect(centerx=rect.centerx, centery=rect.centery + 7)
-                )
-                continue
+        if text.get_width() > rect.width - 4:
+            text = font_sm.render(lab, True, text_col)
         screen.blit(text, text.get_rect(center=rect.center))
     return rects
 
