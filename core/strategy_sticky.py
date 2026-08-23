@@ -267,6 +267,18 @@ def flag_opponents_after_structure(
             builder_id=builder_id,
             detail={"target_id": target_id, "structure": kind, "relevant": True},
         )
+        # WP3 code 6: plan-relevant structure is a sticky-target threat
+        try:
+            from core.strategy_explicit_recalc import note_sticky_target_threat
+
+            note_sticky_target_threat(
+                game,
+                p,
+                reason=f"{reason}:tw={target_id}",
+                force=True,
+            )
+        except Exception:
+            pass
         flagged.append(int(pid))
     # P2-B: board piece change → drop portfolio cache for all seats
     try:
@@ -1210,8 +1222,18 @@ def should_invalidate_sticky(
         way_audit = find_audit_for_way(audits, way_id)
         if way_audit is not None:
             feas = str(_audit_get(way_audit, "feasibility", "") or "").lower()
-            if feas in _FEAS_KILL:
+            if feas in _FEAS_KILL or feas == "board_unfit":
                 return True, "locked_way_infeasible"
+        # WP2: locked way cannot realize structure / held specials
+        try:
+            from core.strategy_board_fit import is_board_fit_enabled, way_fits_player
+
+            if is_board_fit_enabled(game) and not way_fits_player(
+                way_id, player, game=game
+            ):
+                return True, "board_fit_unfit"
+        except Exception:
+            pass
 
     # Target blocked on board and not own (own handled above)
     if target_blocked_on_board(game, tid) and not target_own_complete(player, tid):

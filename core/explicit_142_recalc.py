@@ -15,9 +15,12 @@ Codes
 3  on_target_hard_invalid — sticky target hard-invalid / blocked race
 4  every_n_own_turns — form ``[4, n]`` (n ≥ 1); bare ``4`` → n default
 5  milestones — first cross of EXPLICIT_RECALC_MILESTONES VP values
+6  on_sticky_target_threat — opponent threatens sticky settle/path (WP3)
+7  on_lr_tooling — TFR/road tools toward sticky LR (WP3)
 
 9  reserved (every_own_turn) — not implemented
 
+Product AI default remains ``[2, [4, 4]]`` (6/7 opt-in via arm).
 Multi-entry lists are OR'd. See docs/PhaseC2_way_reassess_experiment_plan.md.
 """
 
@@ -33,6 +36,8 @@ EXPLICIT_RECALC_ON_ETA_SETBACK: int = 2
 EXPLICIT_RECALC_ON_TARGET_HARD_INVALID: int = 3
 EXPLICIT_RECALC_EVERY_N_OWN_TURNS: int = 4
 EXPLICIT_RECALC_MILESTONES: int = 5
+EXPLICIT_RECALC_ON_STICKY_TARGET_THREAT: int = 6  # WP3
+EXPLICIT_RECALC_ON_LR_TOOLING: int = 7  # WP3
 # Reserved — do not implement in v1
 EXPLICIT_RECALC_EVERY_OWN_TURN_RESERVED: int = 9
 
@@ -43,6 +48,8 @@ EXPLICIT_RECALC_CODE_NAMES: Dict[int, str] = {
     EXPLICIT_RECALC_ON_TARGET_HARD_INVALID: "on_target_hard_invalid",
     EXPLICIT_RECALC_EVERY_N_OWN_TURNS: "every_n_own_turns",
     EXPLICIT_RECALC_MILESTONES: "milestones",
+    EXPLICIT_RECALC_ON_STICKY_TARGET_THREAT: "on_sticky_target_threat",
+    EXPLICIT_RECALC_ON_LR_TOOLING: "on_lr_tooling",
     EXPLICIT_RECALC_EVERY_OWN_TURN_RESERVED: "every_own_turn_reserved",
 }
 
@@ -54,8 +61,19 @@ EXPLICIT_RECALC_VALID_CODES = frozenset(
         EXPLICIT_RECALC_ON_TARGET_HARD_INVALID,
         EXPLICIT_RECALC_EVERY_N_OWN_TURNS,
         EXPLICIT_RECALC_MILESTONES,
+        EXPLICIT_RECALC_ON_STICKY_TARGET_THREAT,
+        EXPLICIT_RECALC_ON_LR_TOOLING,
     }
 )
+
+# WP3: per-code fire caps (balanced explicit L2 — thrash guard)
+EXPLICIT_L2_CODE6_MAX_PER_GAME: int = 4
+EXPLICIT_L2_CODE7_MAX_PER_GAME: int = 4
+EXPLICIT_L2_WP3_MAX_PER_GAME: int = 6  # combined 6+7 fires per seat per game
+EXPLICIT_L2_WP3_ONCE_PER_OWN_TURN: bool = True
+
+# Lab arm template (not product default): setback + every-4 + threat + LR tooling
+EXPLICIT_142_RECALC_LAB_WP3: List[Any] = [2, [4, 4], 6, 7]
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 

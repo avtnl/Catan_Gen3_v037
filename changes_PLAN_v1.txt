@@ -1,0 +1,56 @@
+Let's make a couple of changes to PLAN.
+1. Read and analyze changes below.
+2. Let's discuss need clarifications.
+3. Draft an implementation plan to make agreed changes.
+4. Implement agreed implementation plan.
+
+1. Alternating radius.
+Players turn	Blue	Red	White	Orange
+Blue		  4		10	  8		  6
+Red			  6		  4	10		  8
+White		  8		  6	  4		10
+Orange		10		  8	  6		  4
+
+2. Show all players new-settlements having distance 2 or 3 from existing players settlement
+3. Only show opponents circle if a) intersection is part of new_settlement showed in 2. and b) risk_level for player at turn is medium of high.
+
+4. In PLAN:
+a) List all players new-settlements having distance 2 or 3 from existing players settlement
+b) Display ETA to achieve target listed in column New
+c) Display ETA_Win once achieving target (=Expected Hand predicted till victory)
+d) Display distance (shortest; for instance if distance=2 from S15 and distance=3 from S50) 
+e) Display risk level (highest if  there is a threat from multiple opponents)
+f) Display target delta  (lowest if  there is a threat from multiple opponents)
+
+Example referencing C:\Users\avtnl\Documents\Projecten\Python\Catan_Gen3\catan_game_v037> py -3.13 scripts/replay_catan_game.py --dig --game-dir batch_runs/mglog_replay_n5_wp5/g001
+R1T3 where Orange owns S15 + S50:
+New	target	ETA		Dist	Risk	Delta-t (triangle+t)
+S3		x		y		2
+S4		x		y		3
+S5		x		y		2
+S6		x		y		3
+S27		x		y		2
+S29		x		y		3
+S38		x		y		2
+S40		2.8		21.1	2	M	-0.8
+S52		4.0		22.8	2	M	+1.0
+S53		x		y		3
+S59		x		y		3
+S60		4.0		23.2	2
+S61		x		y		3
+S62		x		y		2
+S63		x		y		3
+
+Note: target, ETA, Risk and Delta-t are for illustation only
+2.8 turns expected before Orange is expected to build new_settlement on S40
+4.0 turns expected before Orange is expected to build new_settlement on S52
+4.0 turns expected before Orange is expected to build new_settlement on S60
+21.1 Once Orange succeeds in build a settlement on S40, Expected Hand predicts 21.1 till victory
+22.8 Once Orange succeeds in build a settlement on S52, Expected Hand predicts 22.8 till victory
+23.2 Once Orange succeeds in build a settlement on S60, Expected Hand predicts 23.2 till victory
+M=Medium risk; Only show Medium (=M) and High (=H)
+-0.8 One of the opponents is expected to need 0.8 turns less than Orange (opponent is expected to be there earlier). We don't need to specify the opponent() anymore! Therefore target for best positioned opponent: 2.8-0.8=2.0.
++6.5 One of the opponents is expected to need 1.0 turns more than Orange (opponent is expected to be there later). We don't need to specify the opponent() anymore! Therefore target for best positioned opponent: 4.0+1.0=5.0.
+
+Sort: 1) lowest sum of target+ETA listed at the top and 2) if ETA is identical -> lowest target listed higher and 3) if target is identical -> New (= settlement number lowest listed higher)
+If too many new_settlements to be listed, display only the first so much and close with a line S60, S61, S62, S63 without details (or somethig similar). Keep a blank line above the buttons STR-PLAN-ACT-WHY1-WHY2-MORE.

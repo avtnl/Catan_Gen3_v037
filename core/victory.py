@@ -434,14 +434,13 @@ def check_and_declare_winner(
             pass
 
     # W4: Gen2-style win fanfare once per declare (panel open skips a second blare).
+    # Respects NO_GUI_AT_ALL_TF / is_audio_enabled (silent under headless).
     try:
         if not bool(getattr(game, "win_fanfare_played", False)):
             setattr(game, "win_fanfare_played", True)
-            from gui.gui_constants import SOUNDS
+            from gui.gui_constants import play_sound
 
-            sound = SOUNDS.get("FANFARE") or SOUNDS.get("ENDGAME") or SOUNDS.get("BELL")
-            if sound is not None:
-                sound.play()
+            play_sound("FANFARE", fallback="ENDGAME")
     except Exception:
         try:
             setattr(game, "win_fanfare_played", True)

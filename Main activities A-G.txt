@@ -1146,3 +1146,87 @@ REPLAY_DIG | Implementation:
 | **SE8** | Colors red/blue/black + Deleted + (*)(**) | Fixture walkthrough test |
 | **SE9** | CLI `--dig` / `--mglog-cs` / cats; normal path unchanged | Regression |
 | **SE10** | MANUAL + dig one-pager; lab smoke n=5 both variants | Doc + timing note (file sizes) |
+
+Improve_SE | Requirements:
+See docs/improve_SE_v3.txt.
+
+Improve_SE | Implementation:
+## 5. WP checklist (v3)
+
+| WP | Content | Parallel? |
+|----|---------|-----------|
+| **WP0** | Dig LR length, YOP delta, nav stars, L2 red, tab rename shell | A |
+| **WP1** | MORE req/owned, residual DC/VP, tag residual, no stale tags | After/with B |
+| **WP2** | Board-fit way filter + switch | B |
+| **WP3** | Explicit L2 / dirty only as needed for §4 triggers + threat | After B core |
+| **WP4** | Lr/LaRacePlan + sticky roads + knight/TFR rules_v1 | With B |
+| **WP5** | STR/PLAN/ACT/WHY1/WHY2/MORE + Show; **live snapshot + offline enrich** | After 0+ snapshots |
+| **WP6** | LR recompute opt optional | Anytime |
+
+Improve_SE (2) | Requirements:
+See docs/ changes_PLAN_v1.txt.
+
+Improve_SE (2) | Implementation:
+| WP | Deliverable | Depends | Exit |
+|----|-------------|---------|------|
+| **P0** | Tabs PLN1/PLN2; drop WHY2; Show on PLN2 only | — | Dig opens; no WHY2 crash |
+| **P1** | Radius matrix helper + dig uses it | P0 | Same color size stable; unit matrix |
+| **P2** | PLN2 live snapshot + `plan_catalog` / pick / overflow | — | CS keys present on L2 |
+| **P3** | `plan_show` + replay circles | P1, P2 | Show toggle paints S; opp only M/H |
+| **P4** | PLN2 dig table + red + Why + sort + overflow | P0, P2 | Columns match v1; 10+ellipsis |
+| **P5** | PLN1 emitter + dig panel + DC posture/focus | P2 | Residual + Now/Word + DC line |
+| **P6** | Why/Word mapping completeness | P2, P5 | SE≠Fastest → non-empty Why |
+| **P7** | Tests + MANUAL one-liner + “re-run n=5” note | P0–P6 | pytest green |
+
+Parallel OK: P1 with P2; P5 after P2 schema exists.
+
+Improve_SE (3) | Requirements:
+See docs/improve_SE_v4.txt.
+
+Improve_SE (3) | Implementation
+### Phase P0a — Spec lock in repo
+- Add `docs/SE_improvement_plan_v4.md` summarizing B’s ETA definition + tag order + radii + phased backlog (pointer from `improving_SE_v4.txt`).
+### Phase P0b — Post-New victory ETA (B1)
+### Phase P0c — Catalog completeness (B2/B3/B4)
+- Ensure portfolio generates **d=3** settle candidates (or PLN snapshot expands geometry scan).  
+- Fill city target+ETA (not null placeholders).  
+- Confirm sort `(target+ETA, target, id)` after B1.  
+- Dig: show C rows always when way needs cities.
+### Phase P0d — Tags + STR ETA table (A1/A2/C1)
+- Residual settlement count after IP (owned S count toward way).  
+- Canonical tag formatter: `LA · LR · 4×C · 1×S · 1×VP`.  
+- STR Dig: ETA plan/prev/delta as Type|ETA table; wire numbers to A2 formula once B1 exists.
+### Phase P0e — Show radii (B5)
+- Replace `SHOW_RADIUS_MATRIX` / `radius_for_show` with turn-order rings: own **8**, then +4 per seat in turn order (12/16/20), port base documented as 5. Optional white underlay ring.
+### Phase P0f — Dig honesty sync (E1–E3)
+- Audit dense emit: PLN fields never cross seats.  
+- When any SE/PLN field stamps a seat-turn, ensure STR+PLN1+PLN2+ACT share that sample (or backfill empty tabs from same CS row).  
+- Re-annotate `mglog_replay_n5_pln`; verify R1T2 starts with PLN at first STR update ei.
+
+### Phase P1 — Sticky overshoot (A3)
+- Gate / prefer ways whose nominal VP ≤ `VICTORY` (or exact 10) when scoring sticky. Dig before/after on R1T3.
+
+### Phase P2 — BA / RCard ladder (D)
+- Dig ACT text explaining ladder; then live BA ordering vs settle race when risk=L.
+
+### Phase P3 — Placeholders
+- Stub modules/docs only: `road_optimizer`, `card_to_strategy_optimizer`.
+
+Improve_SE(4) | Requirements
+See docs/improve_SE_v5.txt and Missing_S_having_distance_2_or_3.docx.
+
+Improve_SE(5) | Implementation
+Grok Build changed the way to find all viable new-settlments meeting distance=2/3.
+
+Way-id and Playboard got out of sync (again) | Requirements
+See: Way_and_Board_dont_sync.docx.
+
+Way-id and Playboard got out of sync (again) | Implementation
+• P0 — Structure_surplus (board C+S > way C+S) 
+• P1 — Maybe_force_board_fit after AI/human settle + city (clears unfit sticky under product mode)
+• P2a — LR playboard: lr_playboard_implausible via assess_lr_feasibility; skipped if LR give-up (kill_lr)
+• P2b — VP surplus: a) Hand 3×VP vs way 2×VP → vp_surplus unfit. b) Hand 1×VP vs way 2×VP → still fit (buyability = P3)
+• P3 — VP buyability (stack not empty + RP/ports for Wh+O+Sh)
+• P4 — LA feasibility + give-up carve-out wiring
+• P5 — Dig/CS unfit markers
+• P6 — pln_v8 dig proof

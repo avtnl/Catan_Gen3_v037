@@ -16,9 +16,10 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 RESOURCE_ORDER = ["Wheat", "Ore", "Wood", "Brick", "Sheep"]
 INFINITE_TURNS = 9999.0
 DEFAULT_PRODUCTION_HORIZON_TURNS = 12.0
-MAX_TARGETS_PER_WAY = 8
+MAX_TARGETS_PER_WAY = 14  # v5: room for d=2 + reserved d=3
 MAX_COMBOS = 70
-MAX_ROAD_DISTANCE = 2
+MAX_ROAD_DISTANCE = 3  # include distance=3 settles in PLN2
+MAX_D3_RESERVED = 4  # v5-A: always keep top-K distance-3 sites
 MAX_CRITICAL_RACES = 2
 BOARD_OVERRIDE_MIN_RANK_EDGE = 0.75
 BOARD_OVERRIDE_BURIED_INDEX = 2  # 0-based: abstract at rank 3+ favors board#1
@@ -406,7 +407,34 @@ def build_candidate_targets(game, player, requirements, *, max_targets=MAX_TARGE
     usable = [c for c in candidates if c.race_status != "likely_lost"]
     if len(usable) < max(1, requirements.required_new_intersections):
         usable = candidates
-    return usable[: max(1, int(max_targets))]
+    # v5-A: reserve top distance-3 settles so score truncation cannot drop all d=3
+    cap = max(1, int(max_targets))
+    d3 = [c for c in usable if int(getattr(c, "distance_roads", 0) or 0) == 3]
+    d3 = d3[: max(0, int(MAX_D3_RESERVED))]
+    primary = [c for c in usable if int(getattr(c, "distance_roads", 0) or 0) != 3]
+    primary = primary[: max(0, cap - len(d3))]
+    merged: List[PortfolioTarget] = list(primary)
+    seen_ids = {int(c.target_id) for c in merged}
+    for c in d3:
+        tid = int(c.target_id)
+        if tid in seen_ids:
+            continue
+        merged.append(c)
+        seen_ids.add(tid)
+        if len(merged) >= cap:
+            break
+    # Fill remaining slots from unused usable
+    if len(merged) < cap:
+        for c in usable:
+            tid = int(c.target_id)
+            if tid in seen_ids:
+                continue
+            merged.append(c)
+            seen_ids.add(tid)
+            if len(merged) >= cap:
+                break
+    merged.sort(key=lambda t: (-t.score, t.distance_roads, t.target_id))
+    return merged[:cap]
 
 
 def _estimate_self_eta_own_turns(
@@ -556,6 +584,250 @@ def _portfolio_forcing_target(
     return [forced] + pool[: max(0, k - 1)]
 
 
+def _player_with_virtual_settle(player: Any, settle_id: int) -> Any:
+    """Shallow copy of player with *settle_id* appended (for post-New road cover)."""
+    try:
+        settles = [int(x) for x in list(getattr(player, "settlements", []) or [])]
+    except Exception:
+        settles = []
+    if int(settle_id) not in settles:
+        settles.append(int(settle_id))
+    return type(
+        "VirtualPlayer",
+        (),
+        {
+            "id": getattr(player, "id", None),
+            "color": getattr(player, "color", None),
+            "settlements": settles,
+            "cities": list(getattr(player, "cities", None) or []),
+            "roads": list(getattr(player, "roads", None) or []),
+            "trade_rates": getattr(player, "trade_rates", None),
+            "development_cards": getattr(player, "development_cards", None),
+            "resource_cards": getattr(player, "resource_cards", None),
+        },
+    )()
+
+
+def _apply_port_text_to_rates(rates: Sequence[Any], port_text: Any) -> List[int]:
+    """Improve trade rates if *port_text* is a 3:1 or 2:1 harbor label."""
+    out = [max(1, int(_safe_float(x, 4) or 4)) for x in list(rates)[:5]]
+    while len(out) < 5:
+        out.append(4)
+    text = str(port_text or "").strip().lower()
+    if not text or text in ("blank", "none", "?"):
+        return out
+    if "3:1" in text or text == "3:1":
+        return [min(r, 3) for r in out]
+    # 2:1 resource ports
+    name_to_i = {n.lower(): i for i, n in enumerate(RESOURCE_ORDER)}
+    aliases = {
+        "wheat": 0,
+        "grain": 0,
+        "field": 0,
+        "ore": 1,
+        "mountain": 1,
+        "wood": 2,
+        "lumber": 2,
+        "forest": 2,
+        "brick": 3,
+        "clay": 3,
+        "hill": 3,
+        "sheep": 4,
+        "wool": 4,
+        "pasture": 4,
+    }
+    for key, idx in aliases.items():
+        if key in text:
+            out[idx] = min(out[idx], 2)
+            return out
+    for name, idx in name_to_i.items():
+        if name in text:
+            out[idx] = min(out[idx], 2)
+            break
+    return out
+
+
+def estimate_victory_eta_after_acquiring_target(
+    game: Any,
+    player: Any,
+    requirements: WayRequirements,
+    forced: PortfolioTarget,
+    *,
+    empty_hand: bool = True,
+) -> float:
+    """P0/v4: Expected Hand to Victory **after** New is acquired.
+
+    - Hand unknown at that future moment → default **empty hand**.
+    - RP = current pips + New site (settle) or +site again (city upgrade).
+    - Trade rates include New's port when present.
+    - Need = remaining way components after counting New as done.
+    - TwB via ``estimate_resource_requirement_time``.
+    """
+    board = getattr(game, "board", None)
+    if board is None or player is None or forced is None:
+        return INFINITE_TURNS
+    try:
+        from core.resource_time_estimator import (
+            get_player_production_pips,
+            get_player_resource_cards_vector,
+            get_player_trade_rates,
+            trade_rates_after_candidate,
+        )
+        from core.strategy_timing import (
+            estimate_resource_requirement_time,
+            strategy_cost_from_components,
+        )
+    except Exception:
+        return INFINITE_TURNS
+
+    kind = str(getattr(forced, "kind", "") or "").lower()
+    is_city = "city" in kind or kind in ("upgrade", "city_upgrade")
+
+    # Production after New
+    try:
+        base_pips = [float(x) for x in get_player_production_pips(board, player)]
+    except Exception:
+        base_pips = [0.0] * 5
+    while len(base_pips) < 5:
+        base_pips.append(0.0)
+    gain = dict(getattr(forced, "resource_gain_named", None) or {})
+    if not gain:
+        try:
+            gain = _pips_named(board, int(forced.target_id))
+        except Exception:
+            gain = {}
+    pips = list(base_pips[:5])
+    for i, name in enumerate(RESOURCE_ORDER):
+        add = _safe_float(gain.get(name, 0.0), 0.0)
+        # City upgrade: site already owned as settle → add one more pip layer
+        if is_city and add <= 0:
+            try:
+                site_pips = _pips_named(board, int(forced.target_id))
+                add = _safe_float(site_pips.get(name, 0.0), 0.0)
+            except Exception:
+                add = 0.0
+        pips[i] = float(pips[i]) + float(add or 0.0)
+
+    # Trade rates after New (port)
+    try:
+        if is_city:
+            rates = list(get_player_trade_rates(board, player))
+        else:
+            rates = list(
+                trade_rates_after_candidate(
+                    board, player, candidate_id=int(forced.target_id)
+                )
+            )
+    except Exception:
+        rates = [4, 4, 4, 4, 4]
+    port = getattr(forced, "port", None) or _port_at(board, int(forced.target_id))
+    if port:
+        rates = _apply_port_text_to_rates(rates, port)
+
+    # Residual need after New — live board residual (v5)
+    req_s = max(0, int(getattr(requirements, "required_new_intersections", 0) or 0))
+    req_c = max(0, int(getattr(requirements, "required_cities", 0) or 0))
+    req_r = max(0, int(getattr(requirements, "required_roads_min", 0) or 0))
+    req_d = max(0, int(getattr(requirements, "required_dcards", 0) or 0))
+    try:
+        from core.strategy_way_residual import compute_way_residual
+
+        wid = int(getattr(requirements, "way_id", 0) or 0)
+        res = compute_way_residual(wid, player, board=board) or {}
+        req_c = max(req_c, int(res.get("req_cities") or 0))
+        req_s = max(req_s, int(res.get("req_settles") or 0))
+        req_r = max(req_r, int(res.get("req_roads") or 0))
+        req_d = max(req_d, int(res.get("req_dcards") or 0))
+    except Exception:
+        pass
+    dist = max(0, int(getattr(forced, "distance_roads", 0) or 0))
+    if is_city:
+        rem_s, rem_c = req_s, max(0, req_c - 1)
+    else:
+        rem_s, rem_c = max(0, req_s - 1), req_c
+    # v5: min legal road cover on current playboard (not CSV Roads_To_Build count).
+    # Do not plan S/C/road sequence or LA/LR — only mass of roads for remaining settles.
+    rem_r = req_r
+    try:
+        from core.strategy_min_road_cover import victory_structure_road_need
+
+        # After a new settle, treat that site as already owned for the cover search
+        cover_player = player
+        if not is_city:
+            try:
+                cover_player = _player_with_virtual_settle(player, int(forced.target_id))
+            except Exception:
+                cover_player = player
+        cover = victory_structure_road_need(
+            game,
+            cover_player,
+            remaining_new_settlements=int(rem_s),
+            remaining_city_upgrades=int(rem_c),
+            max_distance=3,
+        )
+        if cover.get("ok") or int(cover.get("roads_needed") or 0) > 0:
+            rem_r = int(cover.get("roads_needed") or 0)
+        elif not is_city:
+            rem_r = max(0, req_r - dist)
+    except Exception:
+        if not is_city:
+            rem_r = max(0, req_r - dist)
+    try:
+        need = strategy_cost_from_components(
+            new_settlements=rem_s,
+            city_upgrades=rem_c,
+            roads=rem_r,
+            dev_cards=req_d,
+        )
+        need_v = [float(x) for x in need]
+    except Exception:
+        need_v = [float(x) for x in (getattr(requirements, "need_vector", None) or [0] * 5)]
+    while len(need_v) < 5:
+        need_v.append(0.0)
+
+    if empty_hand:
+        hand = (0.0, 0.0, 0.0, 0.0, 0.0)
+    else:
+        try:
+            hand = get_player_resource_cards_vector(player)
+        except Exception:
+            hand = (0.0, 0.0, 0.0, 0.0, 0.0)
+
+    try:
+        # v5: discrete TwB (continuous under-trades city Tgt/ETA)
+        estimate = estimate_resource_requirement_time(
+            current_hand=hand,
+            production_pips=pips,
+            need=need_v,
+            trade_rates=rates,
+            num_players=_num_players(game),
+            require_confidence=False,
+            continuous_trading=False,
+        )
+        turns = _safe_float(estimate.get("turns", INFINITE_TURNS), INFINITE_TURNS)
+    except TypeError:
+        try:
+            estimate = estimate_resource_requirement_time(
+                current_hand=hand,
+                production_pips=pips,
+                need=need_v,
+                trade_rates=rates,
+                num_players=_num_players(game),
+                require_confidence=False,
+            )
+            turns = _safe_float(estimate.get("turns", INFINITE_TURNS), INFINITE_TURNS)
+        except Exception:
+            turns = INFINITE_TURNS
+    except Exception:
+        turns = INFINITE_TURNS
+    rem_left = rem_s + rem_c + rem_r + req_d
+    if rem_left > 0 and float(turns) <= 0.0:
+        pip_sum = sum(max(0.0, float(x)) for x in pips) or 1.0
+        need_sum = sum(max(0.0, float(x)) for x in need_v)
+        turns = max(1.0, need_sum * 36.0 / (pip_sum * 4.0))
+    return float(min(max(turns, 0.0), INFINITE_TURNS))
+
+
 def _best_board_turns_including_target(
     game: Any,
     player: Any,
@@ -565,7 +837,19 @@ def _best_board_turns_including_target(
     *,
     fallback_portfolio: Sequence[PortfolioTarget],
 ) -> float:
-    """Min board-expected turns among portfolios that include *forced*."""
+    """P0/v4: EH-to-victory after acquiring *forced* (empty hand + RP + TwB).
+
+    Legacy portfolio-combo min is kept as a fallback if the counterfactual fails.
+    """
+    try:
+        eta = estimate_victory_eta_after_acquiring_target(
+            game, player, requirements, forced, empty_hand=True
+        )
+        if eta is not None and float(eta) < INFINITE_TURNS / 2:
+            return float(eta)
+    except Exception:
+        pass
+
     cand_list = list(candidates or [])
     best: Optional[float] = None
     try:
@@ -1660,6 +1944,32 @@ def evaluate_top_ways_board_feasibility(
             audits = apply_la_way_rank_bias(game, audits, player=player)
     except Exception:
         pass
+    # WP2 board-fit: demote ways that cannot realize structure/specials held
+    try:
+        from core.strategy_board_fit import apply_board_fit_to_audits
+
+        audits, board_fit_meta = apply_board_fit_to_audits(
+            audits, player, game=game
+        )
+        if game is not None:
+            try:
+                game._last_board_fit_portfolio = dict(board_fit_meta)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # P1 victory cap: demote table VP > VICTORY (e.g. 117@11 vs 38@10)
+    try:
+        from core.strategy_victory_cap import apply_victory_cap_to_audits
+
+        audits, _vcap_meta = apply_victory_cap_to_audits(audits, game=game)
+        if game is not None:
+            try:
+                game._last_victory_cap_portfolio = dict(_vcap_meta)
+            except Exception:
+                pass
+    except Exception:
+        pass
     if game is not None:
         try:
             game.current_board_way_audit = audits[0] if audits else None
@@ -2009,10 +2319,34 @@ def build_l0_hand_strategy_report(
         direction["l0_hand_rescore"] = True
         direction["strategy_refresh_mode"] = "hand_only"
         if way_ids:
-            # Never switch: force sticky/preferred id to stay the L0 way
+            # Never switch on pure L0: keep sticky/preferred id
             keep = int(way_ids[0])
             direction["preferred_way_id"] = keep
             direction["way_id"] = keep
+            # WP2: if sticky way no longer fits board, request L2 explore next
+            try:
+                from core.strategy_board_fit import (
+                    is_board_fit_force_switch,
+                    way_fits_player,
+                )
+
+                if is_board_fit_force_switch(game) and not way_fits_player(
+                    keep, player, game=game
+                ):
+                    direction["board_fit_l0_unfit"] = True
+                    try:
+                        from core.strategy_sticky import flag_strategy_recalc
+
+                        flag_strategy_recalc(
+                            player,
+                            "board_fit_mismatch",
+                            detail={"reason": "l0_hand_unfit", "way_id": keep},
+                        )
+                        player.force_strategy_recalc = True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     report["by_player"][pid] = {
         "player": {
@@ -2159,12 +2493,11 @@ def board_audit_to_strategic_direction(audit, *, abstract_preferred=None, overri
         "{}{}".format(k[:2] if k != "Wheat" else "Wh", int(round(_safe_float(v))))
         for k, v in needed.items() if _safe_float(v) > 0
     ) or "none"
-    # Attach 142-way composition tags so STR can show LA/City/VP (not NewS-as-Settle)
+    # WP1: residual tags from remaining counts (not full table settlement total)
     tags: List[str] = []
     biggest_army = bool(req.get("biggest_army") or req.get("largest_army"))
     longest_road = bool(req.get("longest_road"))
     vp_cards = _safe_int(req.get("victory_point_cards") or req.get("required_vp_cards"), 0)
-    table_settlements = 0
     try:
         from core.strategy_timing import load_strategy_requirements
 
@@ -2174,29 +2507,29 @@ def board_audit_to_strategic_direction(audit, *, abstract_preferred=None, overri
             biggest_army = bool(getattr(row, "biggest_army", biggest_army))
             longest_road = bool(getattr(row, "longest_road", longest_road))
             vp_cards = _safe_int(getattr(row, "victory_point_cards", vp_cards), vp_cards)
-            table_settlements = _safe_int(getattr(row, "settlements", 0), 0)
             if remaining["cities"] <= 0:
                 remaining["cities"] = _safe_int(getattr(row, "city_upgrades", 0) or getattr(row, "cities", 0), 0)
             if remaining["new_settlements"] <= 0:
                 remaining["new_settlements"] = _safe_int(getattr(row, "new_settlements_to_build", 0), 0)
-            # Prefer joint expected DC buys for remaining (ranking model)
             rem_dc = _safe_int(getattr(row, "development_cards_to_buy", 0), 0)
             if rem_dc > 0:
                 remaining["development_cards"] = rem_dc
             break
     except Exception:
         pass
+    # Residual composition (CS path re-refines with player via strategy_way_residual)
     if longest_road:
         tags.append("Longest Road")
     if biggest_army:
         tags.append("Largest Army")
-    if remaining["cities"] > 0:
-        tags.append("{} cities".format(remaining["cities"]))
-    # Settlements column only (way 16 → no Settle tag; NewS stays in remaining for PROJ)
-    if table_settlements > 0:
-        tags.append("{} settlements".format(table_settlements))
+    n_c = int(remaining.get("cities") or 0)
+    if n_c > 0:
+        tags.append("{} cities".format(n_c) if n_c != 1 else "1 city")
+    n_s = int(remaining.get("new_settlements") or 0)
+    if n_s > 0:
+        tags.append("{} settlements".format(n_s) if n_s != 1 else "1 settlement")
     if vp_cards > 0:
-        tags.append("{} VP cards".format(vp_cards))
+        tags.append("{} VP cards".format(vp_cards) if vp_cards != 1 else "1 VP card")
     # S11: city-only ways may have recommendation_target_id=None — tag kind for sticky
     target_kind = ""
     if supporting == "city_upgrade":
@@ -2415,6 +2748,36 @@ def apply_board_behavior_override(report, game, player, audits, *, persist=True)
         report["board_way_override"] = {"applied": False, "reason": "no_audits"}
         return report
 
+    # WP2 board-fit (again after cache hits / external audit lists)
+    board_fit_meta: Dict[str, Any] = {"applied": False, "reason": "not_run"}
+    try:
+        from core.strategy_board_fit import (
+            apply_board_fit_to_audits,
+            is_board_fit_force_switch,
+            pick_best_fit_audit,
+            sticky_or_direction_way_id,
+            way_fits_player,
+        )
+
+        audits, board_fit_meta = apply_board_fit_to_audits(
+            list(audits), player, game=game
+        )
+        report["board_fit"] = dict(board_fit_meta)
+    except Exception as _bf_exc:
+        board_fit_meta = {"applied": False, "reason": f"error:{_bf_exc}"}
+        report["board_fit"] = dict(board_fit_meta)
+        audits = list(audits)
+
+    # P1 victory cap (also on override path / cache hits)
+    try:
+        from core.strategy_victory_cap import apply_victory_cap_to_audits
+
+        audits, vcap_meta = apply_victory_cap_to_audits(list(audits), game=game)
+        report["victory_cap"] = dict(vcap_meta)
+    except Exception as _vc_exc:
+        report["victory_cap"] = {"applied": False, "reason": f"error:{_vc_exc}"}
+        audits = list(audits)
+
     # WP2: after give-up, prefer ways that do not need the dead special
     audits = list(audits)
     specials_dead_meta: Dict[str, Any] = {
@@ -2478,6 +2841,79 @@ def apply_board_behavior_override(report, game, player, audits, *, persist=True)
         return report
 
     winner = audits[0]
+    # WP2: prefer first board-fit audit; force switch when sticky/current way unfit
+    board_fit_force = False
+    s142_external = False
+    try:
+        from core.strategy_board_fit import (
+            is_board_fit_force_switch,
+            pick_best_fit_audit,
+            sticky_or_direction_way_id,
+            way_fits_player,
+        )
+
+        fit_winner, pick_meta = pick_best_fit_audit(audits, player, game=game)
+        if fit_winner is not None:
+            winner = fit_winner
+        report.setdefault("board_fit", {})
+        if isinstance(report.get("board_fit"), dict):
+            report["board_fit"]["pick"] = dict(pick_meta)
+
+        cur_way = sticky_or_direction_way_id(player)
+        if (
+            is_board_fit_force_switch(game)
+            and cur_way is not None
+            and not way_fits_player(cur_way, player, game=game)
+            and not (board_fit_meta or {}).get("all_unfit_special_case")
+        ):
+            board_fit_force = True
+            try:
+                from core.strategy_sticky import clear_sticky_commitment
+
+                clear_sticky_commitment(player)
+            except Exception:
+                pass
+    except Exception:
+        board_fit_force = False
+
+    # Sidestep S142 drive: prefer stashed external way_id over L2 rank-1
+    try:
+        from core.sidestep_s142_drive import (
+            clear_external_preferred_way_id,
+            get_external_preferred_way_id,
+        )
+
+        ext_wid = get_external_preferred_way_id(player)
+        if ext_wid is not None:
+            for audit in audits:
+                try:
+                    aw = _safe_int(_audit_get(audit, "way_id"), -1)
+                except Exception:
+                    aw = -1
+                if aw == int(ext_wid):
+                    winner = audit
+                    s142_external = True
+                    clear_external_preferred_way_id(player)
+                    break
+    except Exception:
+        s142_external = False
+
+    # P1: sticky overshoot (e.g. 117@11) → clear when winner is exact-VP
+    try:
+        from core.strategy_victory_cap import maybe_force_victory_cap_sticky
+
+        vcap_sticky = maybe_force_victory_cap_sticky(game, player, audits)
+        report.setdefault("victory_cap", {})
+        if isinstance(report.get("victory_cap"), dict):
+            report["victory_cap"]["sticky"] = dict(vcap_sticky)
+        if vcap_sticky.get("cleared_sticky"):
+            board_fit_force = True
+            # Prefer ranked winner after clear
+            if audits:
+                winner = audits[0]
+    except Exception:
+        pass
+
     pid = str(getattr(player, "id", ""))
     block = (report.get("by_player") or {}).get(pid)
     if not isinstance(block, dict):
@@ -2498,7 +2934,11 @@ def apply_board_behavior_override(report, game, player, audits, *, persist=True)
         explicit_best = bool(should_adopt_best_way(player))
     except Exception:
         explicit_best = False
-    if explicit_best:
+    if board_fit_force:
+        apply, reason = True, "board_fit_force_switch"
+    elif s142_external:
+        apply, reason = True, "sidestep_s142_drive"
+    elif explicit_best:
         apply, reason = True, "explicit_142_recalc_best_way"
     else:
         apply, reason = should_override_abstract_preferred(winner, abstract, audits)
@@ -2602,6 +3042,11 @@ def apply_board_behavior_override(report, game, player, audits, *, persist=True)
         direction["explicit_best_way"] = True
         direction["preference_source"] = (
             str(direction.get("preference_source") or "") + "+explicit_best_way"
+        ).lstrip("+")
+    if s142_external:
+        direction["sidestep_s142_drive"] = True
+        direction["preference_source"] = (
+            str(direction.get("preference_source") or "") + "+sidestep_s142_drive"
         ).lstrip("+")
     if not apply:
         # enrichment: keep abstract way if present, still attach board project

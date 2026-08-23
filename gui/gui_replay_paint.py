@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from core.constants import ResourceCard
 from core.mglog_replay import (
@@ -123,8 +123,58 @@ def _apply_state_to_board(board: Any, state: ReplayState) -> None:
                 break
 
 
-def _paint_player_from_replay(pl_src: Any) -> SimpleNamespace:
-    """Build a Player-like stub for scoreboard / DCard paint."""
+def replay_continuous_road_lengths(state: Any) -> Dict[int, int]:
+    """WP0.1: continuous path length per seat (not road piece count).
+
+    Uses ``core.longest_road.compute_longest_road_for_edges`` with opponent
+    settlements/cities as barrier nodes — same rules as live recompute.
+    """
+    from core.longest_road import compute_longest_road_for_edges
+
+    players = getattr(state, "players", None) or {}
+    out: Dict[int, int] = {}
+    for pid, pl in players.items():
+        try:
+            ip = int(pid)
+        except Exception:
+            continue
+        barriers = set()
+        for oid, op in players.items():
+            try:
+                if int(oid) == ip:
+                    continue
+            except Exception:
+                if op is pl:
+                    continue
+            for loc in list(getattr(op, "settlements", None) or []):
+                try:
+                    barriers.add(int(loc))
+                except Exception:
+                    pass
+            for loc in list(getattr(op, "cities", None) or []):
+                try:
+                    barriers.add(int(loc))
+                except Exception:
+                    pass
+        res = compute_longest_road_for_edges(
+            list(getattr(pl, "roads", None) or []),
+            barrier_nodes=barriers,
+            player_id=ip,
+        )
+        out[ip] = int(getattr(res, "length", 0) or 0)
+    return out
+
+
+def _paint_player_from_replay(
+    pl_src: Any,
+    *,
+    size_longest_route: Optional[int] = None,
+) -> SimpleNamespace:
+    """Build a Player-like stub for scoreboard / DCard paint.
+
+    ``size_longest_route``: continuous path length (WP0.1). If omitted, falls
+    back to stored attribute then edge-only length without barriers (last resort).
+    """
     hand = list(pl_src.hand or [0, 0, 0, 0, 0])
     while len(hand) < 5:
         hand.append(0)
@@ -160,6 +210,37 @@ def _paint_player_from_replay(pl_src: Any) -> SimpleNamespace:
     except Exception:
         pass
 
+    # Unplayed VP cards for scoreboard E (new + playable)
+    unplayed_vp = 0
+    try:
+        for row in dcard_summary:
+            if row and str(row[0]) == "victory_point":
+                unplayed_vp += max(0, int(row[1] or 0)) + max(0, int(row[2] or 0))
+    except Exception:
+        unplayed_vp = 0
+
+    lr_len = size_longest_route
+    if lr_len is None:
+        try:
+            lr_len = int(getattr(pl_src, "size_longest_route", None))
+        except Exception:
+            lr_len = None
+    if lr_len is None:
+        # Last resort: path length without barriers (still better than piece count)
+        try:
+            from core.longest_road import compute_longest_road_for_edges
+
+            lr_len = int(
+                compute_longest_road_for_edges(
+                    list(getattr(pl_src, "roads", None) or []),
+                    barrier_nodes=[],
+                    player_id=int(getattr(pl_src, "id", 0) or 0),
+                ).length
+                or 0
+            )
+        except Exception:
+            lr_len = 0
+
     return SimpleNamespace(
         id=int(pl_src.id),
         color=str(pl_src.color or "Blue"),
@@ -174,10 +255,12 @@ def _paint_player_from_replay(pl_src: Any) -> SimpleNamespace:
         points=int(getattr(pl_src, "vp", 0) or 0),
         longest_route_tf=bool(pl_src.longest_route_tf),
         largest_army_tf=bool(pl_src.largest_army_tf),
-        size_longest_route=len(list(pl_src.roads or [])),
+        size_longest_route=int(lr_len or 0),
         size_largest_army=int(getattr(pl_src, "army_size", 0) or 0),
         number_of_rcards=sum(int(x or 0) for x in hand),
         number_of_dcards=int(n_dc),
+        # Hint for scoreboard E if gui ever reads it; live gui uses dcard_summary
+        _unplayed_vp_cards=int(unplayed_vp),
         # G6: filled by apply_turn_details_to_paint_player after construction
         turn_details_resource_production=[0, 0, 0, 0, 0, 0],
         turn_details_resource_production_robber=[0, 0, 0, 0, 0, 0],
@@ -320,19 +403,27 @@ class ReplayPainter:
         # G6: synthetic turn details for current R/T
         details_by_pid = self._details_for_state(state)
 
-        # Paint players for scoreboard
+        # Paint players for scoreboard (WP0.1: continuous LR lengths)
+        lr_lens = replay_continuous_road_lengths(state)
         players = []
         for pid in sorted(state.players.keys()):
-            pl = _paint_player_from_replay(state.players[pid])
+            ip = int(pid)
+            pl = _paint_player_from_replay(
+                state.players[pid],
+                size_longest_route=lr_lens.get(ip),
+            )
             apply_turn_details_to_paint_player(
-                pl, details_by_pid.get(int(pid)) or empty_turn_detail_vectors()
+                pl, details_by_pid.get(ip) or empty_turn_detail_vectors()
             )
             players.append(pl)
         if not players:
             for i in range(1, 5):
                 from core.mglog_replay import ReplayPlayer
 
-                pl = _paint_player_from_replay(ReplayPlayer(id=i))
+                pl = _paint_player_from_replay(
+                    ReplayPlayer(id=i),
+                    size_longest_route=lr_lens.get(i, 0),
+                )
                 apply_turn_details_to_paint_player(
                     pl, details_by_pid.get(i) or empty_turn_detail_vectors()
                 )

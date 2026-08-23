@@ -437,6 +437,11 @@ class GameManager:
             kw["arm_name"] = self.arm_name
         if self.la_soft_bias:
             kw["la_soft_bias"] = self.la_soft_bias
+        try:
+            if self.arm_config.get("sidestep_s142_drive"):
+                kw["sidestep_s142_drive"] = True
+        except Exception:
+            pass
         return kw
 
     def run_batch(self) -> Dict[str, Any]:

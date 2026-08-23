@@ -852,6 +852,40 @@ def _enrich_candidates(
                         EARLY_KNIGHT_DEMOTE * 0.4
                     )
 
+    # WP4: soft knight vs TFR bias from race plans (after early pairwise polish)
+    wp4_policy: Dict[str, Any] = {}
+    try:
+        from core.specials_race_plans import (
+            apply_knight_tfr_policy_to_candidates,
+            prefer_knight_before_tfr,
+            refresh_specials_race_plans,
+        )
+
+        policy = getattr(player, "knight_tfr_policy", None)
+        if not isinstance(policy, Mapping) or policy.get("prefer_knight") is None:
+            # Ensure plans exist for this chooser pass (cheap if already refreshed)
+            if not getattr(player, "lr_race_plan", None) and not getattr(
+                player, "la_race_plan", None
+            ):
+                refresh_specials_race_plans(
+                    game, player, reason="dcard_chooser", apply_sticky=False
+                )
+            policy = prefer_knight_before_tfr(
+                game,
+                player,
+                lr_plan=getattr(player, "lr_race_plan", None),
+                la_plan=getattr(player, "la_race_plan", None),
+            )
+            try:
+                player.knight_tfr_policy = dict(policy)
+            except Exception:
+                pass
+        if isinstance(policy, Mapping):
+            wp4_policy = dict(policy)
+            enriched = apply_knight_tfr_policy_to_candidates(enriched, policy)
+    except Exception:
+        wp4_policy = {}
+
     hold = score_hold_dcard(
         game,
         player,
@@ -872,6 +906,7 @@ def _enrich_candidates(
         "early_game": early_game,
         "phase_a_timing": True,
         "phase_b_polish": True,
+        "knight_tfr_policy": wp4_policy or None,
     }
     return enriched + [hold], ctx
 

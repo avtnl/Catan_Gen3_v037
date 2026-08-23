@@ -29,6 +29,7 @@ SE_PRIMARY_FIELDS: Tuple[str, ...] = (
     "sticky_way_id",
     "way_id",
     "way_tags",
+    "way_def_tags",  # WP1: canonical 142 definition
     "way_la",
     "way_lr",
     # 2 Sticky target
@@ -84,6 +85,26 @@ SE_SECONDARY_FIELDS: Tuple[str, ...] = (
     "vp_effective",
     "roads_changed",
     "sticky_apply_action",
+    # WP1 MORE / VP-E
+    "owned_display",
+    "remaining_vp_cards",
+    "unplayed_vp_cards",
+)
+
+# When way_id changes, never preserve these from previous in-force (WP1.4)
+SE_CLEAR_ON_WAY_ID_CHANGE: frozenset = frozenset(
+    {
+        "way_tags",
+        "way_def_tags",
+        "way_la",
+        "way_lr",
+        "req_cities",
+        "req_settles",
+        "req_roads",
+        "req_dcards",
+        "owned_display",
+        "remaining_vp_cards",
+    }
 )
 
 SE_L2_FIELDS: Tuple[str, ...] = (
@@ -95,8 +116,53 @@ SE_L2_FIELDS: Tuple[str, ...] = (
     "l2_force_reason",
     "explicit_codes",
     "explicit_trigger",
+    "explicit_l2_code",  # WP3 primary code for dig red
+    "explicit_l2_reason",
     "sticky_apply_reason",
     "sticky_invalidate_reason_live",
+)
+
+# WP4 specials race plans / knight-TFR (CS additive; dig PLAN/MORE)
+SE_RACE_FIELDS: Tuple[str, ...] = (
+    "lr_plan_label",
+    "lr_plan_conf",
+    "lr_plan_roads_fp",
+    "lr_plan_claim",
+    "la_plan_label",
+    "la_plan_conf",
+    "la_plan_play_knight",
+    "knight_tfr_prefer",
+    "knight_tfr_rule",
+)
+
+# PLN2 / plan snapshot (L2 sample; dig PLN2/Show)
+SE_PLAN_FIELDS: Tuple[str, ...] = (
+    "plan_settles",
+    "plan_cities",
+    "plan_catalog",  # P2 canonical PLN2 detail
+    "plan_overflow",
+    "plan_se_pick",
+    "plan_why",
+    "plan_knight",
+    "plan_tfr",
+    "plan_vp_dc",
+    "plan_lr_pkg",
+    "plan_la_pkg",
+    "plan_asof_rt",
+    "plan_why2",
+    "plan_show",
+)
+
+# P5 PLN1 way components / DC posture×focus
+SE_PLN1_FIELDS: Tuple[str, ...] = (
+    "pln1_residual",
+    "pln1_now",
+    "pln1_word",
+    "pln1_also",
+    "pln1_parked",
+    "pln1_dc_posture",
+    "pln1_dc_focus",
+    "pln1_dc_clause",
 )
 
 # Way reassess / first-way fit (CS schema v2+; often populated)
@@ -120,6 +186,9 @@ SE_FIELD_KEYS: Tuple[str, ...] = (
     SE_PRIMARY_FIELDS
     + SE_SECONDARY_FIELDS
     + SE_L2_FIELDS
+    + SE_RACE_FIELDS
+    + SE_PLAN_FIELDS
+    + SE_PLN1_FIELDS
     + SE_REASSESS_FIELDS
 )
 
@@ -158,6 +227,30 @@ SE_PRESERVE_ON_NULL: frozenset = frozenset(
         "first_way_fit_expand",
         "first_way_fit_total",
         "first_way_fit_d2_count",
+        # PLN2 plan snapshot — keep last L2 plan across hand-only samples
+        "plan_settles",
+        "plan_cities",
+        "plan_catalog",
+        "plan_overflow",
+        "plan_se_pick",
+        "plan_why",
+        "plan_knight",
+        "plan_tfr",
+        "plan_vp_dc",
+        "plan_lr_pkg",
+        "plan_la_pkg",
+        "plan_asof_rt",
+        "plan_why2",
+        "plan_show",
+        # P5 PLN1
+        "pln1_residual",
+        "pln1_now",
+        "pln1_word",
+        "pln1_also",
+        "pln1_parked",
+        "pln1_dc_posture",
+        "pln1_dc_focus",
+        "pln1_dc_clause",
     }
 )
 
@@ -202,8 +295,20 @@ def normalize_se_cell(value: Any) -> str:
         for x in value:
             if x is None:
                 continue
-            parts.append(str(x).strip())
-        # stable join for tags / codes
+            s = str(x).strip()
+            if s:
+                parts.append(s)
+        # v4 residual tags use · ; legacy lists keep ;
+        if parts and any(
+            ("×" in p) or p in ("LA", "LR", "Longest Road", "Largest Army")
+            for p in parts
+        ):
+            try:
+                from core.strategy_way_residual import format_tags_join
+
+                return format_tags_join(parts)
+            except Exception:
+                return " · ".join(parts)
         return ";".join(parts)
     if isinstance(value, float):
         # trim noisy floats; keep ints clean
@@ -371,11 +476,23 @@ def merge_cs_into_state(
 
     Optional fields listed in ``SE_PRESERVE_ON_NULL`` keep the previous value
     when the CS sample has null/empty (avoids wiping BA every hand-only refresh).
+
+    WP1.4: when ``way_id`` changes, do **not** preserve composition fields
+    (``way_tags``, ``req_*``, …) from the previous way.
     """
     snap = cs_row_to_se_snapshot(cs_row)
     if prev_in_force:
+        prev_way = parse_se_cell(prev_in_force.get("way_id", ""))
+        new_way = parse_se_cell(snap.get("way_id", ""))
+        way_changed = bool(new_way) and bool(prev_way) and new_way != prev_way
+        # Also treat first non-empty way after empty as a switch if tags would stick
+        if not way_changed and new_way and not prev_way:
+            way_changed = False  # cold start: allow preserve of empty
+
         for k in SE_PRESERVE_ON_NULL:
             if k not in SE_FIELD_SET:
+                continue
+            if way_changed and k in SE_CLEAR_ON_WAY_ID_CHANGE:
                 continue
             new_v = (snap.get(k) or "").strip()
             old_v = parse_se_cell(prev_in_force.get(k, ""))
@@ -383,6 +500,17 @@ def merge_cs_into_state(
                 old_v = ""
             if not new_v and old_v:
                 snap[k] = old_v
+
+        # WP1.4: even if way_tags were empty in CS, drop previous tags on way switch
+        if way_changed:
+            for k in SE_CLEAR_ON_WAY_ID_CHANGE:
+                if k not in SE_FIELD_SET:
+                    continue
+                new_v = (snap.get(k) or "").strip()
+                if not new_v:
+                    # leave empty (do not keep prev) — already empty in snap
+                    pass
+                # if new has values, keep them (already in snap)
     return diff_se_snapshots(prev_in_force, snap)
 
 
@@ -394,10 +522,14 @@ __all__ = [
     "SE_PRIMARY_FIELDS",
     "SE_SECONDARY_FIELDS",
     "SE_L2_FIELDS",
+    "SE_RACE_FIELDS",
+    "SE_PLAN_FIELDS",
+    "SE_PLN1_FIELDS",
     "SE_REASSESS_FIELDS",
     "SE_FIELD_KEYS",
     "SE_FIELD_SET",
     "SE_PRESERVE_ON_NULL",
+    "SE_CLEAR_ON_WAY_ID_CHANGE",
     "is_empty_se_value",
     "is_del_token",
     "normalize_se_cell",

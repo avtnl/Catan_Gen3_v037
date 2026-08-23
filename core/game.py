@@ -1945,6 +1945,56 @@ class Game:
                 )
             except Exception:
                 pass
+            # WP4: tangible LA/LR race plans + knight/TFR soft policy (no board mutation)
+            try:
+                from core.specials_race_plans import refresh_specials_race_plans
+
+                race_bag = refresh_specials_race_plans(
+                    self,
+                    player,
+                    reason=str(reason or "refresh_strategy_context"),
+                    apply_sticky=True,
+                )
+                status["specials_race"] = {
+                    "ok": bool(race_bag.get("ok")),
+                    "lr_label": (race_bag.get("lr") or {}).get("label"),
+                    "la_label": (race_bag.get("la") or {}).get("label"),
+                    "prefer_knight": (race_bag.get("knight_tfr") or {}).get(
+                        "prefer_knight"
+                    ),
+                    "knight_tfr_rule": (race_bag.get("knight_tfr") or {}).get("rule"),
+                    "sticky_merged": bool(race_bag.get("sticky_merged")),
+                }
+            except Exception as _wp4_exc:
+                status["specials_race"] = {
+                    "ok": False,
+                    "error": str(_wp4_exc)[:120],
+                }
+            # WP5: PLAN/WHY2 snapshot (L2/explore only; CS dig fields)
+            try:
+                from core.strategy_plan_snapshot import refresh_plan_snapshot
+
+                plan_bag = refresh_plan_snapshot(
+                    self,
+                    player,
+                    preferred if preferred else getattr(player, "strategic_direction", None),
+                    reason=str(reason or "refresh_strategy_context"),
+                    refresh_mode=str(resolved_mode or ""),
+                    force=False,
+                )
+                status["plan_snapshot"] = {
+                    "ok": bool(plan_bag.get("ok")),
+                    "active": bool(plan_bag.get("active")),
+                    "asof": (plan_bag.get("cs") or {}).get("plan_asof_rt"),
+                    "n_settles": len(plan_bag.get("settles") or []),
+                    "n_why2": len(plan_bag.get("why2") or []),
+                    "reason": plan_bag.get("reason"),
+                }
+            except Exception as _wp5_exc:
+                status["plan_snapshot"] = {
+                    "ok": False,
+                    "error": str(_wp5_exc)[:120],
+                }
             # Phase L salvage: terminal reminder if S4 would help (bounce after escape)
             try:
                 from core.partial_way_salvage import maybe_signal_s4_needed
@@ -2337,6 +2387,22 @@ class Game:
             from core.strategy_explicit_recalc import note_own_execution_turn
 
             note_own_execution_turn(self, self.get_current_player())
+        except Exception:
+            pass
+
+        # Sidestep S142: consume deferred opp R/S/C (trigger b) for seat to move
+        try:
+            from core.sidestep_s142_drive import consume_deferred_opp_build
+
+            consume_deferred_opp_build(self, self.get_current_player())
+        except Exception:
+            pass
+
+        # Legacy Sidestep PLN2 compare (off by default; cadence retired unless flag)
+        try:
+            from core.sidestep_compare import maybe_run_sidestep_compare
+
+            maybe_run_sidestep_compare(self)
         except Exception:
             pass
 
@@ -2755,6 +2821,20 @@ class Game:
                 _p = self.get_current_player()
                 if _p is not None:
                     priority = apply_slr_c_action_priority(priority, pick_turn_focus(self, _p))
+            except Exception:
+                pass
+            # P2: sticky race risk M/H → chase settle/key road
+            try:
+                from core.strategy_race_ba import (
+                    apply_race_ba_action_priority,
+                    race_ba_focus,
+                )
+
+                _p = self.get_current_player()
+                if _p is not None:
+                    priority = apply_race_ba_action_priority(
+                        priority, race_ba_focus(self, _p)
+                    )
             except Exception:
                 pass
 
@@ -5299,14 +5379,20 @@ class Game:
         if not keys:
             return False
 
-        # Operator flag: headless lab = silent.
+        # NO_GUI_AT_ALL_TF=True → silent (operator-owned; run_headless requires True).
         try:
-            from core.constants import NO_GUI_AT_ALL_TF
+            from core.console import is_no_gui
 
-            if bool(NO_GUI_AT_ALL_TF):
+            if is_no_gui():
                 return False
         except Exception:
-            pass
+            try:
+                from core.constants import NO_GUI_AT_ALL_TF
+
+                if bool(NO_GUI_AT_ALL_TF):
+                    return False
+            except Exception:
+                pass
 
         # Prefer GUI-level sound API when available (NullGui no-ops).
         try:
@@ -8189,6 +8275,20 @@ class Game:
                 action_priority = apply_slr_c_action_priority(action_priority, slr_c_focus)
         except Exception:
             slr_c_focus = {}
+        # P2: risk M/H sticky race → BA chase settle/key road (risk=L unchanged)
+        race_ba: Dict[str, Any] = {}
+        try:
+            from core.strategy_race_ba import (
+                apply_race_ba_action_priority,
+                race_ba_focus,
+            )
+
+            _p = self.get_current_player()
+            if _p is not None:
+                race_ba = race_ba_focus(self, _p)
+                action_priority = apply_race_ba_action_priority(action_priority, race_ba)
+        except Exception:
+            race_ba = {}
 
         rows = [row for row in list(getattr(self, "current_actionable_choices", []) or []) if isinstance(row, Mapping)]
         rows = [row for row in rows if str(row.get("action", "") or "") in executable_actions and bool(row.get("actionable", row.get("viable", False)))]
@@ -8248,7 +8348,7 @@ class Game:
                 return False
             return False
 
-        def _sort_key(row: Mapping[str, Any]) -> Tuple[int, int, int]:
+        def _sort_key(row: Mapping[str, Any]) -> Tuple[int, int, int, int]:
             action_name = str(row.get("action", "") or "")
             # 0 = winning action first
             win_rank = 0 if _action_wins_now(action_name) else 1
@@ -8256,11 +8356,17 @@ class Game:
                 row_priority = int(row.get("priority", 99) or 99)
             except Exception:
                 row_priority = 99
-            # Family priority (route + S6) before per-row scanner priority so
-            # road-first / city-first and endgame sequence picks actually win.
+            try:
+                from core.strategy_race_ba import race_ba_sort_bonus
+
+                race_bonus = int(race_ba_sort_bonus(row, race_ba))
+            except Exception:
+                race_bonus = 1
+            # Family priority (route + S6 + P2 race) before per-row scanner priority
             return (
                 win_rank,
                 action_priority.get(action_name, 99),
+                race_bonus,
                 row_priority,
             )
 
@@ -8315,6 +8421,19 @@ class Game:
                 plan["lr_race"] = bool(slr_c_focus.get("lr_race"))
                 if str(slr_c_focus.get("focus") or "") in {"lr", "la", "city"}:
                     plan["source"] = str(plan.get("source") or "canonical_best_action") + "_slr_c"
+        except Exception:
+            pass
+        try:
+            if race_ba and race_ba.get("apply"):
+                plan["race_ba"] = {
+                    "focus": race_ba.get("focus"),
+                    "risk_level": race_ba.get("risk_level"),
+                    "target_id": race_ba.get("target_id"),
+                    "next_road": race_ba.get("next_road"),
+                    "reason": race_ba.get("reason"),
+                    "dig_note": race_ba.get("dig_note"),
+                }
+                plan["source"] = str(plan.get("source") or "canonical_best_action") + "_race_ba"
         except Exception:
             pass
         return plan
@@ -9045,6 +9164,25 @@ class Game:
                             )
                         else:
                             flag_strategy_recalc(p, "own_largest_army")
+                        # WP2: sticky way must account for held LA
+                        try:
+                            from core.strategy_board_fit import (
+                                maybe_force_board_fit_after_specials,
+                            )
+
+                            maybe_force_board_fit_after_specials(
+                                self, p, reason="own_largest_army"
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            from core.sidestep_s142_drive import (
+                                latch_own_public_milestone,
+                            )
+
+                            latch_own_public_milestone(self, p, kind="la")
+                        except Exception:
+                            pass
                     elif prev_id is not None and pid == prev_id and pid != new_id:
                         flag_strategy_recalc(p, "lost_largest_army", detail={"reason": reason})
             except Exception:
@@ -9063,15 +9201,21 @@ class Game:
         reason: str = "",
         emit_events: bool = True,
         refresh_scoreboard: bool = True,
+        actor: Any = None,
+        force_full: bool = False,
     ) -> Dict[str, Any]:
         """Recompute continuous road lengths and Longest Road award (≥5).
 
-        Uses ``core.longest_road.compute_longest_road_lengths`` (PR2 engine).
-        Rules:
+        Uses ``core.longest_road`` (PR2 engine). Rules:
           - Continuous road of ≥5 segments required to claim.
           - Exact length ties: current holder keeps the special.
           - If nobody has ≥5, special is vacant.
           - Opponent settlements/cities break continuity (engine).
+
+        WP6 (``LR_RECOMPUTE_OPT``):
+          - ``full`` (default): every seat DFS.
+          - ``threshold``: settlement → full; road/TFR → actor only; city → cache.
+            Pass ``actor=`` on road/TFR hooks. ``force_full=True`` always full.
 
         Updates each player's ``size_longest_route``, ``structure_longest_route``,
         ``longest_route_tf``, ``game.longest_road_player``, and VP for flag changes.
@@ -9090,6 +9234,9 @@ class Game:
             "lengths": {},
             "previous_lengths": {},
             "length_changes": {},
+            "recompute_scope": "full",
+            "recompute_scope_why": "default_full",
+            "recompute_opt_mode": "full",
         }
 
         players = [p for p in list(getattr(self, "players", []) or []) if p is not None]
@@ -9112,56 +9259,159 @@ class Game:
             except Exception:
                 return False
 
+        def _pid_of(p: Any) -> int:
+            try:
+                return int(getattr(p, "id", 0) or 0)
+            except Exception:
+                return 0
+
         # Snapshot lengths before recompute (hardening / debug)
         prev_lengths: Dict[int, int] = {}
         for p in players:
             try:
-                pid = int(getattr(p, "id", 0) or 0)
+                pid = _pid_of(p)
                 if pid > 0:
                     prev_lengths[pid] = max(0, int(getattr(p, "size_longest_route", 0) or 0))
             except Exception:
                 pass
         info["previous_lengths"] = dict(prev_lengths)
 
+        # WP6 scope decision
+        scope = "full"
+        scope_why = "default_full"
+        try:
+            from core.lr_recompute_opt import classify_lr_recompute_scope
+
+            decision = classify_lr_recompute_scope(
+                self,
+                reason=str(reason or ""),
+                actor=actor,
+                force_full=bool(force_full),
+            )
+            scope = str(decision.get("scope") or "full")
+            scope_why = str(decision.get("why") or "")
+            info["recompute_scope"] = scope
+            info["recompute_scope_why"] = scope_why
+            info["recompute_opt_mode"] = str(decision.get("mode") or "full")
+        except Exception:
+            scope = "full"
+            scope_why = "classify_failed_full"
+
         lengths_by_player: List[Tuple[Any, int, List]] = []
         best = 0
-        try:
-            from core.longest_road import compute_longest_road_lengths
+        computed: Dict[Any, Any] = {}
 
-            computed = compute_longest_road_lengths(self)
-        except Exception as exc:
-            info["ok"] = False
-            info["error"] = str(exc)
-            computed = {}
-
-        for p in players:
-            try:
-                pid = int(getattr(p, "id", 0) or 0)
-            except Exception:
-                pid = 0
-            res = computed.get(pid) if computed else None
-            length = 0
-            path: List = []
-            if res is not None:
+        if scope == "cache_only":
+            # Reuse cached continuous lengths (city upgrade: graphs unchanged)
+            for p in players:
+                pid = _pid_of(p)
                 try:
-                    length = max(0, int(getattr(res, "length", 0) or 0))
-                    path = list(getattr(res, "path_edges", []) or [])
+                    length = max(0, int(getattr(p, "size_longest_route", 0) or 0))
                 except Exception:
-                    length, path = 0, []
+                    length = 0
+                try:
+                    path = list(getattr(p, "structure_longest_route", []) or [])
+                except Exception:
+                    path = []
+                lengths_by_player.append((p, length, path))
+                if pid > 0:
+                    info["lengths"][pid] = length
+                if length > best:
+                    best = length
+            info["best_length"] = int(best)
+        else:
             try:
-                p.size_longest_route = length
-                p.structure_longest_route = [list(e) for e in path]
-            except Exception:
-                pass
-            lengths_by_player.append((p, length, path))
-            if pid > 0:
-                info["lengths"][pid] = length
-                old_len = int(prev_lengths.get(pid, length))
-                if old_len != length:
-                    info["length_changes"][pid] = {"from": old_len, "to": length}
-            if length > best:
-                best = length
-        info["best_length"] = int(best)
+                from core.longest_road import (
+                    compute_longest_road_for_player,
+                    compute_longest_road_lengths,
+                )
+
+                if scope == "actor_only" and actor is not None:
+                    # Only actor graph changed (road/TFR). Opponents reuse cache.
+                    actor_res = compute_longest_road_for_player(self, actor)
+                    actor_pid = _pid_of(actor)
+                    for p in players:
+                        pid = _pid_of(p)
+                        if _same_player(p, actor) or (actor_pid > 0 and pid == actor_pid):
+                            length = max(0, int(getattr(actor_res, "length", 0) or 0))
+                            path = list(getattr(actor_res, "path_edges", []) or [])
+                            try:
+                                p.size_longest_route = length
+                                p.structure_longest_route = [list(e) for e in path]
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                length = max(
+                                    0, int(getattr(p, "size_longest_route", 0) or 0)
+                                )
+                            except Exception:
+                                length = 0
+                            try:
+                                path = list(
+                                    getattr(p, "structure_longest_route", []) or []
+                                )
+                            except Exception:
+                                path = []
+                        lengths_by_player.append((p, length, path))
+                        if pid > 0:
+                            info["lengths"][pid] = length
+                            old_len = int(prev_lengths.get(pid, length))
+                            if old_len != length:
+                                info["length_changes"][pid] = {
+                                    "from": old_len,
+                                    "to": length,
+                                }
+                        if length > best:
+                            best = length
+                    info["best_length"] = int(best)
+                else:
+                    # full (default)
+                    if scope != "full":
+                        # actor missing under actor_only → fall through to full
+                        info["recompute_scope"] = "full"
+                        info["recompute_scope_why"] = scope_why + "+fallback_full"
+                    computed = compute_longest_road_lengths(self)
+                    for p in players:
+                        pid = _pid_of(p)
+                        res = computed.get(pid) if computed else None
+                        length = 0
+                        path: List = []
+                        if res is not None:
+                            try:
+                                length = max(0, int(getattr(res, "length", 0) or 0))
+                                path = list(getattr(res, "path_edges", []) or [])
+                            except Exception:
+                                length, path = 0, []
+                        try:
+                            p.size_longest_route = length
+                            p.structure_longest_route = [list(e) for e in path]
+                        except Exception:
+                            pass
+                        lengths_by_player.append((p, length, path))
+                        if pid > 0:
+                            info["lengths"][pid] = length
+                            old_len = int(prev_lengths.get(pid, length))
+                            if old_len != length:
+                                info["length_changes"][pid] = {
+                                    "from": old_len,
+                                    "to": length,
+                                }
+                        if length > best:
+                            best = length
+                    info["best_length"] = int(best)
+            except Exception as exc:
+                info["ok"] = False
+                info["error"] = str(exc)
+                computed = {}
+                # Fall back to empty lengths if engine failed mid-path
+                if not lengths_by_player:
+                    for p in players:
+                        pid = _pid_of(p)
+                        lengths_by_player.append((p, 0, []))
+                        if pid > 0:
+                            info["lengths"][pid] = 0
+                    info["best_length"] = 0
 
         new_holder: Optional[Player] = None
         if best >= 5:
@@ -9347,6 +9597,25 @@ class Game:
                             )
                         else:
                             flag_strategy_recalc(p, "own_longest_road")
+                        # WP2: sticky way must account for held LR
+                        try:
+                            from core.strategy_board_fit import (
+                                maybe_force_board_fit_after_specials,
+                            )
+
+                            maybe_force_board_fit_after_specials(
+                                self, p, reason="own_longest_road"
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            from core.sidestep_s142_drive import (
+                                latch_own_public_milestone,
+                            )
+
+                            latch_own_public_milestone(self, p, kind="lr")
+                        except Exception:
+                            pass
                     elif prev_id is not None and pid == prev_id and pid != new_id:
                         flag_strategy_recalc(p, "lost_longest_road", detail={"reason": reason})
             except Exception:
@@ -9382,6 +9651,7 @@ class Game:
             reason=reason or "recompute_special_awards",
             emit_events=emit_events,
             refresh_scoreboard=False,
+            force_full=True,  # WP6: bulk awards always full multi-seat DFS
         )
         out["longest_road"] = lr
         if include_largest_army:
@@ -10378,6 +10648,7 @@ class Game:
                 reason="after_tfr_complete",
                 emit_events=True,
                 refresh_scoreboard=True,
+                actor=player,
             )
         except Exception:
             pass
@@ -10559,6 +10830,19 @@ class Game:
             )
         except Exception:
             pass
+        # WP3 code 7: TFR buy while pursuing LR
+        try:
+            cn = str(card_name or "").lower()
+            if "two_free" in cn or cn in ("tfr", "road_building"):
+                from core.strategy_explicit_recalc import note_lr_tooling
+
+                note_lr_tooling(self, player, reason="buy_tfr", force=True)
+            else:
+                from core.strategy_explicit_recalc import note_lr_tooling
+
+                note_lr_tooling(self, player, reason="after_buy_dcard")
+        except Exception:
+            pass
         out: Dict[str, Any] = {
             "ok": True,
             "action": action,
@@ -10610,12 +10894,13 @@ class Game:
             player.recalculate_victory_points()
         except Exception:
             pass
-        # Own city does not break LR continuity; recompute still refreshes length fields
+        # Own city does not break LR continuity; recompute still refreshes award fields
         try:
             self.recompute_longest_road(
                 reason="after_ai_build_city",
                 emit_events=True,
                 refresh_scoreboard=True,
+                actor=player,
             )
         except Exception:
             pass
@@ -10638,12 +10923,30 @@ class Game:
             )
         except Exception:
             out_flag = {}
+        try:
+            from core.sidestep_s142_drive import (
+                latch_opp_build_for_opponents,
+                latch_own_public_milestone,
+            )
+
+            latch_opp_build_for_opponents(self, player, kind="city")
+            latch_own_public_milestone(self, player, kind="city")
+        except Exception:
+            pass
+        board_fit_force: Dict[str, Any] = {}
+        try:
+            from core.strategy_board_fit import maybe_force_board_fit
+
+            board_fit_force = maybe_force_board_fit(self, player, reason="own_city") or {}
+        except Exception:
+            board_fit_force = {}
         out: Dict[str, Any] = {
             "ok": True,
             "action": action,
             "target_id": target,
             "strategy_recalc_flagged_opponents": out_flag,
             "own_strategy_milestone": "own_city",
+            "board_fit_force": board_fit_force,
         }
         try:
             out["win_check"] = self._maybe_declare_winner_after("after_ai_build_city", player)
@@ -10674,12 +10977,14 @@ class Game:
             player.recalculate_victory_points()
         except Exception:
             pass
-        # Settlement can break opponent continuous roads → recompute LR
+        # Settlement can break opponent continuous roads → full LR recompute (WP6.2)
         try:
             self.recompute_longest_road(
                 reason="after_ai_build_settlement",
                 emit_events=True,
                 refresh_scoreboard=True,
+                actor=player,
+                force_full=True,
             )
         except Exception:
             pass
@@ -10701,6 +11006,26 @@ class Game:
             )
         except Exception:
             out_flag = {}
+        try:
+            from core.sidestep_s142_drive import (
+                latch_opp_build_for_opponents,
+                latch_own_public_milestone,
+            )
+
+            latch_opp_build_for_opponents(self, player, kind="settlement")
+            latch_own_public_milestone(self, player, kind="settlement")
+        except Exception:
+            pass
+        # WP2 / Way sync P1: settlement can create structure_surplus vs sticky way
+        board_fit_force: Dict[str, Any] = {}
+        try:
+            from core.strategy_board_fit import maybe_force_board_fit
+
+            board_fit_force = maybe_force_board_fit(
+                self, player, reason="own_settlement"
+            ) or {}
+        except Exception:
+            board_fit_force = {}
         # Own rec-settle vs any settle: milestone reason refined in Slice D
         out: Dict[str, Any] = {
             "ok": True,
@@ -10708,6 +11033,7 @@ class Game:
             "target_id": target,
             "strategy_recalc_flagged_opponents": out_flag,
             "own_strategy_milestone": "own_settlement",
+            "board_fit_force": board_fit_force,
         }
         try:
             out["win_check"] = self._maybe_declare_winner_after("after_ai_build_settlement", player)
@@ -10742,6 +11068,7 @@ class Game:
                 reason="after_ai_build_road",
                 emit_events=True,
                 refresh_scoreboard=True,
+                actor=player,
             )
         except Exception:
             pass
@@ -10752,6 +11079,12 @@ class Game:
             out_flag = flag_opponents_after_road(self, player, road_id=list(road))
         except Exception:
             out_flag = {}
+        try:
+            from core.sidestep_s142_drive import latch_opp_build_for_opponents
+
+            latch_opp_build_for_opponents(self, player, kind="road")
+        except Exception:
+            pass
         self.update_strategy_dashboard(player)
         self.emit_twitter_event(getattr(player, "id", None), f"built Road [{road[0]},{road[1]}]")
         self._play_execution_action_sound(action)
@@ -10982,12 +11315,13 @@ class Game:
             mglog.log_build(self, "city", player, target_id=target, rc_out=cost)
         except Exception:
             pass
-        # Own city does not interrupt continuous road; recompute keeps LR length/VP in sync
+        # Own city does not interrupt continuous road; recompute keeps award in sync
         try:
             self.recompute_longest_road(
                 reason="after_human_build_city",
                 emit_events=True,
                 refresh_scoreboard=True,
+                actor=player,
             )
         except Exception:
             pass
@@ -11000,6 +11334,14 @@ class Game:
             )
         except Exception:
             result["strategy_recalc_flagged_opponents"] = {}
+        try:
+            from core.strategy_board_fit import maybe_force_board_fit
+
+            result["board_fit_force"] = maybe_force_board_fit(
+                self, player, reason="own_city"
+            ) or {}
+        except Exception:
+            result["board_fit_force"] = {}
         result.update({
             "ok": True,
             "reason": "executed",
@@ -11082,12 +11424,14 @@ class Game:
             mglog.log_build(self, "settlement", player, target_id=target, rc_out=cost)
         except Exception:
             pass
-        # Settlement can break opponent continuous roads → recompute LR
+        # Settlement can break opponent continuous roads → full LR recompute (WP6.2)
         try:
             self.recompute_longest_road(
                 reason="after_human_build_settlement",
                 emit_events=True,
                 refresh_scoreboard=True,
+                actor=player,
+                force_full=True,
             )
         except Exception:
             pass
@@ -11100,6 +11444,14 @@ class Game:
             )
         except Exception:
             result["strategy_recalc_flagged_opponents"] = {}
+        try:
+            from core.strategy_board_fit import maybe_force_board_fit
+
+            result["board_fit_force"] = maybe_force_board_fit(
+                self, player, reason="own_settlement"
+            ) or {}
+        except Exception:
+            result["board_fit_force"] = {}
         result.update({
             "ok": True,
             "reason": "executed",
@@ -11258,11 +11610,13 @@ class Game:
                 reason="after_human_build_road" if not free_tfr else "after_human_free_road",
                 emit_events=True,
                 refresh_scoreboard=True,
+                actor=player,
             )
             result["longest_road"] = {
                 "holder_id": lr_info.get("holder_id"),
                 "best_length": lr_info.get("best_length"),
                 "holder_changed": lr_info.get("holder_changed"),
+                "recompute_scope": lr_info.get("recompute_scope"),
             }
         except Exception:
             pass

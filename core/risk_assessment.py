@@ -49,7 +49,8 @@ except Exception:  # pragma: no cover - editor/test fallback
 RiskTuple = Tuple[str, float]
 
 # BFS depth for “can opponent reach kill-site / target with free roads”
-_MAX_SPOILER_ROAD_DEPTH = 2
+# v5: align with max new-settle road distance; BFS still blocks through opp S/C
+_MAX_SPOILER_ROAD_DEPTH = 3
 
 
 def _player_colors(player: Any) -> set[str]:
@@ -181,6 +182,40 @@ def _player_network_nodes(game: Any, player: Any) -> Set[int]:
     return nodes
 
 
+def _vertex_blocked_for_road_path(
+    game: Any, player: Any, node_id: int, *, allow_as_target: bool = False
+) -> bool:
+    """True if *node_id* cannot be used as an intermediate road-path vertex.
+
+    Catan: you may not build a road into/through another player's settlement/city.
+    Own occupied vertices are fine (already on network). The race *target*
+    settle site may be unoccupied (allow_as_target).
+    """
+    if allow_as_target:
+        return False
+    board = getattr(game, "board", None)
+    try:
+        inter = board.intersections[int(node_id)]
+    except Exception:
+        return False
+    if inter is None:
+        return False
+    try:
+        if not bool(getattr(inter, "occupied_tf", False)):
+            return False
+    except Exception:
+        return False
+    # Occupied: blocked unless it is *this* player's structure
+    own_colors = _player_colors(player)
+    try:
+        col = str(getattr(inter, "color", "") or "")
+        if col and col in own_colors:
+            return False
+    except Exception:
+        pass
+    return True
+
+
 def _min_empty_roads_to_reach(
     game: Any,
     player: Any,
@@ -192,11 +227,17 @@ def _min_empty_roads_to_reach(
 
     0 means already on network / road already touches target.
     None means unreachable within max_depth.
+
+    v5-B: cannot path through opponent-occupied S/C vertices; depth capped.
     """
     try:
         target = int(target_id)
     except Exception:
         return None
+    try:
+        max_depth = max(1, min(3, int(max_depth)))
+    except Exception:
+        max_depth = 3
     start = _player_network_nodes(game, player)
     if not start:
         return None
@@ -228,6 +269,9 @@ def _min_empty_roads_to_reach(
             continue
         for nxt in adj.get(node, []):
             if nxt in seen:
+                continue
+            # v5-B: skip opponent-occupied intermediates (target settle may be open)
+            if nxt != target and _vertex_blocked_for_road_path(game, player, nxt):
                 continue
             nd = dist + 1
             if nxt == target:

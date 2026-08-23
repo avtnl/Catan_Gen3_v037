@@ -77,7 +77,7 @@ DICEROLL_SET_TF: bool = False
 NAME_DR_FILE: str = "DiceRolls_4_Players_13_Mar_2025_00_22_10.txt"
 """File name for dice roll sequence."""
 
-NO_GUI_AT_ALL_TF: bool = False
+NO_GUI_AT_ALL_TF: bool = True
 """Headless lab mode: when True, no interactive GUI presentation and no sounds.
 
 False → normal product path (GUI + audio).
@@ -143,6 +143,22 @@ opponent unplayed DCard triplets, and opponent DCard buy types in Events.
 Human always sees full own DCard triplets. When True: full dig-in / Check-Mode UI.
 (Overview term: Check-Mode; former constant name was DEBUG_MODE.)"""
 
+SIDESTEP_COMPARE: bool = False
+"""Legacy PLN2 Side compare dumps (R-cadence). Default off — S142 uses a/b/c triggers."""
+
+SIDESTEP_S142_TRIGGERS: bool = False
+"""When True, run S142 compute+log on a/b/c events (own public VP/LA/LR; deferred opp R/S/C)."""
+
+SIDESTEP_S142_DRIVE: bool = False
+"""Headless lab: on S142 fire, adopt s142_way_id into sticky (implies triggers).
+Default False — product SE unchanged. Enable via ``--arm s142-drive``."""
+
+SIDESTEP_REQUIRE_CONFIDENCE: bool = True
+"""If True, Sidestep scales RP by an H-dependent confidence factor after Raw walk:
+full midpoint (1+1/conf)/2 at ~10 dice rolls (e.g. 8.5→9.25), tapering to 1.0
+by ~60 rolls (long horizon → little/no adjust). Side = second walk; Raw = first.
+Binomial Conf column is informational only."""
+
 
 # Expected-Hand (EH) data (algorithm_id=5)
 ALGORITHM_ID_EXPECTED_HAND: int = 5
@@ -196,10 +212,25 @@ EXPLICIT_RECALC_MILESTONE_VPS: tuple = (2, 4, 6, 8)
 """VP milestones for code 5."""
 
 EXPLICIT_142_RECALC_PRODUCT_AI: list = [2, [4, 4]]
-"""Default explicit_142_recalc for AI seats (setback + every 4 own turns)."""
+"""Default explicit_142_recalc for AI seats (setback + every 4 own turns).
+
+WP3 codes 6/7 are **not** included (opt-in via arm / seat map / LAB_WP3).
+"""
 
 EXPLICIT_142_RECALC_PRODUCT_HUMAN: list = [0]
 """Humans: no explicit extra L2 (sticky + P1–P3 closed-table gates only)."""
+
+EXPLICIT_142_RECALC_LAB_WP3: list = [2, [4, 4], 6, 7]
+"""Lab arm: product AI + sticky-target threat (6) + LR tooling (7)."""
+
+EXPLICIT_L2_CODE6_MAX_PER_GAME: int = 4
+"""Max code-6 (threat) latches per seat per game."""
+
+EXPLICIT_L2_CODE7_MAX_PER_GAME: int = 4
+"""Max code-7 (LR tooling) latches per seat per game."""
+
+EXPLICIT_L2_WP3_MAX_PER_GAME: int = 6
+"""Max combined code 6+7 latches per seat per game."""
 
 EXPLICIT_142_RECALC_BY_SEAT: dict = {
     1: [2, [4, 4]],
@@ -243,6 +274,54 @@ Values: ``off`` | ``early`` | ``mid`` | ``late``
   - late: when max VP >= 6 or round >= 12
 CLI: ``run_headless --la-soft-bias early`` overrides per run.
 Does not ban non-LA ways (soft rank/ETA boost + knight hold→play tip).
+"""
+
+# WP2: Victory-Way must match board structure + held specials (see strategy_board_fit)
+WAY_BOARD_FIT_MODE: str = "filter_and_force_switch"
+"""Board-fit filter for preferred Victory-Way vs live pieces/specials.
+
+Values:
+  - ``off`` — historical: no structure/specials hold filter
+  - ``filter`` — demote unfit ways in L2 portfolio (rank ∞); sticky not auto-cleared
+  - ``filter_and_force_switch`` — filter + clear sticky / adopt best fit when sticky unfit
+    (also on own LA/LR gain when sticky way omits that special)
+
+Default product intent: ``filter_and_force_switch`` (operator lock improving_SE_v3).
+Set ``off`` for A/B control arms.
+"""
+
+# WP6: Longest Road recompute scoping (see lr_recompute_opt / game.recompute_longest_road)
+LR_RECOMPUTE_OPT: str = "full"
+"""Live Longest Road recompute policy after board mutations.
+
+Values:
+  - ``full`` — always recompute continuous length for every seat (default; proven).
+  - ``threshold`` — scope DFS: settlement → full; road/TFR → actor only; city → cache.
+
+Product default stays ``full`` until threshold is lab-proven. Set ``threshold`` for
+perf A/B. Never skips settlement recompute (opponent path breaks).
+"""
+
+# WP5: hybrid PLAN/WHY2 snapshot on L2 (see strategy_plan_snapshot)
+PLAN_SNAPSHOT: str = "on"
+"""Write dig PLAN/WHY2 snapshot fields on L2/explore strategy refresh.
+
+Values:
+  - ``on`` — sample plan_settles/cities/knight/TFR/LA-LR packages into CS
+  - ``off`` — no plan snapshot (dig PLAN stays empty / note)
+
+Hand-only L0 never writes settlement ETA catalog (cost). Dig Show reads CS.
+"""
+
+# WP4: soft knight vs TFR chooser bias (see specials_race_plans.prefer_knight_before_tfr)
+KNIGHT_TFR_POLICY: str = "rules_v1"
+"""Knight-before-TFR soft policy for DCard chooser + dig PLAN.
+
+Values:
+  - ``off`` — no WP4 score bump/demote (existing S-LR/S-LA / early TFR logic only)
+  - ``rules_v1`` — prefer_knight True/False from LA/LR race plans (improving_SE_v3 a–g)
+
+Default product: ``rules_v1``. Soft bias only; never hard-blocks legal plays.
 """
 
 # ---------------------------------------------------------------------------

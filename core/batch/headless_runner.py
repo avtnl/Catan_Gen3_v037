@@ -126,6 +126,7 @@ class HeadlessGameRunner:
         explicit_142_recalc_by_seat: Optional[Any] = None,
         arm_name: Optional[str] = None,
         la_soft_bias: Optional[str] = None,
+        sidestep_s142_drive: Optional[bool] = None,
     ) -> None:
         self.sequence_number = int(sequence_number)
         self.max_round_override = max_round
@@ -152,6 +153,9 @@ class HeadlessGameRunner:
         self.arm_name = str(arm_name).strip() if arm_name else None
         # Lab LA soft bias: off | early | mid | late
         self.la_soft_bias = str(la_soft_bias).strip() if la_soft_bias else None
+        self.sidestep_s142_drive = (
+            bool(sidestep_s142_drive) if sidestep_s142_drive is not None else None
+        )
         # Backward-compatible: verbose=False ≈ quieter (WARN) if log_level unset
         # and process threshold was not already configured by CLI.
         self.verbose = bool(verbose)
@@ -343,6 +347,20 @@ class HeadlessGameRunner:
                 f"headless: game seed={self.seed} sequence={self.sequence_number}",
                 level=console.DEBUG,
             )
+        # Sidestep S142 drive arm (headless lab)
+        try:
+            drive = self.sidestep_s142_drive
+            if drive is None and self.arm_name:
+                if str(self.arm_name).lower().replace("_", "-") in (
+                    "s142-drive",
+                    "s142drive",
+                ):
+                    drive = True
+            if drive:
+                game.sidestep_s142_drive = True
+                self._log("headless: SIDESTEP_S142_DRIVE on", level=console.INFO)
+        except Exception:
+            pass
         # WP-R6: override per-seat explicit_142_recalc (CLI / arm) after Game defaults
         if self.explicit_142_recalc_by_seat is not None:
             try:
@@ -546,8 +564,8 @@ class HeadlessGameRunner:
             # Soft check: presentation should be off for true headless
             if is_gui_presentation_enabled():
                 self._log(
-                    "headless: presentation still enabled "
-                    "(NO_GUI_AT_ALL_TF False); runner uses NullGui anyway.",
+                    "headless: presentation still enabled after lab setup; "
+                    "runner uses NullGui anyway.",
                     level=console.WARN,
                 )
 

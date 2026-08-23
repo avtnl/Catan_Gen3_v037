@@ -238,22 +238,52 @@ def _dcard_summary_compact(player: Any) -> str:
     return ";".join(parts)
 
 
-def _way_tags_and_reqs(preferred: Mapping[str, Any], way_id: Optional[int]) -> Dict[str, Any]:
-    """Way composition tags + requirement counts when loadable."""
+def _way_tags_and_reqs(
+    preferred: Mapping[str, Any],
+    way_id: Optional[int],
+    *,
+    player: Any = None,
+    game: Any = None,
+) -> Dict[str, Any]:
+    """WP1: residual way_tags + req_* from board/hand; way_def_tags from 142 table."""
     out: Dict[str, Any] = {
         "way_tags": [],
+        "way_def_tags": [],
         "req_cities": None,
         "req_settles": None,
         "req_roads": None,
         "req_dcards": None,
         "way_lr": None,
         "way_la": None,
+        "owned_display": "",
+        "remaining_vp_cards": None,
     }
-    # Tags from preferred strategy if present
+    # Prefer residual recompute when we have a player (WP1.1 / WP1.2)
+    if player is not None:
+        try:
+            from core.strategy_way_residual import compute_way_residual
+
+            board = getattr(game, "board", None) if game is not None else None
+            res = compute_way_residual(
+                way_id, player, preferred=preferred, board=board
+            )
+            out["way_tags"] = list(res.get("way_tags") or [])[:12]
+            out["way_def_tags"] = list(res.get("way_def_tags") or [])[:12]
+            out["req_cities"] = res.get("req_cities")
+            out["req_settles"] = res.get("req_settles")
+            out["req_roads"] = res.get("req_roads")
+            out["req_dcards"] = res.get("req_dcards")
+            out["way_lr"] = res.get("way_lr")
+            out["way_la"] = res.get("way_la")
+            out["owned_display"] = str(res.get("owned_display") or "")
+            out["remaining_vp_cards"] = res.get("remaining_vp_cards")
+            return out
+        except Exception:
+            pass
+    # Fallback: preferred.tags + table absolute (legacy / no player)
     tags = preferred.get("tags")
     if isinstance(tags, Sequence) and not isinstance(tags, (str, bytes)):
         out["way_tags"] = [str(t) for t in tags][:12]
-    # Requirements from strategy table (avoid GUI imports)
     try:
         from core.strategy_timing import load_strategy_requirements
 
@@ -270,24 +300,26 @@ def _way_tags_and_reqs(preferred: Mapping[str, Any], way_id: Optional[int]) -> D
                     getattr(strategy, "biggest_army", False)
                     or getattr(strategy, "largest_army", False)
                 )
-                # Build compact tags from requirements when preferred.tags empty
+                try:
+                    out["way_def_tags"] = list(getattr(strategy, "tags", None) or [])[:12]
+                except Exception:
+                    out["way_def_tags"] = []
                 if not out["way_tags"]:
                     tag_bits = []
                     if out["way_la"]:
-                        tag_bits.append("LA")
+                        tag_bits.append("Largest Army")
                     if out["way_lr"]:
-                        tag_bits.append("LR")
+                        tag_bits.append("Longest Road")
                     if out["req_cities"]:
-                        tag_bits.append(f"C{out['req_cities']}")
+                        tag_bits.append(f"{out['req_cities']} cities")
                     if out["req_settles"]:
-                        tag_bits.append(f"S{out['req_settles']}")
+                        tag_bits.append(f"{out['req_settles']} settlements")
                     if out["req_dcards"]:
-                        tag_bits.append(f"DC{out['req_dcards']}")
+                        tag_bits.append(f"{out['req_dcards']} dev cards")
                     out["way_tags"] = tag_bits
                 break
     except Exception:
         pass
-    # Prefer explicit fields on preferred
     for src, dst in (
         ("required_cities", "req_cities"),
         ("city_upgrades", "req_cities"),
@@ -714,6 +746,20 @@ def _sticky_cs_enrichment(
         out.update(cs_fields_from_first_way_fit(player))
     except Exception:
         pass
+    # WP4: LA/LR race plan + knight/TFR policy dig fields
+    try:
+        from core.specials_race_plans import cs_fields_from_race_plans
+
+        out.update(cs_fields_from_race_plans(player))
+    except Exception:
+        pass
+    # WP5: PLAN / WHY2 snapshot CS fields
+    try:
+        from core.strategy_plan_snapshot import cs_fields_from_plan_snapshot
+
+        out.update(cs_fields_from_plan_snapshot(player))
+    except Exception:
+        pass
     return out
 
 
@@ -730,6 +776,8 @@ def _cs_gate_and_ba_fields(game: Any, player: Any) -> Dict[str, Any]:
         "l2_bucket_live": None,
         "explicit_codes": None,
         "explicit_trigger": None,
+        "explicit_l2_code": None,  # WP3 dig: primary code
+        "explicit_l2_reason": None,
         "sticky_apply_reason": None,
         "sticky_invalidate_reason_live": None,
         "ba_action": None,
@@ -821,15 +869,34 @@ def _cs_gate_and_ba_fields(game: Any, player: Any) -> Dict[str, Any]:
                 codes = list(rt.get("session_codes") or rt.get("pending_codes") or [])
                 if codes:
                     out["explicit_codes"] = [int(c) for c in codes if c is not None]
+                    try:
+                        out["explicit_l2_code"] = int(codes[0])
+                    except Exception:
+                        out["explicit_l2_code"] = None
                 reason = str(rt.get("session_reason") or "") or None
                 if reason:
                     out["explicit_trigger"] = reason
+                    out["explicit_l2_reason"] = reason
+                last_eval = rt.get("last_eval") if isinstance(rt.get("last_eval"), Mapping) else {}
+                if last_eval.get("primary") is not None and out.get("explicit_l2_code") is None:
+                    try:
+                        out["explicit_l2_code"] = int(last_eval.get("primary"))
+                    except Exception:
+                        pass
+                if last_eval.get("reason") and not out.get("explicit_l2_reason"):
+                    out["explicit_l2_reason"] = str(last_eval.get("reason") or "") or None
             last_tr = getattr(player, "last_explicit_trigger", None)
             if isinstance(last_tr, Mapping):
                 if not out["explicit_trigger"]:
                     out["explicit_trigger"] = str(last_tr.get("reason") or "") or None
+                    out["explicit_l2_reason"] = out["explicit_trigger"]
                 if not out["explicit_codes"] and last_tr.get("codes"):
                     out["explicit_codes"] = list(last_tr.get("codes") or [])
+                if out.get("explicit_l2_code") is None and last_tr.get("primary") is not None:
+                    try:
+                        out["explicit_l2_code"] = int(last_tr.get("primary"))
+                    except Exception:
+                        pass
         except Exception:
             pass
         try:
@@ -879,6 +946,7 @@ def build_strategy_cs_row(
     turns_info = _turns_fields(preferred, game)
     prev_turns = _safe_float(prev_sample.get("turns"))
     turns = turns_info.get("turns")
+    # v4: delta = ETA_plan + ETA_target − ETA_prev (fallback: plan − prev)
     delta = None
     if turns is not None and prev_turns is not None:
         delta = round(float(turns) - float(prev_turns), 3)
@@ -889,7 +957,7 @@ def build_strategy_cs_row(
     except Exception:
         board_way_i = None
 
-    way_pack = _way_tags_and_reqs(preferred, way)
+    way_pack = _way_tags_and_reqs(preferred, way, player=player, game=game)
     progress = _player_progress(player) if player is not None else {}
     specials = _specials(game)
     target_pack = _target_pack_summary(preferred, game)
@@ -919,6 +987,16 @@ def build_strategy_cs_row(
     except Exception:
         pass
 
+    # WP1.5: unplayed VP cards for dig VP-E alignment
+    unplayed_vp = None
+    try:
+        from core.strategy_way_residual import unplayed_vp_cards
+
+        if player is not None:
+            unplayed_vp = int(unplayed_vp_cards(player))
+    except Exception:
+        unplayed_vp = None
+
     row: Dict[str, Any] = {
         "schema": CS_SCHEMA_VERSION,
         "ts": datetime.now().isoformat(timespec="seconds"),
@@ -945,14 +1023,18 @@ def build_strategy_cs_row(
         "prev_turns": prev_turns,
         "delta_turns": delta,
         "abstract_turns": turns_info.get("abstract_turns"),
-        # Way composition
+        # Way composition (WP1 residual)
         "way_tags": way_pack.get("way_tags") or [],
+        "way_def_tags": way_pack.get("way_def_tags") or [],
         "req_cities": way_pack.get("req_cities"),
         "req_settles": way_pack.get("req_settles"),
         "req_roads": way_pack.get("req_roads"),
         "req_dcards": way_pack.get("req_dcards"),
         "way_lr": way_pack.get("way_lr"),
         "way_la": way_pack.get("way_la"),
+        "owned_display": way_pack.get("owned_display") or "",
+        "remaining_vp_cards": way_pack.get("remaining_vp_cards"),
+        "unplayed_vp_cards": unplayed_vp,
         # Player progress
         "settlements_owned": progress.get("settlements_owned"),
         "cities_owned": progress.get("cities_owned"),
@@ -991,6 +1073,16 @@ def build_strategy_cs_row(
     # Phase C2 dig: L2 gate attribution + compact BA (schema 3 additive)
     try:
         row.update(_cs_gate_and_ba_fields(game, player))
+    except Exception:
+        pass
+
+    # v4 delta: ETA_plan + ETA_target − ETA_prev (self_eta = target EH)
+    try:
+        plan_v = _safe_float(row.get("turns"))
+        prev_v = _safe_float(row.get("prev_turns"))
+        tgt_v = _safe_float(row.get("self_eta"))
+        if plan_v is not None and prev_v is not None and tgt_v is not None:
+            row["delta_turns"] = round(float(plan_v) + float(tgt_v) - float(prev_v), 3)
     except Exception:
         pass
 

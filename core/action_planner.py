@@ -2113,6 +2113,14 @@ def _rank_strategy_state_top_n(
                                         always_ids.append(wid)
                                 except Exception:
                                     pass
+                    try:
+                        ext = getattr(p, "_external_preferred_way_id", None)
+                        if ext is not None:
+                            ew = int(ext)
+                            if ew > 0:
+                                always_ids.append(ew)
+                    except Exception:
+                        pass
                     break
     except Exception:
         pass

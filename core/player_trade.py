@@ -4560,6 +4560,21 @@ def _play_twp_success_sound(game: Any, proposal: TradeProposal) -> None:
 
     _ = proposal  # reserved for future per-trade sounds/metadata
 
+    # Headless / NO_GUI_AT_ALL_TF: stay silent (same gate as play_sound).
+    try:
+        from gui.gui_constants import is_audio_enabled
+
+        if not is_audio_enabled():
+            return
+    except Exception:
+        try:
+            from core.constants import NO_GUI_AT_ALL_TF
+
+            if bool(NO_GUI_AT_ALL_TF):
+                return
+        except Exception:
+            pass
+
     # Correct GUI sound keys from gui.gui_constants.Sound.
     # DEAL is CashRegister.wav and is preferred for completed TwP trades.
     # STEAL is a compatibility fallback because it also maps to CashRegister.wav

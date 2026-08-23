@@ -1553,15 +1553,19 @@ def log_play_dcard(
         if payload not in (None, ""):
             bits.append(str(payload))
 
-        # YoP: two resources
+        # YoP: two resources (WP0.4).
+        # If caller already passed rc_in, treat it as authoritative — do not
+        # double-add from resource_indices (AI path used to pass both → Wd+Wd
+        # became rc_in wood=4).
         if resource_indices is not None and ctype == "year_of_plenty":
             try:
                 idxs = [int(x) for x in list(resource_indices)[:2]]
                 while len(idxs) < 2:
                     idxs.append(0)
-                for idx in idxs:
-                    if 0 <= idx < 5:
-                        rc_in_v[idx] = int(rc_in_v[idx] or 0) + 1
+                if rc_in is None:
+                    for idx in idxs:
+                        if 0 <= idx < 5:
+                            rc_in_v[idx] = int(rc_in_v[idx] or 0) + 1
                 bits.append(
                     "res="
                     + "+".join(

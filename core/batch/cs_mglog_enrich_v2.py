@@ -47,7 +47,10 @@ MGLOG_CS_NAME = "mglog_cs.csv"
 MGLOG_CS_DENSE_NAME = MGLOG_CS_NAME  # alias
 MGLOG_CS_SPARSE_NAME = "mglog_cs_sparse.csv"  # retired; not written
 CARRY_FORWARD = "dense"
-ATTACH_POLICY_SE = "a_same_step_or_b_se_update"
+# Dig honesty: prefer reason→event affinity, else last same-seat row, else se_update.
+ATTACH_POLICY_SE = "a_reason_or_last_seat_or_b_se_update"
+# Back-compat alias (old header / docs).
+ATTACH_POLICY_SE_LEGACY = "a_same_step_or_b_se_update"
 
 # Reasons that often coincide with a rules MGlog event (heuristic for policy a)
 _REASON_HINTS = frozenset(
@@ -58,6 +61,7 @@ _REASON_HINTS = frozenset(
         "build_city",
         "build_road",
         "buy_dcard",
+        "buy_development",
         "play_dcard",
         "play_knight",
         "play_monopoly",
@@ -74,6 +78,26 @@ _REASON_HINTS = frozenset(
         "opponent_city",
         "opponent_road",
     }
+)
+
+# CS reason substring → preferred MGlog event name(s). First matching rule wins.
+_REASON_EVENT_AFFINITY: Tuple[Tuple[Tuple[str, ...], Tuple[str, ...]], ...] = (
+    (("buy_development", "buy_dcard"), ("buy_dcard",)),
+    (("end_turn",), ("turn_end",)),
+    (("dice_roll",), ("dice_roll", "dice")),
+    (("build_road",), ("build_road",)),
+    (("build_settlement",), ("build_settlement",)),
+    (("build_city",), ("build_city",)),
+    (("basic_robber", "set_robber"), ("set_robber",)),
+    (("steal",), ("steal",)),
+    (("activate_dcard",), ("activate_dcard",)),
+    (("play_knight",), ("play_knight", "activate_dcard", "play_dcard")),
+    (("play_monopoly",), ("play_monopoly", "play_dcard")),
+    (("play_yop",), ("play_yop", "play_dcard")),
+    (("play_tfr",), ("play_tfr", "play_dcard")),
+    (("discard",), ("discard",)),
+    (("twp", "trade_player"), ("twp", "trade_player", "trade")),
+    (("twb", "trade_bank"), ("twb", "trade_bank", "trade")),
 )
 
 
@@ -269,11 +293,29 @@ def _reason_suggests_rules_event(reason: str) -> bool:
     return False
 
 
-def _find_attach_index(nodes: Sequence[_Node], cs_row: Mapping[str, Any]) -> Optional[int]:
-    """Policy (a): last non-insert row of same seat-turn, if any.
+def preferred_events_for_reason(reason: Any) -> Tuple[str, ...]:
+    """Map a CS ``reason`` to preferred MGlog ``event`` names (may be empty)."""
+    r = str(reason or "").strip().lower()
+    if not r:
+        return ()
+    for needles, events in _REASON_EVENT_AFFINITY:
+        for needle in needles:
+            if needle in r:
+                return tuple(events)
+    return ()
 
-    Prefer when seat-turn has rules rows. Multiple CS samples may stamp the
-    same last rules row (later SE diffs merge onto it).
+
+def _event_name(node: _Node) -> str:
+    return str(node.base.get("event") or "").strip().lower()
+
+
+def _find_attach_index(nodes: Sequence[_Node], cs_row: Mapping[str, Any]) -> Optional[int]:
+    """Policy (a): same seat-turn rules row — affinity first, else last row.
+
+    Dig honesty: ``buy_development_*`` prefers ``buy_dcard``, ``end_turn``
+    prefers ``turn_end``, etc. Fallback remains last non-insert same-seat row
+    (legacy). Multiple CS samples may stamp the same affinity row; later SE
+    diffs merge onto it.
     """
     key = _seat_key(cs_row)
     if key is None:
@@ -283,14 +325,20 @@ def _find_attach_index(nodes: Sequence[_Node], cs_row: Mapping[str, Any]) -> Opt
         for i, n in enumerate(nodes)
         if (not n.is_insert) and _seat_key(n.base) == key
     ]
-    if matches:
-        return matches[-1]
-    # also allow attaching to prior se_update of same seat-turn
-    matches_any = [i for i, n in enumerate(nodes) if _seat_key(n.base) == key]
-    if matches_any and _reason_suggests_rules_event(str(cs_row.get("reason") or "")):
-        # no rules row — will insert
+    if not matches:
+        matches_any = [i for i, n in enumerate(nodes) if _seat_key(n.base) == key]
+        if matches_any and _reason_suggests_rules_event(str(cs_row.get("reason") or "")):
+            # only inserts so far — force policy (b) insert
+            return None
         return None
-    return None
+
+    preferred = preferred_events_for_reason(cs_row.get("reason"))
+    if preferred:
+        pref_set = {str(e).strip().lower() for e in preferred if str(e).strip()}
+        affinity = [i for i in matches if _event_name(nodes[i]) in pref_set]
+        if affinity:
+            return affinity[-1]
+    return matches[-1]
 
 
 def _insert_after_index(nodes: Sequence[_Node], cs_row: Mapping[str, Any]) -> int:
@@ -467,12 +515,69 @@ def build_enriched_nodes(
     }
 
 
+def _row_has_se_values(row: Mapping[str, Any]) -> bool:
+    for k in SE_FIELD_KEYS:
+        v = row.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s and s != DEL_TOKEN:
+            return True
+    return False
+
+
+def _backfill_seat_turn_se(dense_rows: List[Dict[str, Any]]) -> int:
+    """Per-field backfill within each same-seat-turn segment.
+
+    Dig honesty (v4 E1): sticky/STR may stamp early (dice_roll) while PLN
+    arrives later (buy/end_turn). For each SE column, copy the **first
+    non-empty** value in the segment onto earlier empty cells. Never crosses
+    seats. Does not move ``se_tf``.
+    """
+    n_filled = 0
+    i = 0
+    n = len(dense_rows)
+    while i < n:
+        sk = _seat_key(dense_rows[i])
+        if sk is None:
+            i += 1
+            continue
+        j = i + 1
+        while j < n and _seat_key(dense_rows[j]) == sk:
+            j += 1
+        # segment [i, j) — per-column first-hit backfill
+        for col in SE_FIELD_KEYS:
+            first_k: Optional[int] = None
+            first_val = ""
+            for k in range(i, j):
+                v = dense_rows[k].get(col)
+                s = str(v).strip() if v is not None else ""
+                if s and s != DEL_TOKEN:
+                    first_k = k
+                    first_val = dense_rows[k].get(col, "")
+                    break
+            if first_k is None or first_k <= i:
+                continue
+            for k in range(i, first_k):
+                cur = dense_rows[k].get(col)
+                cs = str(cur).strip() if cur is not None else ""
+                if cs and cs != DEL_TOKEN:
+                    continue
+                dense_rows[k][col] = first_val
+                n_filled += 1
+        i = j
+    return n_filled
+
+
 def emit_dense_rows(
     nodes: Sequence[_Node],
     *,
     base_fieldnames: Sequence[str],
 ) -> Dict[str, Any]:
-    """Materialize **dense** row list + fieldnames (sparse retired)."""
+    """Materialize **dense** row list + fieldnames (sparse retired).
+
+    Forward per-player carry, then same-seat-turn backfill for Dig honesty.
+    """
     fields = v2_fieldnames(base_fieldnames)
     dense_rows: List[Dict[str, Any]] = []
 
@@ -504,11 +609,14 @@ def emit_dense_rows(
         drow[COL_CS_CAT2] = encode_code_list(node.cat2) if node.cs_tf else ""
         dense_rows.append(drow)
 
+    n_backfill = _backfill_seat_turn_se(dense_rows)
+
     return {
         "fieldnames": fields,
         "dense_rows": dense_rows,
         "n_rows": len(dense_rows),
         "carry_forward": CARRY_FORWARD,
+        "n_seat_turn_backfill": n_backfill,
     }
 
 
@@ -617,6 +725,8 @@ __all__ = [
     "MGLOG_CS_SPARSE_NAME",
     "CARRY_FORWARD",
     "ATTACH_POLICY_SE",
+    "ATTACH_POLICY_SE_LEGACY",
+    "preferred_events_for_reason",
     "v2_fieldnames",
     "build_enriched_nodes",
     "emit_dense_rows",

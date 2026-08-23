@@ -57,6 +57,55 @@ _threshold: int = INFO
 _stream: TextIO = sys.stdout
 _show_level_prefix: bool = False
 
+# ANSI colors for stderr warn/error (Windows Terminal / modern PowerShell OK).
+_ANSI_RESET = "\033[0m"
+_ANSI_RED = "\033[91m"
+_ANSI_YELLOW = "\033[93m"
+_color_enabled: Optional[bool] = None
+
+
+def _enable_windows_ansi() -> None:
+    """Best-effort VT processing for older Windows consoles (cmd.exe)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        for std_id in (-11, -12):  # STDOUT, STDERR
+            handle = kernel32.GetStdHandle(std_id)
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:
+        pass
+
+
+def _use_color(stream: Optional[TextIO] = None) -> bool:
+    """True when ANSI color is allowed (TTY, not NO_COLOR)."""
+    global _color_enabled
+    if _color_enabled is not None:
+        return bool(_color_enabled)
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        _enable_windows_ansi()
+        return True
+    try:
+        target = stream if stream is not None else sys.stderr
+        if bool(getattr(target, "isatty", lambda: False)()):
+            _enable_windows_ansi()
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def set_color_enabled(enabled: Optional[bool]) -> None:
+    """Force color on/off, or ``None`` to auto-detect (TTY + env)."""
+    global _color_enabled
+    _color_enabled = enabled
+
 
 def parse_level(value: Union[str, int, None], default: int = INFO) -> int:
     """Parse a level name or int; return ``default`` on failure."""
@@ -178,7 +227,25 @@ def info(msg: Any = "", *args: Any, **kwargs: Any) -> None:
 
 
 def warn(msg: Any = "", *args: Any, **kwargs: Any) -> None:
-    log(WARN, msg, *args, **kwargs)
+    if not enabled(WARN):
+        return
+    text = str(msg)
+    if args:
+        try:
+            text = text % args
+        except Exception:
+            try:
+                text = text.format(*args)
+            except Exception:
+                text = f"{text} {' '.join(str(a) for a in args)}"
+    if _show_level_prefix:
+        text = f"[WARN] {text}"
+    if _use_color(_stream):
+        text = f"{_ANSI_YELLOW}{text}{_ANSI_RESET}"
+    try:
+        print(text, file=_stream, flush=kwargs.get("flush", True))
+    except Exception:
+        log(WARN, msg, *args, **kwargs)
 
 
 def warning(msg: Any = "", *args: Any, **kwargs: Any) -> None:
@@ -186,7 +253,7 @@ def warning(msg: Any = "", *args: Any, **kwargs: Any) -> None:
 
 
 def error(msg: Any = "", *args: Any, **kwargs: Any) -> None:
-    # Errors go to stderr by temporary stream swap only for this line if needed
+    # Errors go to stderr (red when the terminal supports ANSI).
     if not enabled(ERROR):
         return
     text = str(msg)
@@ -197,6 +264,8 @@ def error(msg: Any = "", *args: Any, **kwargs: Any) -> None:
             text = f"{text} {' '.join(str(a) for a in args)}"
     if _show_level_prefix:
         text = f"[ERROR] {text}"
+    if _use_color(sys.stderr):
+        text = f"{_ANSI_RED}{text}{_ANSI_RESET}"
     try:
         print(text, file=sys.stderr, flush=True)
     except Exception:
@@ -209,7 +278,10 @@ def level_name(level: Optional[int] = None) -> str:
 
 
 def is_no_gui() -> bool:
-    """True when operator flag NO_GUI_AT_ALL_TF is set (headless lab)."""
+    """True when ``NO_GUI_AT_ALL_TF`` is set (operator-owned).
+
+    When True, ``digin`` routes through leveled ``log`` (quiet at INFO).
+    """
     try:
         from core.constants import NO_GUI_AT_ALL_TF
 
@@ -230,7 +302,7 @@ def execution_debug_print(
     When the flag is off: no output.
     When on:
       - interactive (``NO_GUI_AT_ALL_TF=False``): always print (legacy)
-      - headless: ``digin`` at ``level`` (default DEBUG → visible with ``-v``)
+      - headless (``NO_GUI_AT_ALL_TF=True``): ``digin`` at ``level`` (DEBUG → ``-v``)
     """
     try:
         if not bool(getattr(game, "execution_debug_print_tf", False)):
@@ -243,10 +315,10 @@ def execution_debug_print(
 def digin(msg: Any = "", *args: Any, level: int = DEBUG, **kwargs: Any) -> None:
     """Diagnostic / dig-in chatter (Slice A/B, Markov dumps, advance_turn, …).
 
-    Policy:
-      - Interactive (``NO_GUI_AT_ALL_TF=False``): always ``print`` (legacy behaviour).
-      - Headless (``NO_GUI_AT_ALL_TF=True``): route through ``log(level, …)`` so
-        default INFO stays quiet; use ``-v`` / ``--trace`` to re-enable.
+    Policy (operator owns ``NO_GUI_AT_ALL_TF``):
+      - ``False`` (interactive): always ``print`` (legacy behaviour).
+      - ``True`` (headless): route through ``log(level, …)`` so default INFO
+        stays quiet; use ``-v`` / ``--trace`` to re-enable.
 
     Preferred levels for common offenders:
       - ``advance_turn executed`` → DEBUG

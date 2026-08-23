@@ -26,6 +26,7 @@ Named arm shortcuts (``--arm``)::
     treat-p2  → seat 2 dense, others [0]
     treat-p3  → seat 3 dense, others [0]
     treat-all → all seats dense
+    s142-drive → all seats [0] sticky + SIDESTEP_S142_DRIVE (matched A/B treat)
 
 No ``--arm``: Game init applies product defaults (AI ``[2,[4,4]]``, human ``[0]``).
 
@@ -98,6 +99,9 @@ ARM_PRESETS: Dict[str, SeatMap] = {
         3: [1, 2, 3, [4, 2]],
         4: [1, 2, 3, [4, 2]],
     },
+    # Lab: original sticky codes; S142 a/b/c drive stamped on game by runner
+    "s142-drive": {1: [0], 2: [0], 3: [0], 4: [0]},
+    "s142_drive": {1: [0], 2: [0], 3: [0], 4: [0]},
 }
 
 
@@ -344,6 +348,18 @@ def resolve_arm_config(
         else:
             name = "control"
 
+    s142_drive = False
+    if str(arm_key or "").strip().lower().replace("_", "-") in (
+        "s142-drive",
+        "s142drive",
+    ):
+        s142_drive = True
+    if name and str(name).strip().lower().replace("_", "-") in (
+        "s142-drive",
+        "s142drive",
+    ):
+        s142_drive = True
+
     return {
         "ok": not errors or bool(base),
         "errors": errors,
@@ -354,6 +370,7 @@ def resolve_arm_config(
         "dice_from_batch": str(dice_from_batch).strip() if dice_from_batch else None,
         "seed": int(seed) if seed is not None else None,
         "seed_base": int(seed_base) if seed_base is not None else None,
+        "sidestep_s142_drive": bool(s142_drive),
     }
 
 

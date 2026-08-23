@@ -645,6 +645,29 @@ def main():
     """Main entry point for the Catan game."""
     print("DEBUG: main() STARTED - first line")
 
+    # Operator owns NO_GUI_AT_ALL_TF: interactive main requires False.
+    try:
+        from core.constants import NO_GUI_AT_ALL_TF
+
+        if bool(NO_GUI_AT_ALL_TF):
+            try:
+                from core import console
+
+                console.error(
+                    "main.py requires NO_GUI_AT_ALL_TF=False in core/constants.py "
+                    "(True mutes GUI sounds and is for headless only). "
+                    "For multi-game batch runs, use run_headless.py instead of main.py."
+                )
+            except Exception:
+                print(
+                    "ERROR: main.py requires NO_GUI_AT_ALL_TF=False in core/constants.py. "
+                    "For multi-game batch runs, use run_headless.py instead of main.py.",
+                    file=sys.stderr,
+                )
+            return 2
+    except Exception:
+        pass
+
     _install_phase0_baseline_support()
     print("DEBUG: phase0_baseline_support installed")
 
@@ -817,4 +840,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main() or 0)

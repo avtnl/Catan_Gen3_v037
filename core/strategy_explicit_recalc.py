@@ -1,12 +1,12 @@
-"""Phase C2 WP-R3: evaluate explicit_142_recalc triggers + always-best way pick.
+"""Phase C2 WP-R3 + WP3: evaluate explicit_142_recalc triggers + always-best way pick.
 
 Seats with non-default ``explicit_142_recalc`` can force L2 explore when a
 trigger is active, then adopt the L2 rank-1 Victory-Way without the sticky
 min-ETA-gain floor.
 
 Trigger codes (OR): 1 VP gain, 2 ETA setback, 3 hard-invalid target,
-4 every n own turns, 5 VP milestones. See ``core/explicit_142_recalc.py``
-and ``docs/PhaseC2_way_reassess_experiment_plan.md``.
+4 every n own turns, 5 VP milestones, **6 sticky-target threat**, **7 LR tooling**.
+See ``core/explicit_142_recalc.py`` and ``docs/PhaseC2_way_reassess_experiment_plan.md``.
 """
 
 from __future__ import annotations
@@ -14,11 +14,17 @@ from __future__ import annotations
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from core.explicit_142_recalc import (
+    EXPLICIT_L2_CODE6_MAX_PER_GAME,
+    EXPLICIT_L2_CODE7_MAX_PER_GAME,
+    EXPLICIT_L2_WP3_MAX_PER_GAME,
+    EXPLICIT_L2_WP3_ONCE_PER_OWN_TURN,
     EXPLICIT_RECALC_EVERY_N_OWN_TURNS,
     EXPLICIT_RECALC_MILESTONE_VPS,
     EXPLICIT_RECALC_MILESTONES,
     EXPLICIT_RECALC_NONE,
     EXPLICIT_RECALC_ON_ETA_SETBACK,
+    EXPLICIT_RECALC_ON_LR_TOOLING,
+    EXPLICIT_RECALC_ON_STICKY_TARGET_THREAT,
     EXPLICIT_RECALC_ON_TARGET_HARD_INVALID,
     EXPLICIT_RECALC_ON_VP_GAIN,
     EXPLICIT_RECALC_SETBACK_THR,
@@ -41,6 +47,18 @@ _HARD_INVALID_REASONS = (
     "locked_way_infeasible",
     "route_edges",
     "target_blocked",
+    "board_fit",
+)
+
+_THREAT_FLAG_NEEDLES = (
+    "target_blocked",
+    "race_worse",
+    "target_race",
+    "opponent_settlement",
+    "opponent_city",
+    "opp_structure",
+    "sticky_target_threat",
+    "threat",
 )
 
 
@@ -132,7 +150,265 @@ def ensure_runtime(player: Any) -> Dict[str, Any]:
     rt.setdefault("session_codes", [])
     rt.setdefault("session_reason", "")
     rt.setdefault("last_eval", {})
+    # WP3 caps / once-per-turn
+    rt.setdefault("code6_fires", 0)
+    rt.setdefault("code7_fires", 0)
+    rt.setdefault("wp3_fires", 0)
+    rt.setdefault("last_code6_turn_key", None)
+    rt.setdefault("last_code7_turn_key", None)
+    rt.setdefault("last_tfr_count", None)
     return rt
+
+
+def _wp3_cap(name: str, default: int) -> int:
+    try:
+        from core import constants as C
+
+        return max(0, int(getattr(C, name, default) or default))
+    except Exception:
+        return max(0, int(default))
+
+
+def _own_turn_key(game: Any, player: Any) -> Optional[List[int]]:
+    try:
+        return [
+            int(_safe_int(getattr(game, "round", None), 0) or 0),
+            int(_safe_int(getattr(game, "turn", None), 0) or 0),
+            int(_safe_int(getattr(player, "id", None), 0) or 0),
+        ]
+    except Exception:
+        return None
+
+
+def _can_latch_wp3(rt: Dict[str, Any], code: int, turn_key: Optional[List[int]]) -> bool:
+    """Thrash guards for codes 6/7."""
+    if code == EXPLICIT_RECALC_ON_STICKY_TARGET_THREAT:
+        max_c = _wp3_cap("EXPLICIT_L2_CODE6_MAX_PER_GAME", EXPLICIT_L2_CODE6_MAX_PER_GAME)
+        if int(rt.get("code6_fires") or 0) >= max_c:
+            return False
+        if EXPLICIT_L2_WP3_ONCE_PER_OWN_TURN and turn_key is not None:
+            if rt.get("last_code6_turn_key") == list(turn_key):
+                return False
+    elif code == EXPLICIT_RECALC_ON_LR_TOOLING:
+        max_c = _wp3_cap("EXPLICIT_L2_CODE7_MAX_PER_GAME", EXPLICIT_L2_CODE7_MAX_PER_GAME)
+        if int(rt.get("code7_fires") or 0) >= max_c:
+            return False
+        if EXPLICIT_L2_WP3_ONCE_PER_OWN_TURN and turn_key is not None:
+            if rt.get("last_code7_turn_key") == list(turn_key):
+                return False
+    else:
+        return True
+    max_wp3 = _wp3_cap("EXPLICIT_L2_WP3_MAX_PER_GAME", EXPLICIT_L2_WP3_MAX_PER_GAME)
+    if int(rt.get("wp3_fires") or 0) >= max_wp3:
+        return False
+    return True
+
+
+def _record_wp3_fire(rt: Dict[str, Any], code: int, turn_key: Optional[List[int]]) -> None:
+    if code == EXPLICIT_RECALC_ON_STICKY_TARGET_THREAT:
+        rt["code6_fires"] = int(rt.get("code6_fires") or 0) + 1
+        if turn_key is not None:
+            rt["last_code6_turn_key"] = list(turn_key)
+    elif code == EXPLICIT_RECALC_ON_LR_TOOLING:
+        rt["code7_fires"] = int(rt.get("code7_fires") or 0) + 1
+        if turn_key is not None:
+            rt["last_code7_turn_key"] = list(turn_key)
+    if code in (
+        EXPLICIT_RECALC_ON_STICKY_TARGET_THREAT,
+        EXPLICIT_RECALC_ON_LR_TOOLING,
+    ):
+        rt["wp3_fires"] = int(rt.get("wp3_fires") or 0) + 1
+
+
+def _sticky_wants_lr(player: Any) -> bool:
+    try:
+        direction = getattr(player, "strategic_direction", None) or {}
+        if isinstance(direction, Mapping):
+            if bool(direction.get("longest_road") or direction.get("way_lr")):
+                return True
+            tags = " ".join(str(t).lower() for t in list(direction.get("tags") or []))
+            if "longest road" in tags or tags.strip() == "lr":
+                return True
+        sticky = getattr(player, "sticky_commitment", None) or {}
+        if isinstance(sticky, Mapping) and sticky.get("wants_lr"):
+            return True
+    except Exception:
+        pass
+    try:
+        from core.ai_road_planner import way_wants_longest_road
+
+        return bool(way_wants_longest_road(player))
+    except Exception:
+        return False
+
+
+def _has_tfr_tooling(player: Any) -> bool:
+    try:
+        from core.strategy_way_residual import unplayed_tfr
+
+        return int(unplayed_tfr(player) or 0) > 0
+    except Exception:
+        pass
+    try:
+        for c in list(getattr(player, "development_cards", []) or []):
+            s = str(c or "").lower()
+            if "two_free" in s or s in ("tfr", "road_building"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _can_afford_road(player: Any) -> bool:
+    """Rough hand check: 1 wood + 1 brick (or bank rates ignored for latch)."""
+    try:
+        rc = getattr(player, "rcards", None)
+        if isinstance(rc, Mapping):
+            w = int(rc.get("Wood", rc.get("wood", 0)) or 0)
+            b = int(rc.get("Brick", rc.get("brick", 0)) or 0)
+            return w >= 1 and b >= 1
+        if isinstance(rc, (list, tuple)) and len(rc) >= 5:
+            # game order Wh,O,Wd,B,Sh
+            return int(rc[2] or 0) >= 1 and int(rc[3] or 0) >= 1
+    except Exception:
+        pass
+    return False
+
+
+def note_sticky_target_threat(
+    game: Any,
+    player: Any,
+    *,
+    reason: str = "",
+    force: bool = False,
+) -> Dict[str, Any]:
+    """WP3 code 6: latch when sticky path/target is under opponent threat."""
+    out: Dict[str, Any] = {"ok": False, "latched": [], "code": 6}
+    if player is None or not is_treatment_seat(player):
+        return out
+    norm = get_norm(player)
+    if EXPLICIT_RECALC_ON_STICKY_TARGET_THREAT not in _policy_codes(norm):
+        out["ok"] = True
+        out["skipped"] = "no_code_6"
+        return out
+
+    threatened = bool(force)
+    if not threatened:
+        try:
+            from core.strategy_reconsider import get_reconsider_flags
+
+            flags = get_reconsider_flags(player)
+            if bool(flags.get("target_blocked") or flags.get("race_worse")):
+                threatened = True
+            for r in list(flags.get("reasons") or []):
+                rs = str(r or "").lower()
+                if any(n in rs for n in _THREAT_FLAG_NEEDLES):
+                    threatened = True
+                    break
+        except Exception:
+            pass
+        try:
+            meta = getattr(player, "last_sticky_meta", None)
+            if isinstance(meta, Mapping):
+                inv = str(meta.get("invalidate_reason") or meta.get("reason") or "").lower()
+                if any(n in inv for n in _THREAT_FLAG_NEEDLES):
+                    threatened = True
+        except Exception:
+            pass
+        # plan-relevant opponent structure flags on strategy_recalc_flag
+        try:
+            fl = getattr(player, "strategy_recalc_flag", None)
+            if isinstance(fl, Mapping) and fl.get("pending"):
+                for r in list(fl.get("reasons") or []):
+                    rs = str(r or "").lower()
+                    if any(n in rs for n in _THREAT_FLAG_NEEDLES):
+                        threatened = True
+                        break
+        except Exception:
+            pass
+
+    if not threatened:
+        out["ok"] = True
+        out["skipped"] = "no_threat"
+        return out
+
+    rt = ensure_runtime(player)
+    turn_key = _own_turn_key(game, player)
+    if not _can_latch_wp3(rt, EXPLICIT_RECALC_ON_STICKY_TARGET_THREAT, turn_key):
+        out["ok"] = True
+        out["skipped"] = "cap"
+        return out
+
+    _latch_code(rt, EXPLICIT_RECALC_ON_STICKY_TARGET_THREAT)
+    _record_wp3_fire(rt, EXPLICIT_RECALC_ON_STICKY_TARGET_THREAT, turn_key)
+    if reason:
+        rt["threat_reason"] = str(reason)[:120]
+    out["latched"] = [EXPLICIT_RECALC_ON_STICKY_TARGET_THREAT]
+    out["ok"] = True
+    return out
+
+
+def note_lr_tooling(
+    game: Any,
+    player: Any,
+    *,
+    reason: str = "",
+    force: bool = False,
+) -> Dict[str, Any]:
+    """WP3 code 7: latch when LR-pursuing seat gains TFR/road tooling."""
+    out: Dict[str, Any] = {"ok": False, "latched": [], "code": 7}
+    if player is None or not is_treatment_seat(player):
+        return out
+    norm = get_norm(player)
+    if EXPLICIT_RECALC_ON_LR_TOOLING not in _policy_codes(norm):
+        out["ok"] = True
+        out["skipped"] = "no_code_7"
+        return out
+
+    wants_lr = _sticky_wants_lr(player)
+    has_tfr = _has_tfr_tooling(player)
+    can_road = _can_afford_road(player)
+    rt = ensure_runtime(player)
+    tfr_n = 0
+    try:
+        from core.strategy_way_residual import unplayed_tfr
+
+        tfr_n = int(unplayed_tfr(player) or 0)
+    except Exception:
+        tfr_n = 1 if has_tfr else 0
+    last_tfr = rt.get("last_tfr_count")
+    tfr_increased = last_tfr is not None and tfr_n > int(last_tfr)
+    rt["last_tfr_count"] = tfr_n
+
+    tooling = bool(force)
+    if not tooling and wants_lr and (has_tfr or can_road):
+        # Prefer latch when TFR count rose (2nd TFR buy) or TFR+road cash
+        if tfr_increased or (has_tfr and can_road) or (has_tfr and tfr_n >= 2):
+            tooling = True
+        elif has_tfr and reason:
+            tooling = True
+
+    if not tooling:
+        out["ok"] = True
+        out["skipped"] = "no_tooling"
+        out["wants_lr"] = wants_lr
+        out["has_tfr"] = has_tfr
+        return out
+
+    turn_key = _own_turn_key(game, player)
+    if not _can_latch_wp3(rt, EXPLICIT_RECALC_ON_LR_TOOLING, turn_key):
+        out["ok"] = True
+        out["skipped"] = "cap"
+        return out
+
+    _latch_code(rt, EXPLICIT_RECALC_ON_LR_TOOLING)
+    _record_wp3_fire(rt, EXPLICIT_RECALC_ON_LR_TOOLING, turn_key)
+    if reason:
+        rt["lr_tooling_reason"] = str(reason)[:120]
+    out["latched"] = [EXPLICIT_RECALC_ON_LR_TOOLING]
+    out["ok"] = True
+    out["tfr_n"] = tfr_n
+    return out
 
 
 def _policy_codes(norm: Sequence[Mapping[str, Any]]) -> set:
@@ -401,6 +677,11 @@ def evaluate_explicit_triggers(
         note_eta_sample(player, None)
     if EXPLICIT_RECALC_ON_TARGET_HARD_INVALID in policy and _hard_invalid_from_flags(player):
         note_hard_invalid(player, reason=reason or "reconsider_hard_invalid")
+    # WP3: sample threat + LR tooling on each evaluate (capped)
+    if EXPLICIT_RECALC_ON_STICKY_TARGET_THREAT in policy:
+        note_sticky_target_threat(game, player, reason=reason or "eval_threat")
+    if EXPLICIT_RECALC_ON_LR_TOOLING in policy:
+        note_lr_tooling(game, player, reason=reason or "eval_lr_tooling")
 
     rt = ensure_runtime(player)
     pending = [int(c) for c in (rt.get("pending_codes") or []) if int(c) in policy]
@@ -679,6 +960,8 @@ __all__ = [
     "note_vp_and_milestones",
     "note_eta_sample",
     "note_hard_invalid",
+    "note_sticky_target_threat",
+    "note_lr_tooling",
     "evaluate_explicit_triggers",
     "should_force_explicit_l2",
     "mark_explicit_l2_session",

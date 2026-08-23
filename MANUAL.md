@@ -122,7 +122,7 @@ Lab mode: run **one** all-AI match without the interactive pygame loop (Initial 
 |----------|-----------------|
 | `HUMAN_PLAYER` | **`False`** |
 | `HP_ID` | **`[]`** |
-| `NO_GUI_AT_ALL_TF` | **`True`** → no interactive GUI **and no sounds**. **`False`** → GUI + sounds |
+| `NO_GUI_AT_ALL_TF` | **Operator-owned (no in-process override).** **`True`** → `run_headless` only (mute + quiet digin); **exits 2** if False. **`False`** → `main.py` / `replay_catan_game.py` (GUI + sounds); both **exit 2** if True (red error). Flip the flag when switching lab ↔ interactive. |
 | `GAME_MAX_ROUND` | Cap when no winner (e.g. `50`); CLI can override |
 | `LOAD_PLAYBOARD` / `SAVED_PLAYBOARD` | Optional fixed map for reproducibility |
 | `LOAD_GAME` | **`False`** for a fresh game |
@@ -219,7 +219,7 @@ Module: `core/partial_way_salvage.py`. Spec: `docs/PhaseL_partial_way_salvage_pl
 | `--log-level LEVEL` | override | `TRACE\|DEBUG\|INFO\|WARN\|ERROR` |
 | env `HEADLESS_LOG_LEVEL` | override | same names (or numeric) |
 
-**Dig-in dumps under headless** (`core.console.digin`): when `NO_GUI_AT_ALL_TF=True`, the worst offenders are level-gated instead of always printing:
+**Dig-in dumps under headless** (`core.console.digin`): with `NO_GUI_AT_ALL_TF=True` (required by `run_headless`), the worst offenders are level-gated instead of always printing:
 
 | Message | Level (headless) |
 |---------|------------------|
@@ -230,7 +230,7 @@ Module: `core/partial_way_salvage.py`. Spec: `docs/PhaseL_partial_way_salvage_pl
 | `Loading gui_constants.py …` (import-time) | DEBUG only when headless; silent for interactive |
 | `AI DCard choice/execute`, Knight/YOP/TFR/Monopoly plan+EXECUTE | DEBUG (`-v`); still needs `game.execution_debug_print_tf` |
 
-Interactive dig-in (`advance_turn`, Slice A/B, Markov, DCard when flag on) still prints as before when `NO_GUI_AT_ALL_TF=False`.
+Interactive dig-in (`advance_turn`, Slice A/B, Markov, DCard when flag on) still prints as before when `NO_GUI_AT_ALL_TF=False` (use that only for `main.py`, not headless).
 
 ### Exit codes
 
@@ -238,7 +238,7 @@ Interactive dig-in (`advance_turn`, Slice A/B, Markov, DCard when flag on) still
 |------|---------|
 | **0** | `status` is `won` or `max_round` |
 | **1** | `stuck`, `error`, or runner crash |
-| **2** | Misconfiguration (human seats without `--allow-human`) |
+| **2** | Misconfiguration (`NO_GUI_AT_ALL_TF=False`, or human seats without `--allow-human`) |
 
 ### Artifacts
 
@@ -395,7 +395,9 @@ Lab smoke batch with CS + MGlog: `batch_runs/mglog_replay_n5` (optional; test sk
 
 #### SE Dig (re-play enriched MGlog)
 
-After annotate (`cs_annot/g00N/mglog_cs.csv` dense):
+After annotate (`cs_annot/g00N/mglog_cs.csv` dense). Attach prefers CS `reason`→MGlog event (e.g. buy → `buy_dcard`); same-seat-turn PLN backfill so Dig before the attach row still shows plan:
+
+
 
 ```bash
 py -3.13 scripts/replay_catan_game.py --playboard <PlayBoard.txt> --dig \
@@ -409,11 +411,27 @@ py -3.13 scripts/replay_catan_game.py --dig --game-dir batch_runs/<batch>/g001 -
 |---------|------|
 | **cat1 / cat2** (above dice) | XOR filter lists; typing one clears the other |
 | **Previous / Next** (below dice) | Jump to previous/next probe hit |
-| **SE Dig panel** (right) | PLAN / ACT / WHY / MORE — fixed SE field slots |
+| **SE Dig panel** (right) | **STR · PLN1 · PLN2 · ACT · WHY1 · MORE** (WHY2 removed) |
+| **PLN1** | Way residual + Now/Word + DC `L\|M\|H · focus LA\|VP\|LA/VP\|LR` |
+| **PLN2** | S/C catalog table (New/target/ETA/Dist/Risk/Δt/Why); SE pick in **red** |
+| **Show** (above MORE, PLN2 only) | Circles: turn-player S d=2/3; opp rings if risk M/H; radii own **8** then **12/16/20** (port-dot base 5) |
 | **Continue** (`>`) | Step rows; field colors red/blue (this row / earlier same seat-turn) |
 | Other nav | Black text; optional `(*)` R/T last-update refs |
 
 Normal re-play (no `--dig`) still uses original `mglog.csv` only.
+
+**PLN1/PLN2 need a fresh batch** (old `mglog_replay_n5` lacks `plan_catalog` / `pln1_*`). After code with `PLAN_SNAPSHOT=on` (default):
+
+```bash
+py -3.13 -m pytest tests/test_pln1_pln2_dig.py tests/test_pln1_p5.py tests/test_pln2_catalog_p2.py tests/test_pln2_table_p4.py tests/test_pln_show_p3.py tests/test_pln_show_radius_p1.py tests/test_pln_words_p6.py tests/test_strategy_plan_snapshot_wp5.py -q
+
+py -3.13 run_headless.py --games 5 --batch-dir batch_runs/mglog_replay_n5_pln --arm product
+py -3.13 scripts/annotate_mglog_cs.py --batch-dir batch_runs/mglog_replay_n5_pln
+# Then set NO_GUI_AT_ALL_TF=False in core/constants.py before dig GUI:
+py -3.13 scripts/replay_catan_game.py --dig --game-dir batch_runs/mglog_replay_n5_pln/g001
+```
+
+Design: `docs/changes_PLAN_v1_impl.md` · coding: `docs/changes_PLAN_v2_coding.md`.
 
 ### Matched dice + Victory-Way reassess (Phase C2)
 
@@ -680,12 +698,12 @@ View-only **timeline re-play** of a finished (or truncated) game from **playboar
 
 ### Operator flag: audio / `NO_GUI_AT_ALL_TF`
 
-| Flag | Recommended for re-play |
-|------|-------------------------|
-| **`NO_GUI_AT_ALL_TF`** in `core/constants.py` | Set to **`False`** |
+| Flag | Required for re-play GUI |
+|------|--------------------------|
+| **`NO_GUI_AT_ALL_TF`** in `core/constants.py` | **`False`** (`replay_catan_game.py` **exits 2** with a red error if True) |
 
-- **`False`** → normal product path: GUI + sounds (Continue SFX in re-play; same as interactive `main.py`).
-- **`True`** → headless lab default: **no sounds** on the shared audio path. Re-play may still try to force-enable audio for its window, but for reliable Continue sounds (and any live dig-in you run in the same config), keep **`NO_GUI_AT_ALL_TF = False`**.
+- **`False`** → GUI + sounds (Continue SFX; same as interactive `main.py`).
+- **`True`** → headless / `run_headless` only. Do **not** leave True for re-play or dig GUI — set False yourself after the batch.
 
 Also use **`False`** when running **`py -3.13 main.py`** if you want game audio.
 
@@ -853,7 +871,7 @@ ReplayShot_<playboard_stem>__<mglog_stem>__statistics_<ts>.png
 
 ### Operator tips
 
-1. Set **`NO_GUI_AT_ALL_TF = False`** in `core/constants.py` before re-play (and before `main.py` if you want live game sounds).
+1. Set **`NO_GUI_AT_ALL_TF = False`** in `core/constants.py` before re-play / dig GUI (and before `main.py` if you want live game sounds). If it is still True after a headless batch, the re-play script exits 2 with a red error.
 2. Prefer batch games with **`MGLOG=True`** so `g00N/mglog.csv` + `result.json` → `mglog_path` exist.
 3. Headless writes **`g00N/Playboard_g00N.txt`** (and `playboard_path` in `result.json`) for random **or** fixed maps — use that file (or `--game-dir g00N`) for re-play.
 4. Use **`--check-only`** first on incomplete batch arms.

@@ -75,11 +75,7 @@ def _log_flags(C: Any, *, games: int) -> None:
 
 def _config_warnings(C: Any, *, allow_human: bool) -> List[str]:
     warnings: List[str] = []
-    if not bool(getattr(C, "NO_GUI_AT_ALL_TF", False)):
-        warnings.append(
-            "NO_GUI_AT_ALL_TF is False — runner still uses NullGui, "
-            "but interactive presentation gates may differ."
-        )
+    # NO_GUI_AT_ALL_TF must be True for run_headless (hard-checked in main).
     human = bool(getattr(C, "HUMAN_PLAYER", False))
     raw_ids = getattr(C, "HP_ID", None) or []
     if isinstance(raw_ids, (list, tuple, set)):
@@ -374,6 +370,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     _log_flags(C, games=games)
     for w in _config_warnings(C, allow_human=bool(args.allow_human)):
         console.warn(w)
+
+    # Headless needs mute + quiet digin. Operator owns constants.py —
+    # do not silently force NO_GUI_AT_ALL_TF (leave False for main.py).
+    if not bool(getattr(C, "NO_GUI_AT_ALL_TF", False)):
+        console.error(
+            "headless requires NO_GUI_AT_ALL_TF=True in core/constants.py "
+            "(False → sounds + noisy digin prints). Set True for batch/lab; "
+            "set False again before interactive main.py."
+        )
+        return 2
 
     human = bool(getattr(C, "HUMAN_PLAYER", False))
     raw_ids = getattr(C, "HP_ID", None) or []

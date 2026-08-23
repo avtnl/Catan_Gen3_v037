@@ -1376,6 +1376,7 @@ def _place_one_free_road(game: Any, player: Any, road_id: Sequence[int]) -> Dict
                         reason="after_ai_tfr_fallback_complete",
                         emit_events=True,
                         refresh_scoreboard=True,
+                        actor=player,
                     )
             except Exception:
                 pass
@@ -1387,6 +1388,7 @@ def _place_one_free_road(game: Any, player: Any, road_id: Sequence[int]) -> Dict
                         reason="after_ai_tfr_fallback_road",
                         emit_events=True,
                         refresh_scoreboard=False,
+                        actor=player,
                     )
             except Exception:
                 pass

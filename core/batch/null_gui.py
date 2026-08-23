@@ -20,17 +20,23 @@ def is_gui_presentation_enabled(
     """Return False when draw/sound/screenshot/button chrome should be skipped.
 
     Order of checks:
-      1. ``NO_GUI_AT_ALL_TF`` (operator flag)
+      1. ``NO_GUI_AT_ALL_TF`` (operator-owned)
       2. missing ``gui``
       3. ``NullGui`` / ``is_null_gui`` marker
     """
     try:
-        from core.constants import NO_GUI_AT_ALL_TF
+        from core.console import is_no_gui
 
-        if bool(NO_GUI_AT_ALL_TF):
+        if is_no_gui():
             return False
     except Exception:
-        pass
+        try:
+            from core.constants import NO_GUI_AT_ALL_TF
+
+            if bool(NO_GUI_AT_ALL_TF):
+                return False
+        except Exception:
+            pass
 
     g = gui
     if g is None and game is not None:

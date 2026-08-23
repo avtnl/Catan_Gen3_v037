@@ -48,27 +48,12 @@ except Exception:
     pass
 
 
-# Optional override: True/False force on/off; None → follow NO_GUI_AT_ALL_TF.
-# Re-play GUI sets True so Continue SFX work even when headless default is on.
-_AUDIO_FORCE: Union[bool, None] = None
-
-
-def set_audio_force(enabled: Optional[bool]) -> None:
-    """Force audio on/off (``True``/``False``), or ``None`` to clear override."""
-    global _AUDIO_FORCE
-    _AUDIO_FORCE = enabled
-
-
 def is_audio_enabled() -> bool:
     """Return True when sound effects may play.
 
-    Policy:
-      - If ``set_audio_force(True/False)`` was used, that wins.
-      - Else ``NO_GUI_AT_ALL_TF=False`` → sounds on; ``True`` → sounds off.
+    Policy: ``NO_GUI_AT_ALL_TF=True`` → off; ``False`` → on.
+    Operator owns the constant (no in-process override).
     """
-    global _AUDIO_FORCE
-    if _AUDIO_FORCE is not None:
-        return bool(_AUDIO_FORCE)
     try:
         import core.constants as _cc
 
@@ -225,14 +210,13 @@ SOUNDS: Dict[str, pygame.mixer.Sound] = {}
 def initialize_sounds(*, force: bool = False) -> int:
     """Initialize sound effects and populate the SOUNDS dictionary.
 
-    No-op when audio is disabled (unless ``force=True``, which also calls
-    ``set_audio_force(True)``). Paths are resolved from the project root so
-    loading does not depend on process cwd.
+    No-op when ``NO_GUI_AT_ALL_TF=True`` (``force`` is ignored — operator owns
+    the constant). Paths are resolved from the project root so loading does
+    not depend on process cwd.
 
     Returns the number of successfully loaded sound objects.
     """
-    if force:
-        set_audio_force(True)
+    _ = force  # kept for call-site compatibility; does not bypass NO_GUI
     if not is_audio_enabled():
         SOUNDS.clear()
         return 0
@@ -264,12 +248,12 @@ def initialize_sounds(*, force: bool = False) -> int:
 
 
 def ensure_replay_audio() -> int:
-    """F1: enable + load sounds for interactive re-play (headless-safe override).
+    """Load sounds for interactive re-play after the display exists.
 
     Call after ``pygame.display.set_mode`` / importing ``WIN`` so the mixer is
     (re)initialized with a display present — needed on some Windows setups.
+    Requires ``NO_GUI_AT_ALL_TF=False`` (same as ``is_audio_enabled``).
     """
-    set_audio_force(True)
     try:
         # Display may have been created after an earlier mixer.init(); re-init.
         try:
@@ -280,7 +264,7 @@ def ensure_replay_audio() -> int:
         pygame.mixer.init()
     except Exception:
         pass
-    return initialize_sounds(force=True)
+    return initialize_sounds()
 
 
 def play_sound(name: str, fallback: str = "BUTTON") -> bool:

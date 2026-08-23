@@ -1,7 +1,9 @@
-"""SE Dig (SE5+): probe hits, cat XOR filters, SE Dig panel (PLAN/ACT/WHY/MORE).
+"""SE Dig (SE5+): probe hits, cat XOR filters, SE Dig panel.
 
+Tabs (P0): STR, PLN1, PLN2, ACT, WHY1, MORE (WHY2 removed).
 Loads fields from enriched dense ``mglog_cs.csv`` rows (no SE recompute).
-Product: ``docs/CS_mglog_se_dig_implementation_plan.md``.
+PLN2: geo catalog + Show; PLN1: way-component shell (P5 fills content).
+Product: ``docs/changes_PLAN_v2_coding.md``.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from core.batch.cs_mglog_codes import (
 from core.batch.cs_se_snapshot import (
     DEL_TOKEN,
     SE_L2_FIELDS,
+    SE_PLAN_FIELDS,
     SE_REASSESS_FIELDS,
     is_del_token,
     parse_se_cell,
@@ -54,22 +57,25 @@ except Exception:  # pragma: no cover
 NAV_STEP = "step"  # < or >
 NAV_JUMP = "jump"  # dig next, <<G, rounds, …
 
-TABS: Tuple[str, ...] = ("PLAN", "ACT", "WHY", "MORE")
+# P0: PLN1 (components) + PLN2 (geo catalog); WHY2 removed; Show on PLN2 only
+TABS: Tuple[str, ...] = ("STR", "PLN1", "PLN2", "ACT", "WHY1", "MORE")
 
 # Fixed field slots per tab (stable layout)
-PLAN_FIELDS: Tuple[Tuple[str, str], ...] = (
+STR_FIELDS: Tuple[Tuple[str, str], ...] = (
     ("Way sticky", "sticky_way_id"),
-    ("Way id", "way_id"),
-    ("Tags", "way_tags"),
-    ("LA / LR", "_la_lr"),  # synthetic
-    ("Sticky tgt", "sticky_target_id"),
-    ("Tgt kind", "sticky_target_kind"),
+    ("Way id", "way_id"),  # omit in UI when == sticky
+    ("Tags", "way_def_tags"),
+    ("Given up", "_given_up"),
+    ("Sticky", "_sticky_chip"),  # S62 / C62 combined
     ("Rec tgt", "rec_target_id"),
-    ("ETA plan", "turns"),
-    ("ETA prev", "prev_turns"),
-    ("ETA Δ", "delta_turns"),
-    ("ETA tgt", "self_eta"),
+    ("ETA", "_eta_hdr"),
+    ("  plan", "_eta_plan"),
+    ("  prev", "_eta_prev"),
+    ("  Dt", "_eta_delta"),
 )
+
+# Alias: old PLAN_FIELDS name → STR (legacy); PLN2 uses catalog helpers
+PLAN_FIELDS = STR_FIELDS
 
 ACT_FIELDS: Tuple[Tuple[str, str], ...] = (
     ("BA label", "ba_label"),
@@ -77,12 +83,14 @@ ACT_FIELDS: Tuple[Tuple[str, str], ...] = (
     ("BA target", "ba_target_id"),
     ("BA source", "ba_source"),
     ("BA roads", "ba_roads_fp"),
+    ("Race BA", "_race_ba_note"),  # P2: risk M/H chase note
+    ("Risk", "risk_level"),
     ("Sup type", "supporting_action_type"),
     ("Sup tgt", "supporting_target_id"),
     ("Sticky roads", "sticky_roads_fp"),
 )
 
-WHY_FIELDS: Tuple[Tuple[str, str], ...] = (
+WHY1_FIELDS: Tuple[Tuple[str, str], ...] = (
     ("reason", "reason"),
     ("sample", "sample_kind"),
     ("way cause", "way_switch_cause"),
@@ -98,6 +106,40 @@ WHY_FIELDS: Tuple[Tuple[str, str], ...] = (
     ("cs_cat2", COL_CS_CAT2),
 )
 
+WHY_FIELDS = WHY1_FIELDS  # alias
+
+# PLN1 shell until P5 emits pln1_* CS fields
+PLN1_PLACEHOLDER_FIELDS: Tuple[Tuple[str, str], ...] = (
+    ("note", "_pln1_placeholder"),
+)
+
+# PLN2 geo catalog — table drawn by draw_pln2_table; placeholder if empty CS
+PLN2_PLACEHOLDER_FIELDS: Tuple[Tuple[str, str], ...] = (
+    ("note", "_plan_placeholder"),
+)
+
+# Back-compat aliases
+PLAN_PLACEHOLDER_FIELDS = PLN2_PLACEHOLDER_FIELDS
+WHY2_PLACEHOLDER_FIELDS: Tuple[Tuple[str, str], ...] = (
+    ("note", "_why2_removed"),
+)
+
+
+def normalize_dig_tab(tab: Any) -> str:
+    """Map legacy PLAN/WHY2 names to P0 tabs."""
+    t = str(tab or "STR").strip().upper()
+    if t in ("PLAN", "PLN2"):
+        return "PLN2"
+    if t == "PLN1":
+        return "PLN1"
+    if t == "WHY2":
+        return "PLN2"  # WHY2 removed — land on geo catalog
+    if t in ("WHY", "WHY1"):
+        return "WHY1"
+    if t in TABS:
+        return t
+    return "STR"
+
 MORE_FIELDS: Tuple[Tuple[str, str], ...] = (
     ("abstract", "abstract_turns"),
     ("win_span", "win_span"),
@@ -110,11 +152,15 @@ MORE_FIELDS: Tuple[Tuple[str, str], ...] = (
     ("prev kind", "prev_sticky_target_kind"),
     ("prev_way_id", "prev_way_id"),
     ("req C/S/R/DC", "_req"),
-    ("owned S/C/R", "_owned"),
+    ("owned", "_owned"),  # WP1.3: LA/LR + DCards + S/C (no R=)
+    ("way def", "way_def_tags"),
+    ("VP-E", "unplayed_vp_cards"),
+    ("rem VP", "remaining_vp_cards"),
     ("VP eff", "vp_effective"),
+    ("plan asof", "plan_asof_rt"),
 ) + tuple((f"L2 {k}", k) for k in SE_L2_FIELDS) + tuple(
     (f"RA {k}", k) for k in SE_REASSESS_FIELDS
-)
+) + tuple((f"P {k}", k) for k in SE_PLAN_FIELDS if k not in ("plan_asof_rt", "plan_why2"))
 
 COLOR_RED = (220, 40, 40)
 COLOR_BLUE = (40, 90, 210)
@@ -196,7 +242,118 @@ def seat_turn_of_row(row: Mapping[str, Any]) -> Optional[Tuple[int, int]]:
     return (int(r), int(t))
 
 
+def active_turn_player_id(
+    rows: Sequence[Mapping[str, Any]], cursor: int
+) -> Optional[int]:
+    """Player whose **turn** it is at *cursor* (from latest turn_start at same R/T).
+
+    ``resource_production`` rows use the **recipient** player_id, which is not
+    the seat to show for Dig STR/PLN honesty.
+    """
+    if cursor < 0 or cursor >= len(rows):
+        return None
+    row = rows[cursor]
+    st = seat_turn_of_row(row)
+    if st is None:
+        return _safe_int(row.get("player_id"))
+    rnd, turn = st
+    for i in range(cursor, -1, -1):
+        r = rows[i]
+        if seat_turn_of_row(r) != (rnd, turn):
+            continue
+        ev = str(r.get("event") or "").strip().lower()
+        if ev == "turn_start":
+            return _safe_int(r.get("player_id"))
+    return _safe_int(row.get("player_id"))
+
+
+_SE_DIG_TABS = frozenset({"STR", "PLN1", "PLN2", "ACT", "WHY1", "MORE"})
+
+
+def se_display_row_for_cursor(
+    rows: Sequence[Mapping[str, Any]],
+    cursor: int,
+    *,
+    tab: str = "PLN2",
+) -> Tuple[Optional[Mapping[str, Any]], Optional[str]]:
+    """Row used for Dig SE tabs + optional banner note.
+
+    For STR/PLN/ACT/… use the **active turn seat's** latest SE snapshot at or
+    before *cursor* (not the event actor). Returns ``(display_row, note)``.
+    """
+    if cursor < 0 or cursor >= len(rows):
+        return None, None
+    base = rows[cursor]
+    t = normalize_dig_tab(tab)
+    if t not in _SE_DIG_TABS:
+        return base, None
+    aid = active_turn_player_id(rows, cursor)
+    actor = _safe_int(base.get("player_id"))
+    if aid is None:
+        return base, None
+    # Walk back for latest row of active seat ≤ cursor (dense carry lives there)
+    src: Optional[Mapping[str, Any]] = None
+    for i in range(cursor, -1, -1):
+        if _safe_int(rows[i].get("player_id")) == int(aid):
+            src = rows[i]
+            break
+    if src is None:
+        note = f"No SE row yet for turn seat P{aid}"
+        return base, note
+    if actor is not None and int(actor) != int(aid):
+        note = f"Turn seat P{aid} (event actor P{actor})"
+    else:
+        note = None
+    # Overlay: keep timeline event meta from *base*, SE/PLN fields from *src*
+    from core.batch.cs_se_snapshot import SE_FIELD_KEYS
+
+    merged = dict(base)
+    for k in SE_FIELD_KEYS:
+        merged[k] = src.get(k, "")
+    # Probe cats for dig honesty stay on event row; SE strategy from turn seat
+    return merged, note
+
+
 def field_raw(row: Mapping[str, Any], key: str) -> str:
+    # Absolute way composition from 142 CSV (Dig-time; ignores stale CS residual)
+    if key == "way_def_tags":
+        try:
+            from core.strategy_way_residual import (
+                format_tags_join,
+                load_way_requirement,
+                way_def_tags,
+            )
+
+            wid = row.get("sticky_way_id") or row.get("way_id")
+            strat = load_way_requirement(wid)
+            tags = way_def_tags(strat) if strat is not None else []
+            if tags:
+                return format_tags_join(tags)
+        except Exception:
+            pass
+        # Fall through to CS cell
+    if key == "_pln1_placeholder":
+        try:
+            from core.strategy_pln1 import pln1_lines_for_dig
+
+            lines = pln1_lines_for_dig(row)
+            if lines:
+                return " | ".join(f"{a}: {b}" for a, b in lines[:4])
+        except Exception:
+            pass
+        return "PLN1 not sampled (L0 or PLAN_SNAPSHOT off)"
+    if key == "_plan_placeholder":
+        try:
+            from core.strategy_plan_snapshot import plan_lines_for_dig
+
+            lines = plan_lines_for_dig(row)
+            if lines:
+                return " | ".join(f"{a}: {b}" for a, b in lines[:3])
+        except Exception:
+            pass
+        return "No PLN2 catalog snapshot"
+    if key in ("_why2_placeholder", "_why2_removed"):
+        return "WHY2 removed — see PLN1 Words + PLN2 Why"
     if key == "_la_lr":
         la = parse_se_cell(row.get("way_la", ""))
         lr = parse_se_cell(row.get("way_lr", ""))
@@ -206,6 +363,97 @@ def field_raw(row: Mapping[str, Any], key: str) -> str:
         if lr != "":
             parts.append(f"LR={lr}")
         return " ".join(parts)
+    if key == "_given_up":
+        try:
+            from core.strategy_plan_snapshot import _format_given_up
+
+            return _format_given_up(row) or "—"
+        except Exception:
+            return "—"
+    if key == "_sticky_chip":
+        try:
+            from core.strategy_plan_snapshot import _sticky_chip
+
+            return _sticky_chip(row) or "—"
+        except Exception:
+            tid = parse_se_cell(row.get("sticky_target_id", ""))
+            return tid or "—"
+    # refinements v1 STR ETA: Type | ETA-old | ETA-update | Dt
+    if key == "_eta_hdr":
+        return "Type     ETA-old  ETA-upd  Dt"
+    if key == "_eta_plan":
+        plan_new = None
+        try:
+            from core.strategy_plan_snapshot import _plan_eta_from_pln2_sticky
+
+            plan_new = _plan_eta_from_pln2_sticky(row)
+        except Exception:
+            plan_new = None
+        old = parse_se_cell(row.get("turns", ""))
+        new_s = f"{plan_new}" if plan_new is not None else old
+        try:
+            old_f = float(old) if old not in ("", "—") else None
+            new_f = float(plan_new) if plan_new is not None else old_f
+            dt = (
+                round(float(new_f) - float(old_f), 1)
+                if old_f is not None and new_f is not None
+                else None
+            )
+        except Exception:
+            dt = None
+        dt_s = "—" if dt is None else f"{dt:+.1f}" if dt != 0 else "0"
+        return f"Plan     {old or '—':<8} {new_s or '—':<8} {dt_s}"
+    if key == "_eta_prev":
+        old = parse_se_cell(row.get("prev_turns", ""))
+        # update: prefer last stored prev; delta_turns vs plan if present
+        new = old
+        stored = parse_se_cell(row.get("delta_turns", ""))
+        dt_s = stored if stored != "" else "—"
+        try:
+            if stored != "":
+                dt_s = f"{float(stored):+.1f}" if float(stored) != 0 else "0"
+        except Exception:
+            pass
+        return f"Previous {old or '—':<8} {new or '—':<8} {dt_s}"
+    if key == "_eta_tgt":
+        return ""  # removed from STR (refinements)
+    if key == "_eta_delta":
+        # Summary Dt line: plan update − previous (green/red painted separately)
+        try:
+            from core.strategy_plan_snapshot import _plan_eta_from_pln2_sticky
+
+            plan_v = _plan_eta_from_pln2_sticky(row)
+            prev_v = float(row.get("prev_turns"))
+            if plan_v is not None:
+                d = round(float(plan_v) - float(prev_v), 1)
+                return f"Dt       {d:+.1f}" if d != 0 else "Dt       0"
+        except Exception:
+            pass
+        stored = parse_se_cell(row.get("delta_turns", ""))
+        return f"Dt       {stored}" if stored != "" else "Dt       —"
+    if key == "_race_ba_note":
+        # Dig-time note from CS risk + sticky roads / target
+        risk_raw = str(parse_se_cell(row.get("risk_level", "")) or "").lower()
+        try:
+            from core.strategy_race_ba import _norm_risk, _risk_is_race
+
+            risk = _norm_risk(risk_raw)
+            if not _risk_is_race(risk):
+                return "risk=L → current BA order"
+        except Exception:
+            risk = risk_raw
+            if risk in ("", "low", "l", "safe"):
+                return "risk=L → current BA order"
+        roads = parse_se_cell(row.get("sticky_roads_fp", "") or row.get("ba_roads_fp", ""))
+        tgt = parse_se_cell(row.get("sticky_target_id", "") or row.get("ba_target_id", ""))
+        if roads and roads not in ("—", ""):
+            return f"risk={risk or '?'} → chase key road ({roads})"
+        if tgt and tgt not in ("—", ""):
+            return f"risk={risk or '?'} → chase target {tgt}"
+        src = parse_se_cell(row.get("ba_source", ""))
+        if "race_ba" in src:
+            return f"risk={risk or '?'} → race BA active"
+        return f"risk={risk or '?'} → prefer race structure over DCard"
     if key == "_req":
         parts = []
         for lab, k in (
@@ -219,17 +467,63 @@ def field_raw(row: Mapping[str, Any], key: str) -> str:
                 parts.append(f"{lab}={v}")
         return " ".join(parts)
     if key == "_owned":
+        # WP1.3: prefer owned_display (LA/LR/TFR/…); never emphasize R= piece count
+        od = parse_se_cell(row.get("owned_display", ""))
+        if od:
+            return od
         parts = []
         for lab, k in (
+            ("LA", "way_la"),  # fallback weak
             ("S", "settlements_owned"),
             ("C", "cities_owned"),
-            ("R", "roads_owned"),
         ):
             v = parse_se_cell(row.get(k, ""))
-            if v != "":
+            if v == "":
+                continue
+            if lab == "LA" and v in ("0", "false", "False"):
+                continue
+            if lab == "LA" and v in ("1", "true", "True"):
+                # Prefer lr_flag/la_flag if present
+                continue
+            if lab in ("S", "C") and v not in ("", "0"):
                 parts.append(f"{lab}={v}")
-        return " ".join(parts)
+        # specials from flags
+        for lab, k in (("LA", "la_flag"), ("LR", "lr_flag")):
+            v = parse_se_cell(row.get(k, ""))
+            if v in ("1", "true", "True"):
+                parts.insert(0, lab)
+        return " ".join(parts) if parts else "—"
     return parse_se_cell(row.get(key, ""))
+
+
+def is_l2_refresh_row(row: Optional[Mapping[str, Any]]) -> bool:
+    """WP0.5 / WP3: True when this CS/MGlog row is a full L2 / explore sample."""
+    if not row:
+        return False
+    mode = str(row.get("refresh_mode") or "").strip().lower()
+    if mode in ("l2", "explore", "force", "full"):
+        return True
+    detail = str(row.get("refresh_mode_detail") or "").strip().lower()
+    if "l2" in detail or "explore" in detail:
+        return True
+    # WP3: primary explicit code present
+    elc = parse_se_cell(row.get("explicit_l2_code", ""))
+    if elc not in ("", "—", "0", "none", "null"):
+        return True
+    etr = parse_se_cell(row.get("explicit_trigger", ""))
+    if etr and "explicit_142" in etr.lower():
+        return True
+    for k in ("l2_bucket", "l2_bucket_live", "l2_force_reason", "l2_gate"):
+        v = parse_se_cell(row.get(k, ""))
+        if v not in ("", "—", "0", "false", "none", "null"):
+            # empty gate "l0" / "hand_only" is not L2
+            vl = v.lower()
+            if vl in ("l0", "hand_only", "hand", "skip", "skipped", "false", "0"):
+                continue
+            if k == "l2_gate" and vl in ("l0", "hand_only", "false", "0", "none"):
+                continue
+            return True
+    return False
 
 
 def last_change_index(
@@ -283,11 +577,28 @@ def display_field_at_cursor(
     field_key: str,
     *,
     last_nav: str,
+    value_row: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Return display text, color, optional R/T ref for one field."""
+    """Return display text, color, optional R/T ref for one field.
+
+    WP0.3: R/T refs (``(*)`` / ``(**)``) available on step and jump nav.
+    WP0.5: full L2 sample rows paint non-empty fields red on step nav.
+    *value_row*: optional overlay (turn-seat SE snapshot) for Dig honesty.
+    """
     if cursor < 0 or cursor >= len(rows):
         return {"text": "—", "color": COLOR_BLACK, "ref": None, "omitted": True}
-    row = rows[cursor]
+    row = value_row if value_row is not None else rows[cursor]
+    # WP5 dynamic PLAN/WHY2 lines (not SE field history)
+    dyn = dynamic_plan_text(row, field_key)
+    if dyn is not None:
+        return {
+            "text": dyn if dyn else "—",
+            "color": COLOR_BLACK,
+            "ref": None,
+            "change_index": None,
+            "omitted": False,
+            "l2_row": is_l2_refresh_row(row),
+        }
     raw = field_raw(row, field_key)
     # For display of current in-force: __DEL__ on this row means cleared
     if is_del_token(raw):
@@ -300,10 +611,14 @@ def display_field_at_cursor(
         disp = raw
         in_force_empty = False
 
-    chg_i = last_change_index(rows, field_key, cursor)
+    if field_key.startswith("_plan_dyn") or field_key.startswith("_why2_dyn"):
+        chg_i = None
+    else:
+        chg_i = last_change_index(rows, field_key, cursor)
     st_cur = seat_turn_of_row(row)
     color = COLOR_BLACK
     ref = None
+    l2_row = is_l2_refresh_row(row)
 
     if last_nav == NAV_STEP and chg_i is not None:
         if chg_i == cursor:
@@ -320,6 +635,9 @@ def display_field_at_cursor(
                 color = COLOR_BLACK
                 if st_ch is not None:
                     ref = f"R{st_ch[0]}T{st_ch[1]}"
+        # WP0.5: L2 explore sample → paint nearly all STR/ACT/WHY fields red
+        if l2_row and not in_force_empty and not field_key.startswith("_plan") and not field_key.startswith("_why2"):
+            color = COLOR_RED
     else:
         # jump / default black — still show last-update R/T when useful
         if chg_i is not None and chg_i != cursor:
@@ -331,12 +649,33 @@ def display_field_at_cursor(
         elif is_del_token(raw) and last_nav != NAV_STEP:
             disp = "—"  # no Deleted on black
 
+    # WP0.3: also attach ref on step when change is older (already set above);
+    # on jump, ref is set in the else branch. Placeholders have no R/T.
+    if field_key in ("_plan_placeholder", "_why2_placeholder"):
+        ref = None
+
+    # Refinements v1: STR Dt colours (after nav tint) — green if ≤0 else red
+    if field_key in ("_eta_delta", "_eta_plan", "_eta_prev") and not in_force_empty:
+        try:
+            from core.strategy_pln_words import dt_color_favourable
+
+            parts = str(disp).split()
+            if parts:
+                tone = dt_color_favourable(parts[-1])
+                if tone == "green":
+                    color = COLORS.get("GREEN", (0, 160, 0))
+                elif tone == "red":
+                    color = COLOR_RED
+        except Exception:
+            pass
+
     return {
         "text": disp,
         "color": color,
         "ref": ref,
         "change_index": chg_i,
         "omitted": False,
+        "l2_row": l2_row,
     }
 
 
@@ -350,9 +689,16 @@ class DigUiState:
     focus: Optional[str] = None  # "cat1" | "cat2" | None
     hits: List[int] = field(default_factory=list)
     hit_i: int = -1
-    tab: str = "PLAN"
+    tab: str = "STR"
     last_nav: str = NAV_JUMP
     message: str = ""
+    show_plan: bool = False  # PLN2 Show circles from plan_show
+
+    def normalized_tab(self) -> str:
+        t = normalize_dig_tab(self.tab)
+        if t != self.tab:
+            self.tab = t
+        return t
 
     def set_cat1_text(self, text: str) -> None:
         self.cat1_text = text
@@ -434,6 +780,7 @@ def cat_field_rects(panel: Optional[pygame.Rect] = None) -> Dict[str, pygame.Rec
 
 
 def tab_rects(panel: pygame.Rect) -> Dict[str, pygame.Rect]:
+    """Tab strip on bottom row; Show sits **above MORE** (not beside it)."""
     n = len(TABS)
     pad, gap, h = 6, 4, 22
     y = panel.bottom - h - 6
@@ -443,6 +790,12 @@ def tab_rects(panel: pygame.Rect) -> Dict[str, pygame.Rect]:
     for tab in TABS:
         out[tab] = pygame.Rect(x, y, bw, h)
         x += bw + gap
+    # Show: extra PLAN control stacked above the MORE tab button
+    more = out.get("MORE")
+    if more is not None:
+        out["SHOW"] = pygame.Rect(more.x, more.y - h - gap, more.width, h)
+    else:
+        out["SHOW"] = pygame.Rect(panel.right - pad - bw, y - h - gap, bw, h)
     return out
 
 
@@ -508,15 +861,95 @@ def _draw_btn(
     screen.blit(text, text.get_rect(center=rect.center))
 
 
-def fields_for_tab(tab: str) -> Tuple[Tuple[str, str], ...]:
-    t = str(tab or "PLAN").upper()
+def _draw_show_btn(
+    screen: pygame.Surface,
+    rect: pygame.Rect,
+    *,
+    on: bool = False,
+) -> None:
+    """Show toggle: always enabled (green border), like stage3and4 Test button.
+
+    Never uses tab ``selected``=gray. ON still keeps green border; label reflects state.
+    """
+    green = COLORS.get("GREEN", (0, 255, 0))
+    black = COLORS.get("BLACK", (0, 0, 0))
+    white = COLORS.get("WHITE", (255, 255, 255))
+    lgray = COLORS.get("LGRAY", (200, 200, 200))
+    pygame.draw.rect(screen, lgray, rect)
+    pygame.draw.rect(screen, green, rect, 2)
+    font = _font_small()
+    # ON: black text (active); OFF: white on enabled chrome
+    label = "Show*" if on else "Show"
+    text = font.render(label, True, black if on else white)
+    screen.blit(text, text.get_rect(center=rect.center))
+
+
+def fields_for_tab(
+    tab: str, row: Optional[Mapping[str, Any]] = None
+) -> Tuple[Tuple[str, str], ...]:
+    """Field slots for a tab. PLN1/PLN2 from CS snapshots."""
+    t = normalize_dig_tab(tab)
+    if t == "PLN1":
+        try:
+            from core.strategy_pln1 import pln1_lines_for_dig
+
+            if row is not None:
+                lines = pln1_lines_for_dig(row)
+                return tuple((lab, f"_pln1_dyn:{i}") for i, (lab, _txt) in enumerate(lines))
+        except Exception:
+            pass
+        return PLN1_PLACEHOLDER_FIELDS
+    if t == "PLN2":
+        try:
+            from core.strategy_plan_snapshot import plan_lines_for_dig
+
+            if row is not None:
+                lines = plan_lines_for_dig(row)
+                return tuple((lab, f"_plan_dyn:{i}") for i, (lab, _txt) in enumerate(lines))
+        except Exception:
+            pass
+        return PLN2_PLACEHOLDER_FIELDS
     if t == "ACT":
         return ACT_FIELDS
-    if t == "WHY":
-        return WHY_FIELDS
+    if t == "WHY1":
+        return WHY1_FIELDS
     if t == "MORE":
         return MORE_FIELDS
-    return PLAN_FIELDS
+    if t == "STR":
+        try:
+            from core.strategy_plan_snapshot import str_field_slots
+
+            return tuple(str_field_slots(row))
+        except Exception:
+            return STR_FIELDS
+    return STR_FIELDS
+
+
+def dynamic_plan_text(row: Mapping[str, Any], key: str) -> Optional[str]:
+    """Resolve synthetic PLN1/PLN2 field keys to display text."""
+    if key.startswith("_plan_dyn:"):
+        try:
+            from core.strategy_plan_snapshot import plan_lines_for_dig
+
+            idx = int(key.split(":", 1)[1])
+            lines = plan_lines_for_dig(row)
+            if 0 <= idx < len(lines):
+                return str(lines[idx][1])
+        except Exception:
+            return None
+        return None
+    if key.startswith("_pln1_dyn:"):
+        try:
+            from core.strategy_pln1 import pln1_lines_for_dig
+
+            idx = int(key.split(":", 1)[1])
+            lines = pln1_lines_for_dig(row)
+            if 0 <= idx < len(lines):
+                return str(lines[idx][1])
+        except Exception:
+            return None
+        return None
+    return None
 
 
 def is_ip_phase(row: Optional[Mapping[str, Any]]) -> bool:
@@ -527,6 +960,230 @@ def is_ip_phase(row: Optional[Mapping[str, Any]]) -> bool:
         return True
     ev = str(row.get("event") or "").lower()
     return ev.startswith("ip_")
+
+
+def _fit_cell(font: Any, text: str, max_w: int) -> str:
+    s = str(text or "")
+    if font.size(s)[0] <= max_w:
+        return s
+    while s and font.size(s + "…")[0] > max_w:
+        s = s[:-1]
+    return s + "…" if s else ""
+
+
+def draw_pln1_panel(
+    screen: pygame.Surface,
+    row: Mapping[str, Any],
+    *,
+    x: int,
+    y: int,
+    width: int,
+    body_bottom: int,
+    small: Any,
+    bold: Any,
+) -> int:
+    """V5-D: Way line + Comp/Tag/Need/Why/Target table. Returns next y."""
+    black = COLORS.get("BLACK", (0, 0, 0))
+    dgray = COLORS.get("DGRAY", (80, 80, 80))
+    line_h = 14
+    # Way absolute composition
+    try:
+        from core.strategy_pln1 import pln1_lines_for_dig
+
+        for lab, txt in pln1_lines_for_dig(row):
+            if lab != "Way":
+                continue
+            if y + line_h > body_bottom:
+                return y
+            screen.blit(bold.render(f"Way: {txt}", True, black), (x, y))
+            y += line_h
+            break
+    except Exception:
+        pass
+    try:
+        from core.strategy_pln1_table import pln1_component_table
+
+        tbl = pln1_component_table(row)
+    except Exception as exc:
+        screen.blit(small.render(f"PLN1 table error: {exc}"[:60], True, COLOR_RED), (x, y))
+        return y + line_h
+    if tbl.get("empty"):
+        return y
+    fracs = (0.12, 0.12, 0.14, 0.22, 0.40)
+    usable = max(80, int(width) - 4)
+    col_w = [max(24, int(usable * f)) for f in fracs]
+    col_w[-1] = max(40, usable - sum(col_w[:-1]))
+    headers = tbl.get("headers") or ("Comp", "Tag", "Need", "Why", "Target")
+
+    def _blit_row(cells: Sequence[str], yy: int, *, header: bool = False):
+        font = bold if header else small
+        cx = x
+        for i, cell in enumerate(cells):
+            w = col_w[i] if i < len(col_w) else 40
+            col = dgray if header else black
+            txt = _fit_cell(font, str(cell), w - 2)
+            screen.blit(font.render(txt, True, col), (cx, yy))
+            cx += w
+
+    if y + line_h <= body_bottom:
+        _blit_row(list(headers), y, header=True)
+        y += line_h
+    for r in tbl.get("rows") or []:
+        if y + line_h > body_bottom:
+            break
+        if r.get("spacer"):
+            y += line_h // 2
+            continue
+        cells = [
+            str(r.get("comp") or ""),
+            str(r.get("tag") or ""),
+            str(r.get("need") or ""),
+            str(r.get("why") or ""),
+            str(r.get("target") or ""),
+        ]
+        # Red next-buy/build line (refinements): put label in Need column span
+        if r.get("red") and r.get("need"):
+            font = bold
+            screen.blit(
+                font.render(_fit_cell(font, str(r.get("need")), max(40, usable - 4)), True, COLOR_RED),
+                (x, y),
+            )
+            y += line_h
+            continue
+        _blit_row(cells, y)
+        y += line_h
+    # Now / Also after table — skip redundant DC focus line (table covers it)
+    try:
+        from core.strategy_pln1 import pln1_lines_for_dig
+
+        for lab, txt in pln1_lines_for_dig(row):
+            if lab in ("Way", "DC"):
+                continue
+            if y + line_h > body_bottom:
+                break
+            screen.blit(small.render(f"{lab}: {txt}", True, black), (x, y))
+            y += line_h
+    except Exception:
+        pass
+    return y
+
+
+def draw_pln2_table(
+    screen: pygame.Surface,
+    row: Mapping[str, Any],
+    *,
+    x: int,
+    y: int,
+    width: int,
+    body_bottom: int,
+    small: Any,
+    bold: Any,
+) -> int:
+    """P4: draw PLN2 column table. Returns next y."""
+    try:
+        from core.strategy_plan_snapshot import pln2_table_for_dig
+
+        tbl = pln2_table_for_dig(row)
+    except Exception:
+        screen.blit(
+            small.render("PLN2 table error", True, COLOR_RED),
+            (x, y),
+        )
+        return y + 14
+
+    black = COLORS.get("BLACK", (0, 0, 0))
+    dgray = COLORS.get("DGRAY", (80, 80, 80))
+    line_h = 14
+
+    if tbl.get("asof"):
+        screen.blit(
+            small.render(f"asof {tbl['asof']}", True, dgray),
+            (x, y),
+        )
+        y += line_h
+
+    if tbl.get("empty"):
+        screen.blit(
+            small.render(
+                "No PLN2 catalog (L0 or PLAN_SNAPSHOT off)",
+                True,
+                dgray,
+            ),
+            (x, y),
+        )
+        return y + line_h
+
+    # Column fractions of usable width (New slightly wider for S52*)
+    fracs = (0.12, 0.14, 0.14, 0.10, 0.10, 0.12, 0.28)
+    usable = max(80, int(width) - 4)
+    col_w = [max(28, int(usable * f)) for f in fracs]
+    # Fix rounding drift on last column
+    col_w[-1] = max(40, usable - sum(col_w[:-1]))
+    headers = tbl.get("headers") or ("New", "Tgt", "ETA", "Dist", "Risk", "Δt", "Why")
+
+    def _blit_row(cells: Sequence[str], yy: int, *, se: bool = False, header: bool = False):
+        font = bold if header or se else small
+        cx = x
+        green = COLORS.get("GREEN", (0, 160, 0))
+        for i, cell in enumerate(cells):
+            w = col_w[i] if i < len(col_w) else 40
+            # SE pick: red on New (col 0) and Why (col 6)
+            if se and i in (0, 6):
+                col = COLOR_RED
+            elif header:
+                col = dgray
+            elif i == 5 and not header:  # Δt / Dt column
+                try:
+                    from core.strategy_pln_words import dt_color_favourable
+
+                    tone = dt_color_favourable(cell)
+                    if tone == "green":
+                        col = green
+                    elif tone == "red":
+                        col = COLOR_RED
+                    else:
+                        col = black
+                except Exception:
+                    col = black
+            else:
+                col = black
+            txt = _fit_cell(font, cell, w - 2)
+            screen.blit(font.render(txt, True, col), (cx, yy))
+            cx += w
+
+    if y + line_h <= body_bottom:
+        _blit_row(list(headers), y, header=True)
+        y += line_h
+
+    for r in tbl.get("rows") or []:
+        if y + line_h > body_bottom:
+            break
+        cells = [
+            str(r.get("new") or ""),
+            str(r.get("target") or "—"),
+            str(r.get("eta") or "—"),
+            str(r.get("dist") or "—"),
+            str(r.get("risk") or "—"),
+            str(r.get("delta") or "—"),
+            str(r.get("why") or ""),
+        ]
+        # 9th overflow row: grey text listing omitted C/S
+        if r.get("overflow") or str(r.get("kind") or "") == "OV":
+            font = small
+            cx = x
+            label = "also"
+            rest = str(r.get("why") or "")
+            screen.blit(font.render(label, True, dgray), (cx, y))
+            cx += col_w[0] if col_w else 40
+            span = sum(col_w[1:]) if len(col_w) > 1 else max(40, int(width) - 50)
+            screen.blit(
+                font.render(_fit_cell(font, rest, span), True, dgray),
+                (cx, y),
+            )
+        else:
+            _blit_row(cells, y, se=bool(r.get("se_pick")))
+        y += line_h
+    return y
 
 
 def draw_se_dig_panel(
@@ -565,16 +1222,28 @@ def draw_se_dig_panel(
         filt = f"cat2={','.join(str(c) for c in dig.cat2)}"
     screen.blit(small.render(f"{chip}  {filt}", True, dgray), (x + 90, y - 18))
 
-    row = rows[cursor] if 0 <= cursor < len(rows) else None
-    body_bottom = rect.bottom - 30
+    raw_row = rows[cursor] if 0 <= cursor < len(rows) else None
+    # Two button rows: Show above MORE (PLN2), then tab strip
+    body_bottom = rect.bottom - 30 - 26
     line_h = 14
+    cur_tab = dig.normalized_tab()
+    # Dig honesty: STR/PLN/ACT follow **turn seat**, not RP recipient actor
+    se_note: Optional[str] = None
+    if raw_row is not None:
+        row, se_note = se_display_row_for_cursor(rows, cursor, tab=cur_tab)
+    else:
+        row = None
 
     if dig.message and (not dig.hits or not dig.cat1 and not dig.cat2):
         msg = dig.message
         screen.blit(bold.render(msg[:70], True, COLOR_RED), (x, y))
         y += line_h + 4
 
-    if row is not None and is_ip_phase(row):
+    if se_note and row is not None and not is_ip_phase(raw_row or row):
+        screen.blit(small.render(se_note, True, dgray), (x, y))
+        y += line_h
+
+    if row is not None and is_ip_phase(raw_row or row):
         screen.blit(
             small.render(
                 "SE Dig data is available from Execution only (IP has no CS samples).",
@@ -583,20 +1252,44 @@ def draw_se_dig_panel(
             ),
             (x, y),
         )
+    elif row is not None and cur_tab == "PLN2":
+        # P4: columnar catalog (red New/Why on SE pick)
+        draw_pln2_table(
+            screen,
+            row,
+            x=x,
+            y=y,
+            width=rect.width - 16,
+            body_bottom=body_bottom,
+            small=small,
+            bold=bold,
+        )
+    elif row is not None and cur_tab == "PLN1":
+        y = draw_pln1_panel(
+            screen,
+            row,
+            x=x,
+            y=y,
+            width=rect.width - 16,
+            body_bottom=body_bottom,
+            small=small,
+            bold=bold,
+        )
     elif row is not None:
         # Collect field displays + top 2 R/T refs
         refs: List[str] = []
-        for label, key in fields_for_tab(dig.tab):
+        for label, key in fields_for_tab(cur_tab, row):
             if y + line_h > body_bottom:
                 break
             info = display_field_at_cursor(
-                rows, cursor, key, last_nav=dig.last_nav
+                rows, cursor, key, last_nav=dig.last_nav, value_row=row
             )
             text = info["text"]
             col = info["color"]
             ref = info.get("ref")
             star = ""
-            if ref and dig.last_nav != NAV_STEP:
+            # WP0.3: show (*) / (**) on step and jump nav
+            if ref:
                 if ref not in refs and len(refs) < 2:
                     refs.append(ref)
                 if ref in refs:
@@ -612,10 +1305,14 @@ def draw_se_dig_panel(
             )
             screen.blit(small.render(foot, True, dgray), (x, body_bottom - line_h))
 
-    # Tabs: current tab disabled (PLAN when on PLAN, etc.)
+    # Tabs (bottom) + Show stacked above MORE (PLN2 only)
     tabs = tab_rects(rect)
     for tab, trect in tabs.items():
-        is_cur = tab == dig.tab
+        if tab == "SHOW":
+            if cur_tab == "PLN2":
+                _draw_show_btn(screen, trect, on=bool(dig.show_plan))
+            continue
+        is_cur = tab == cur_tab
         _draw_btn(
             screen,
             trect,
@@ -703,14 +1400,21 @@ def handle_dig_click(
     rows: Sequence[Mapping[str, Any]],
     cursor: int,
 ) -> Optional[str]:
-    """Returns action: dig_prev|dig_next|tab|focus|None."""
+    """Returns action: dig_prev|dig_next|tab|show|focus|None."""
     for tab, r in tab_rects_map.items():
         if r.collidepoint(pos):
+            if tab == "SHOW":
+                # Show only clickable while PLN2 is active
+                if dig.normalized_tab() != "PLN2":
+                    return "show:hidden"
+                dig.show_plan = not dig.show_plan
+                return "show:on" if dig.show_plan else "show:off"
             # Current sub-panel button is disabled — ignore click
-            if tab == dig.tab:
+            cur = dig.normalized_tab()
+            if tab == cur:
                 return "tab:noop"
-            dig.tab = tab
-            return f"tab:{tab}"
+            dig.tab = normalize_dig_tab(tab)
+            return f"tab:{dig.tab}"
     for key in ("cat1", "cat2"):
         r = rects.get(key)
         if r is not None and r.collidepoint(pos):
@@ -748,11 +1452,174 @@ def mark_jump_nav(dig: DigUiState) -> None:
     dig.last_nav = NAV_JUMP
 
 
+def plan_show_circles_from_row(
+    row: Optional[Mapping[str, Any]],
+    *,
+    board: Any = None,
+    game: Any = None,
+) -> List[Dict[str, Any]]:
+    """Parse plan_show CS into circle descriptors (settle + opp only).
+
+    Refinements v1 Q6: **no circles on occupied** intersections (already
+    settled/citied on the replay board).
+    """
+    if not row:
+        return []
+    try:
+        from core.strategy_plan_snapshot import parse_plan_show
+
+        raw = parse_plan_show(row.get("plan_show"))
+    except Exception:
+        return []
+    occupied: set = set()
+    try:
+        b = board or (getattr(game, "board", None) if game is not None else None)
+        if b is not None:
+            for inter in list(getattr(b, "intersections", None) or []):
+                if inter is None:
+                    continue
+                if getattr(inter, "occupied_tf", False):
+                    try:
+                        occupied.add(int(getattr(inter, "id")))
+                    except Exception:
+                        pass
+    except Exception:
+        occupied = set()
+    out: List[Dict[str, Any]] = []
+    for c in raw:
+        kind = str(c.get("kind") or "settle").lower()
+        if kind in ("city", "road", "next_road", "tfr", "c"):
+            continue
+        if kind in ("settle", "s", "opp"):
+            try:
+                tid = int(c.get("id"))
+            except Exception:
+                tid = None
+            if tid is not None and tid in occupied:
+                continue
+            if kind == "s":
+                c = dict(c)
+                c["kind"] = "settle"
+            out.append(c)
+    return out
+
+
+def draw_plan_show_circles(
+    screen: pygame.Surface,
+    circles: Sequence[Mapping[str, Any]],
+    *,
+    positions: Optional[Mapping[Any, Any]] = None,
+    player_colors: Optional[Mapping[Any, str]] = None,
+    row_player_id: Optional[int] = None,
+    row_player_color: Optional[str] = None,
+) -> int:
+    """Draw Show settlement/city circles (no roads).
+
+    P1: radius from ``radius_for_show(turn_color, owner_color)`` matrix —
+    **ignores** any baked radius in ``plan_show`` CS (stops same-color drift).
+    Own sites use turn-player color; ``opp`` rings when encoded (risk M/H).
+    """
+    if not circles:
+        return 0
+    try:
+        from core.strategy_plan_snapshot import radius_for_show
+    except Exception:
+        def radius_for_show(turn_color: Any, owner_color: Any) -> int:  # type: ignore
+            return 5
+
+    pos_map = positions
+    color_lut = dict(player_colors or {})
+    turn_color = str(row_player_color or "").strip()
+    if not turn_color and row_player_id is not None:
+        turn_color = str(
+            color_lut.get(int(row_player_id))
+            or color_lut.get(str(row_player_id))
+            or ""
+        )
+    if pos_map is None:
+        try:
+            from gui.gui_constants import POSITIONS
+
+            pos_map = POSITIONS.get("intersections") or {}
+        except Exception:
+            pos_map = {}
+    try:
+        from gui.gui_constants import COLORS as GUI_COLORS
+    except Exception:
+        GUI_COLORS = {
+            "BLUE": (0, 0, 255),
+            "RED": (255, 0, 0),
+            "WHITE": (255, 255, 255),
+            "ORANGE": (255, 165, 0),
+            "BLACK": (0, 0, 0),
+        }
+
+    def _rgb(color_name: str) -> Tuple[int, int, int]:
+        key = str(color_name or "").upper()
+        rgb = GUI_COLORS.get(key)
+        if rgb:
+            return tuple(rgb)  # type: ignore[return-value]
+        return GUI_COLORS.get("BLACK", (0, 0, 0))
+
+    n = 0
+    for c in circles:
+        kind = str(c.get("kind") or "settle")
+        # No roads in Show overlay
+        if kind in ("road", "next_road", "tfr"):
+            continue
+        iid = c.get("id")
+        if iid is None:
+            continue
+        try:
+            center = pos_map.get(int(iid))
+        except Exception:
+            center = None
+        if center is None:
+            continue
+        try:
+            cx, cy = int(center[0]), int(center[1])
+        except Exception:
+            continue
+
+        color_name = str(c.get("color") or "").strip()
+        pid = c.get("player_id")
+        if not color_name and pid is not None:
+            try:
+                color_name = str(
+                    color_lut.get(int(pid)) or color_lut.get(str(pid)) or ""
+                )
+            except Exception:
+                color_name = ""
+        if kind != "opp" and not color_name:
+            color_name = turn_color
+        # P1: never trust CS baked radius — matrix only
+        rad = int(radius_for_show(turn_color, color_name or turn_color))
+        rgb = _rgb(color_name or turn_color)
+        try:
+            pygame.draw.circle(screen, rgb, (cx, cy), rad, 2)
+            if str(color_name or turn_color).lower() == "white":
+                pygame.draw.circle(screen, (0, 0, 0), (cx, cy), rad, 1)
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
 __all__ = [
     "NAV_STEP",
     "NAV_JUMP",
     "TABS",
+    "STR_FIELDS",
+    "PLAN_FIELDS",
+    "ACT_FIELDS",
+    "WHY1_FIELDS",
+    "WHY_FIELDS",
+    "MORE_FIELDS",
+    "PLN1_PLACEHOLDER_FIELDS",
+    "PLN2_PLACEHOLDER_FIELDS",
+    "PLAN_PLACEHOLDER_FIELDS",
     "DigUiState",
+    "normalize_dig_tab",
     "parse_cat_list",
     "row_event_index",
     "find_row_index_by_event_index",
@@ -760,9 +1627,19 @@ __all__ = [
     "build_hit_list",
     "display_field_at_cursor",
     "last_change_index",
+    "is_l2_refresh_row",
+    "fields_for_tab",
+    "dynamic_plan_text",
+    "plan_show_circles_from_row",
+    "draw_plan_show_circles",
     "dig_panel_rect",
     "dig_nav_rects",
     "cat_field_rects",
+    "tab_rects",
+    "active_turn_player_id",
+    "se_display_row_for_cursor",
+    "draw_pln1_panel",
+    "draw_pln2_table",
     "draw_se_dig_panel",
     "draw_dig_filters_and_nav",
     "handle_dig_key",

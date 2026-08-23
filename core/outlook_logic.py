@@ -131,27 +131,27 @@ def next_settlement_spots(game: "Game", player_id: int) -> List[int]:
 
 def new_settlement_spots(game: "Game", player_id: int) -> List[int]:
     """
-    Return all viable candidate intersections for a NEW settlement.
+    Return all viable NEW-settlement candidates at hop distance 2 or 3.
 
-    A candidate is valid when:
-        a) the intersection is not already occupied
-        b) the normal settlement distance rule is satisfied
-        c) the candidate is exactly 2 or 3 roads away from one of this
-           player's existing settlements/cities
-        d) every road on that 2-road or 3-road path is either:
-             - empty / unowned / Blank, or
-             - already owned by this player
+    Operator procedure (2026-08-21) — implemented literally:
 
-    This is a planning/outlook function:
-        - distance 2 means the target is reachable with road expansion
-        - distance 3 means the target is a slightly further expansion target
+      Step 1  For each existing own settlement **or city**, collect every
+              intersection whose **board** graph distance from that building
+              is exactly 2 or exactly 3. (d=1 is illegal under Catan.)
+      Step 2  Drop potentials that are unavailable or violate the Catan
+              distance rule (occupied / adjacent to any S or C / water / …).
+      Step 3  Keep only those that still have **at least one viable path**
+              of hop length 2 or 3 from that same building: every road on the
+              path empty or own; intermediate opponent S/C blocks. Multiple
+              paths may exist — existence is enough for candidacy (path pick
+              is road_optimizer / pathfinder later).
+      Step 4  Repeat for the next own S/C.
+      End     Deduplicate candidates.
 
-    It can use player.min_pathlength_map_for_targeted_TWs as a prefilter,
-    but it still verifies the actual path on the current board.
+    No min_pathlength_map prefilter (that dropped legal Dig/Show sites).
+    Full scan is well under 0.5s on a standard board.
 
-    Ownership convention:
-        - road.color == player.color is canonical.
-        - player.color2 is accepted only as a defensive alias.
+    Ownership: road.color == player.color (color2 defensive alias).
     """
     player = next((p for p in game.players if p.id == player_id), None)
     if player is None:
@@ -163,193 +163,147 @@ def new_settlement_spots(game: "Game", player_id: int) -> List[int]:
     if getattr(player, "color2", None):
         player_colors.add(player.color2)
 
-    # Existing owned settlements/cities.
-    # Cities count because they are upgraded settlements.
+    # Own S and C are both starts (city = upgraded settlement).
     start_intersections: Set[int] = set(getattr(player, "settlements", []) or [])
     start_intersections.update(getattr(player, "cities", []) or [])
 
     if not start_intersections:
         return []
 
-    # Fast lookup for board roads by normalized road id.
     road_by_id: Dict[Tuple[int, int], Any] = {}
     for road in getattr(board, "roads", []) or []:
         if road is None:
             continue
-
         road_id = tuple(sorted(getattr(road, "id", ())))
         if len(road_id) == 2:
             road_by_id[road_id] = road
 
     def _road_between(a: int, b: int):
-        """Return the board road object between two neighboring intersections."""
         return road_by_id.get(tuple(sorted((a, b))))
 
     def _road_is_empty_or_mine(a: int, b: int) -> bool:
-        """
-        True when road segment a-b can be part of this future path.
-
-        Allowed:
-            - road has no color / Blank / None / ""
-            - road is already owned by this player
-
-        Rejected:
-            - road is owned by another player
-        """
         road = _road_between(a, b)
         if road is None:
             return False
-
         road_color = getattr(road, "color", "Blank")
-
         if road_color in player_colors:
             return True
-
         if road_color in ("", "Blank", None):
             return True
-
         return False
 
+    def _neighbors(inter_id: int) -> List[int]:
+        if not (0 <= inter_id < len(board.intersections)):
+            return []
+        inter = board.intersections[inter_id]
+        if inter is None:
+            return []
+        out: List[int] = []
+        for nxt in getattr(inter, "three_intersection_ids", []) or []:
+            if not (0 <= nxt < len(board.intersections)):
+                continue
+            if board.intersections[nxt] is None:
+                continue
+            if nxt in getattr(board, "INTERSECTION_IN_WATER", []):
+                continue
+            out.append(int(nxt))
+        return out
+
     def _intersection_can_build(inter_id: int) -> bool:
-        """
-        Check basic settlement buildability without requiring an already-owned
-        adjacent road. This is for future settlement targets.
-        """
+        """Step 2: available + Catan distance rule vs any occupied S/C."""
         if not (0 <= inter_id < len(board.intersections)):
             return False
-
         inter = board.intersections[inter_id]
-
         if inter is None:
             return False
-
         if inter_id in getattr(board, "INTERSECTION_IN_WATER", []):
             return False
-
-        # a) Candidate itself is not already occupied.
         if getattr(inter, "occupied_tf", False):
             return False
-
-        # Boolean style used in current v010b.
-        can_build_tf = getattr(inter, "can_build_tf", True)
-        if can_build_tf is False:
+        if getattr(inter, "can_build_tf", True) is False:
             return False
-
-        # Legacy string style.
-        canbuildYNX = getattr(inter, "canbuildYNX", "Y")
-        if canbuildYNX in ("N", "X"):
+        if getattr(inter, "canbuildYNX", "Y") in ("N", "X"):
             return False
-
-        # b) Explicit distance rule:
-        # no adjacent occupied settlement/city.
         for neighbor_id in getattr(inter, "three_intersection_ids", []) or []:
             if not (0 <= neighbor_id < len(board.intersections)):
                 continue
-
             neighbor = board.intersections[neighbor_id]
             if neighbor is not None and getattr(neighbor, "occupied_tf", False):
                 return False
-
         return True
 
-    def _has_valid_path_length_2_or_3(target_id: int) -> bool:
-        """
-        Return True if there is at least one path from an owned settlement/city
-        to target_id with exactly 2 or 3 roads, and every road on that path is
-        empty/unowned or already owned by this player.
-        """
-        for start_id in start_intersections:
-            if not (0 <= start_id < len(board.intersections)):
+    def _intermediate_blocked_by_opponent(next_id: int, target_id: int) -> bool:
+        if int(next_id) == int(target_id):
+            return False
+        try:
+            return bool(
+                intersection_has_opponent_structure(game, player, int(next_id))
+            )
+        except Exception:
+            inter = (
+                board.intersections[next_id]
+                if 0 <= next_id < len(board.intersections)
+                else None
+            )
+            if inter is None or not getattr(inter, "occupied_tf", False):
+                return False
+            return getattr(inter, "color", None) not in player_colors
+
+    def _geometric_ring_d2_d3(start_id: int) -> Set[int]:
+        """Step 1: board-graph intersections at exact hop distance 2 or 3."""
+        ring: Set[int] = set()
+        if not (0 <= start_id < len(board.intersections)):
+            return ring
+        # BFS on topology only (road ownership checked in Step 3).
+        queue: List[Tuple[int, int]] = [(start_id, 0)]
+        seen: Set[int] = {start_id}
+        while queue:
+            node, depth = queue.pop(0)
+            if depth >= 3:
                 continue
+            for nxt in _neighbors(node):
+                if nxt in seen:
+                    continue
+                seen.add(nxt)
+                nd = depth + 1
+                if nd in (2, 3):
+                    ring.add(nxt)
+                if nd < 3:
+                    queue.append((nxt, nd))
+        return ring
 
-            start_inter = board.intersections[start_id]
-            if start_inter is None:
+    def _has_viable_path_from_start(start_id: int, target_id: int) -> bool:
+        """Step 3: >=1 path start->target of hop length 2 or 3, viable roads."""
+        stack = [(start_id, 0, {start_id})]
+        while stack:
+            current_id, depth, visited = stack.pop()
+            if depth in (2, 3) and current_id == target_id:
+                return True
+            if depth >= 3:
                 continue
-
-            stack = [(start_id, 0, {start_id})]
-
-            while stack:
-                current_id, depth, visited = stack.pop()
-
-                if depth in (2, 3) and current_id == target_id:
-                    return True
-
-                if depth >= 3:
+            for next_id in _neighbors(current_id):
+                if next_id in visited:
                     continue
-
-                current_inter = board.intersections[current_id]
-                if current_inter is None:
+                if not _road_is_empty_or_mine(current_id, next_id):
                     continue
-
-                for next_id in getattr(current_inter, "three_intersection_ids", []) or []:
-                    if not (0 <= next_id < len(board.intersections)):
-                        continue
-
-                    if next_id in visited:
-                        continue
-
-                    if next_id in getattr(board, "INTERSECTION_IN_WATER", []):
-                        continue
-
-                    if not _road_is_empty_or_mine(current_id, next_id):
-                        continue
-
-                    stack.append(
-                        (
-                            next_id,
-                            depth + 1,
-                            visited | {next_id},
-                        )
-                    )
-
+                if _intermediate_blocked_by_opponent(next_id, target_id):
+                    continue
+                stack.append((next_id, depth + 1, visited | {next_id}))
         return False
 
-    # ────────────────────────────────────────────────
-    # Optional outlook-map prefilter
-    # ────────────────────────────────────────────────
-    map_candidates: Set[int] = set()
-
-    path_map = getattr(player, "min_pathlength_map_for_targeted_TWs", None)
-    if path_map is not None:
-        for inter in getattr(board, "intersections", []) or []:
-            if inter is None:
+    # Steps 1-4 over each own S/C; End = unique set.
+    candidates: Set[int] = set()
+    for start_id in sorted(start_intersections):
+        potentials = _geometric_ring_d2_d3(int(start_id))
+        for tid in potentials:
+            if not _intersection_can_build(int(tid)):
                 continue
-
-            tw = getattr(inter, "id", None)
-            if tw is None:
+            if not _has_viable_path_from_start(int(start_id), int(tid)):
                 continue
+            candidates.add(int(tid))
 
-            try:
-                if 0 <= tw < len(path_map):
-                    d = path_map[tw]
-                    if d in (2, 3):
-                        map_candidates.add(tw)
-            except Exception:
-                pass
+    return sorted(candidates)
 
-    # If the map exists and gives candidates, use it as a prefilter.
-    # Otherwise scan all intersections.
-    if map_candidates:
-        search_space = sorted(map_candidates)
-    else:
-        search_space = [
-            inter.id
-            for inter in getattr(board, "intersections", []) or []
-            if inter is not None
-        ]
-
-    candidates: List[int] = []
-
-    for inter_id in search_space:
-        if not _intersection_can_build(inter_id):
-            continue
-
-        if not _has_valid_path_length_2_or_3(inter_id):
-            continue
-
-        candidates.append(inter_id)
-
-    return sorted(set(candidates))
 
 def update_outlook_settlement_targets(game: "Game", player_id: int):
     """

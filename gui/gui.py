@@ -3181,11 +3181,15 @@ class GUI:
         WIN.blit(name_text, (x, name_y))
        
         # Player stats
+        # E = unplayed VP development cards (new + playable), not played count
         extra_vp = 0
         for dcard in getattr(player, "dcard_summary", []) or []:
             try:
                 if dcard and str(dcard[0]) == "victory_point":
-                    extra_vp += int(dcard[3] or 0)
+                    row = list(dcard or [])
+                    while len(row) < 4:
+                        row.append(0)
+                    extra_vp += max(0, int(row[1] or 0)) + max(0, int(row[2] or 0))
             except Exception:
                 pass
         stats = [
