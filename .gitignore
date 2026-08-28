@@ -44,6 +44,7 @@ Grok_Interaction_*
 
 # Logfiles
 Catan*
+!catan_142_ways_resource_requirements.csv
 TO_*
 Sidestep_*
 Reports_*
