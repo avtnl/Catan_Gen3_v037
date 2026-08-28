@@ -19,6 +19,11 @@ saved_screenshots/
 # Test files
 tests/
 
+# Local lab scripts + agent instructions (not published)
+scripts/
+AGENTS.md
+Agents.md
+
 # Temporary files
 tmp/
 _tmp_*
