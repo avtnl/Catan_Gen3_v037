@@ -718,7 +718,19 @@ def maybe_force_board_fit(
     except Exception:
         pass
 
-    if mode == "filter_and_force_switch":
+    # WP-SYNC1: severe board/way desync after city/overshoot — always clear sticky
+    # so L2 can adopt a realizing way (n3d Blue C@51 on way 66 / way=1 flash).
+    severe_sync = any(
+        str(r).startswith("structure_surplus")
+        or str(r).startswith("holds_lr_way_no_lr")
+        or str(r).startswith("holds_la_way_no_la")
+        or str(r).startswith("vp_surplus")
+        or str(r).startswith("city_bases_short")
+        for r in (out.get("reasons") or [])
+    )
+    out["wp_sync1_severe"] = bool(severe_sync)
+    clear_sticky = mode == "filter_and_force_switch" or severe_sync
+    if clear_sticky:
         try:
             from core.strategy_sticky import clear_sticky_commitment
 
@@ -727,9 +739,23 @@ def maybe_force_board_fit(
         except Exception:
             pass
         try:
+            setattr(player, "prefer_board_sync", True)
+        except Exception:
+            pass
+        try:
             from core.strategy_explicit_recalc import note_hard_invalid
 
             note_hard_invalid(player, reason=f"board_fit:{','.join(out['reasons'][:3])}")
+        except Exception:
+            pass
+        try:
+            from core.strategy_reconsider import set_reconsider_flag
+
+            set_reconsider_flag(
+                player,
+                "need_next_target",
+                reason=f"wp_sync1:{reason}",
+            )
         except Exception:
             pass
 
@@ -774,6 +800,91 @@ def pick_best_fit_audit(
     return (list(audits)[0] if audits else None), meta
 
 
+def _way_passes_sync(result: Mapping[str, Any]) -> bool:
+    """Soft/unknown count as fit (same contract as Sidestep / portfolio)."""
+    return bool(result.get("soft") or result.get("fit"))
+
+
+def select_fit_ways(
+    game: Any,
+    player: Any,
+    *,
+    way_ids: Optional[Sequence[int]] = None,
+) -> Dict[str, Any]:
+    """Normative sync-fit set for a way-id list (or all catalog ways).
+
+    Shared by Sidestep S142 and L2 sync-first. Predicate: ``can_realize_way``;
+    give-up carve-out when no strict fits remain (buildings+VP never waived).
+    Soft/unknown → fit.
+    """
+    if way_ids is None:
+        try:
+            from core.sidestep_board_sync import all_way_ids
+
+            ids = [int(x) for x in all_way_ids()]
+        except Exception:
+            ids = list(range(1, 143))
+    else:
+        ids = [int(x) for x in way_ids]
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "n_total": len(ids),
+        "fit_way_ids": [],
+        "unfit_way_ids": [],
+        "n_fit": 0,
+        "n_unfit": 0,
+        "giveup_carve_out": False,
+        "ignored_specials": [],
+        "all_unfit": False,
+        "by_way": {},
+    }
+    if player is None:
+        out["ok"] = False
+        out["error"] = "no_player"
+        return out
+
+    strict_fit: List[int] = []
+    strict_unfit: List[int] = []
+    by_way: Dict[int, Dict[str, Any]] = {}
+    for wid in ids:
+        r = can_realize_way(wid, player, game=game, allow_ignored_specials=None)
+        by_way[wid] = dict(r)
+        if _way_passes_sync(r):
+            strict_fit.append(wid)
+        else:
+            strict_unfit.append(wid)
+
+    fit_ids = list(strict_fit)
+    unfit_ids = list(strict_unfit)
+    carve = ignored_specials_from_player(player)
+    if unfit_ids and not fit_ids and carve:
+        out["giveup_carve_out"] = True
+        out["ignored_specials"] = sorted(carve)
+        fit_ids = []
+        unfit_ids = []
+        by_way = {}
+        for wid in ids:
+            r = can_realize_way(
+                wid, player, game=game, allow_ignored_specials=carve
+            )
+            r = dict(r)
+            r["giveup_carve_out"] = True
+            by_way[wid] = r
+            if _way_passes_sync(r):
+                fit_ids.append(wid)
+            else:
+                unfit_ids.append(wid)
+
+    out["fit_way_ids"] = fit_ids
+    out["unfit_way_ids"] = unfit_ids
+    out["n_fit"] = len(fit_ids)
+    out["n_unfit"] = len(unfit_ids)
+    out["all_unfit"] = bool(unfit_ids and not fit_ids)
+    out["by_way"] = by_way
+    return out
+
+
 __all__ = [
     "MODES",
     "normalize_board_fit_mode",
@@ -789,4 +900,6 @@ __all__ = [
     "maybe_force_board_fit",
     "maybe_force_board_fit_after_specials",
     "pick_best_fit_audit",
+    "select_fit_ways",
 ]
+

@@ -601,6 +601,20 @@ def score_new_settlement_road_path(game: Any, player: Any, path: Mapping[str, An
             "reason": "; ".join(list(risk.get("reasons", []) or [])) or "path blocked",
         }
 
+    # Settlement beat-risk: EH for threats using RCARD_MEMORY_OPPONENTS belief
+    try:
+        from core.risk_assessment import enrich_settlement_race_risk_with_eh_memory
+
+        risk = enrich_settlement_race_risk_with_eh_memory(
+            game,
+            player,
+            risk,
+            target_id=int(target_id),
+            own_distance_roads=len(roads_to_build),
+        )
+    except Exception:
+        pass
+
     timing = _expected_hand_timing_bonus(game, player, target_id, roads_to_build)
     pips = _candidate_pips(game, target_id)
     port_bonus = _target_port_bonus(game, target_id)
@@ -635,14 +649,16 @@ def score_new_settlement_road_path(game: Any, player: Any, path: Mapping[str, An
     return out
 
 
-def _build_lr_claim_road_plan(
+def _collect_live_lr_claim_edges(
     game: Any,
     player: Any,
     candidates: Optional[Sequence[Mapping[str, Any]]] = None,
-) -> Dict[str, Any]:
-    """S5a: single-edge plan when that edge takes/steals LR and way wants LR."""
+    *,
+    max_check: int = 12,
+) -> List[Dict[str, Any]]:
+    """All legal 1-edge live LR claim candidates (oracle flags, unsorted)."""
     if not way_wants_longest_road(player):
-        return {}
+        return []
     legal_candidates = [dict(c) for c in list(candidates or []) if isinstance(c, Mapping)]
     edges: List[Tuple[int, int]] = []
     for c in legal_candidates:
@@ -654,12 +670,437 @@ def _build_lr_claim_road_plan(
             key = _road_key_from_any(raw)
             if key and key not in edges:
                 edges.append(key)
+    out: List[Dict[str, Any]] = []
     checked = 0
     for key in edges:
-        if checked >= 12:
+        if checked >= max_check:
             break
         checked += 1
-        if road_is_live_lr_claim_edge(game, player, key):
+        if not road_is_live_lr_claim_edge(game, player, key):
+            continue
+        steals = False
+        try:
+            from core.longest_road import evaluate_lr_claim_after_edges
+
+            ev = evaluate_lr_claim_after_edges(game, player, [key])
+            steals = bool(ev.get("steals"))
+        except Exception:
+            steals = False
+        out.append(
+            {
+                "edge": key,
+                "road": list(key),
+                "path": [list(key)],
+                "takes_now": True,
+                "steals": steals,
+                "claim_now": True,
+            }
+        )
+    return out
+
+
+def _sticky_settle_path_edges(player: Any) -> List[Tuple[int, int]]:
+    """Locked sticky settle path as **directed** network→tip steps, if any.
+
+    Ownership/legal callers should compare via ``_normalise_road_key``.
+    """
+    raw = None
+    tip_id = None
+    orient = None
+    try:
+        from core.strategy_sticky import get_sticky_commitment, orient_path_roads_network_to_tip
+
+        orient = orient_path_roads_network_to_tip
+        c = get_sticky_commitment(player)
+        if isinstance(c, Mapping):
+            raw = c.get("locked_roads_to_build") or c.get("roads_to_build")
+            tip_id = c.get("locked_rec_target_id")
+    except Exception:
+        c = getattr(player, "sticky_commitment", None)
+        if isinstance(c, Mapping):
+            raw = c.get("locked_roads_to_build") or c.get("roads_to_build")
+            tip_id = c.get("locked_rec_target_id")
+    if not raw:
+        try:
+            d = getattr(player, "strategic_direction", None)
+            if isinstance(d, Mapping):
+                raw = d.get("roads_to_build") or d.get("locked_roads_to_build")
+                if tip_id is None:
+                    tip_id = d.get("locked_rec_target_id") or d.get(
+                        "recommendation_target_id"
+                    )
+        except Exception:
+            raw = None
+    if isinstance(raw, str):
+        parsed: List[List[int]] = []
+        for part in raw.replace(";", ",").split(","):
+            part = part.strip()
+            if "-" in part and part.count("-") == 1:
+                a, b = part.split("-", 1)
+                try:
+                    parsed.append([int(a), int(b)])
+                except Exception:
+                    continue
+        raw = parsed
+    if orient is not None and raw:
+        try:
+            directed = orient(player, raw, tip_id=tip_id)
+            if directed:
+                return [tuple(e) for e in directed]  # type: ignore[misc]
+        except Exception:
+            pass
+    out: List[Tuple[int, int]] = []
+    for e in list(raw or []):
+        try:
+            a, b = int(e[0]), int(e[1])
+            if a != b:
+                out.append((a, b))
+                continue
+        except Exception:
+            pass
+        key = _road_key_from_any(e)
+        if key:
+            out.append(key)
+    return out
+
+
+def _prefer_dual_tip_road_over_branch(
+    game: Any,
+    player: Any,
+    *,
+    strategy_first: Any,
+    sticky_path: Sequence[Any],
+    settle_tid: int,
+    legal_roads: Any,
+    legal_candidates: Sequence[Mapping[str, Any]],
+    owned: Any,
+) -> Dict[str, Any]:
+    """WP-ROAD2: if optimizer dual-tip edge beats branch-away first road, use it.
+
+    Dig (White 35-34 vs 38-39; Blue 51-62 vs 51-52): refuse tip-away when a
+    legal tip-serving edge exists.
+    """
+    first = _road_key_from_any(strategy_first)
+    if not first:
+        return {}
+    path_keys = []
+    owned_ids = set(owned or set())
+    for e in list(sticky_path or []):
+        # Prefer directed step when present; road_id for ownership filter.
+        try:
+            a, b = int(e[0]), int(e[1])
+            k = (a, b) if a != b else ()
+        except Exception:
+            k = _road_key_from_any(e)
+        if k and _normalise_road_key(k) not in owned_ids:
+            path_keys.append(k)  # type: ignore[arg-type]
+    # Build LR/grow candidates from legal roads + sticky remaining
+    lr_candidates: List[Dict[str, Any]] = []
+    seen = set()  # undirected road_ids
+    for edge in path_keys:
+        eid = _normalise_road_key(edge)
+        if not eid or eid in seen:
+            continue
+        seen.add(eid)
+        lr_candidates.append(
+            {
+                "edge": edge,
+                "road": list(edge),
+                "path": [list(e) for e in path_keys[:3]],
+                "takes_now": bool(road_is_live_lr_claim_edge(game, player, edge)),
+                "steals": False,
+                "gain": 1,
+            }
+        )
+    for cand in list(legal_candidates or []):
+        if not isinstance(cand, Mapping):
+            continue
+        edge = _road_key_from_any(
+            cand.get("road") or cand.get("road_id") or cand.get("edge")
+        )
+        eid = _normalise_road_key(edge) if edge else ()
+        if not eid or eid in seen:
+            continue
+        if legal_roads and eid not in legal_roads:
+            continue
+        seen.add(eid)
+        lr_candidates.append(
+            {
+                "edge": edge,
+                "road": list(edge),
+                "path": [list(edge)],
+                "takes_now": bool(road_is_live_lr_claim_edge(game, player, edge)),
+                "steals": False,
+                "gain": 1,
+            }
+        )
+    if not lr_candidates:
+        return {}
+    try:
+        from core.road_optimizer import prepare_lr_road_decision
+
+        bag = prepare_lr_road_decision(
+            game,
+            player,
+            lr_candidates=lr_candidates,
+            sticky_path=path_keys or sticky_path,
+            roads_needed=max(1, len(path_keys) or 1),
+        )
+    except Exception:
+        return {}
+    best = bag.get("best") if isinstance(bag, Mapping) else None
+    if not isinstance(best, Mapping):
+        return {}
+    tip_edge = _road_key_from_any(best.get("next_road") or best.get("edge"))
+    reasons = list(best.get("reasons") or [])
+    dual = any(str(r).startswith("dual_purpose") for r in reasons)
+    # Prefer the sticky edge that actually hits the settle tip when strategy
+    # first is a branch-away (Dig: 43-54 vs 43-44).
+    tip_hit = None
+    for e in path_keys:
+        if int(settle_tid) in (int(e[0]), int(e[1])):
+            tip_hit = e
+            break
+    path_ids = {_normalise_road_key(e) for e in path_keys}
+    first_on_path = _normalise_road_key(first) in path_ids
+    branch_away = not first_on_path
+    chosen = None
+    if branch_away and tip_hit and (
+        not legal_roads or _normalise_road_key(tip_hit) in legal_roads
+    ):
+        chosen = tip_hit
+    elif tip_edge and tip_edge != first and (
+        not legal_roads or _normalise_road_key(tip_edge) in legal_roads
+    ):
+        tip_on_path = _normalise_road_key(tip_edge) in path_ids
+        if dual or tip_on_path:
+            if (
+                first_on_path
+                and tip_on_path
+                and path_keys
+                and _normalise_road_key(first) == _normalise_road_key(path_keys[0])
+            ):
+                chosen = None  # already on sticky tip order
+            elif first_on_path and not dual:
+                chosen = None
+            else:
+                chosen = tip_edge
+    if not chosen:
+        return {}
+    rem = [chosen] + [e for e in path_keys if e != chosen]
+    ranked = list(bag.get("ranked") or [])[:3]
+    return {
+        "kind": "new_settlement",
+        "roads_to_build": rem,
+        "next_road": chosen,
+        "route_all_roads": rem,
+        "target_settlement_id": int(settle_tid),
+        "route_source": "road_optimizer_wp_road2_dual_tip",
+        "strategy_reason": "wp_road2:" + (",".join(reasons) if reasons else "dual_tip"),
+        "target_label": f"S@{settle_tid}",
+        "blocked": False,
+        "optimizer_reasons": reasons,
+        "road_candidates_top3": ranked,
+        "takes_now": bool(best.get("takes_now")),
+    }
+
+
+def _optimize_lr_priority_plan(
+    game: Any,
+    player: Any,
+    *,
+    claim_edges: Sequence[Mapping[str, Any]],
+    legal_roads: Any,
+    owned: Any,
+) -> Dict[str, Any]:
+    """When LR has priority: prepare_lr_road_decision (claimability + tips + rank)."""
+    sticky_edges = _sticky_settle_path_edges(player)
+    owned_ids = set(owned or set())
+    sticky_remaining = [
+        e for e in sticky_edges if _normalise_road_key(e) not in owned_ids
+    ]
+    lr_candidates: List[Dict[str, Any]] = [dict(c) for c in claim_edges]
+
+    # Sticky first remaining edge as dual-purpose grow/claim candidate
+    if sticky_remaining:
+        first = sticky_remaining[0]
+        first_id = _normalise_road_key(first)
+        if not legal_roads or first_id in legal_roads:
+            takes = bool(road_is_live_lr_claim_edge(game, player, first))
+            gain = 0
+            steals = False
+            try:
+                from core.longest_road import evaluate_lr_claim_after_edges
+
+                ev = evaluate_lr_claim_after_edges(game, player, [first])
+                takes = takes or bool(ev.get("takes_now"))
+                steals = bool(ev.get("steals"))
+                try:
+                    from core.ai_lr_project import compute_lr_snapshot
+
+                    snap = compute_lr_snapshot(game, player)
+                    gain = int(ev.get("length_after") or 0) - int(snap.get("own_length") or 0)
+                except Exception:
+                    gain = 1 if not takes else 0
+            except Exception:
+                gain = 1 if not takes else 0
+            # Always offer sticky tip edge so optimizer can anticipate
+            lr_candidates.append(
+                {
+                    "edge": first,
+                    "road": list(first),
+                    "path": [list(e) for e in sticky_remaining[:3]],
+                    "takes_now": takes,
+                    "steals": steals,
+                    "gain": max(0, gain),
+                    "claim_now": takes,
+                }
+            )
+
+    if not lr_candidates:
+        return {}
+
+    try:
+        from core.road_optimizer import prepare_lr_road_decision
+
+        bag = prepare_lr_road_decision(
+            game,
+            player,
+            lr_candidates=lr_candidates,
+            sticky_path=sticky_remaining or sticky_edges,
+            roads_needed=max(1, len(sticky_remaining) or 1),
+        )
+    except Exception:
+        return {}
+
+    best = bag.get("best") if isinstance(bag, Mapping) else None
+    if not isinstance(best, Mapping):
+        return {}
+    next_road = _road_key_from_any(best.get("next_road") or best.get("edge"))
+    if not next_road:
+        return {}
+    if legal_roads and _normalise_road_key(next_road) not in legal_roads:
+        return {}
+
+    reasons = list(best.get("reasons") or [])
+    claim_reasons = list((bag.get("claimability") or {}).get("reasons") or [])
+    dual = any(str(r).startswith("dual_purpose") for r in reasons)
+    takes = bool(best.get("takes_now"))
+    path = best.get("path") or [list(next_road)]
+    ranked = list(bag.get("ranked") or [])[:3]
+    return {
+        "kind": "lr_claim" if takes else "lr_grow",
+        "roads_to_build": [tuple(p) if isinstance(p, (list, tuple)) else next_road for p in path]
+        if isinstance(path, list)
+        else [next_road],
+        "next_road": next_road,
+        "route_source": (
+            "road_optimizer_lr_dual" if dual else "road_optimizer_lr_priority"
+        ),
+        "strategy_reason": (
+            "road_optimizer: "
+            + (",".join(reasons) if reasons else "lr_priority")
+        ),
+        "target_label": (
+            f"LR+S{best.get('tip_id')}" if best.get("tip_id") is not None else "LR priority"
+        ),
+        "blocked": False,
+        "optimizer_reasons": reasons,
+        "claimability_reasons": claim_reasons,
+        "takes_now": takes,
+        "steals": bool(best.get("steals")),
+        "road_candidates_top3": ranked,
+    }
+
+
+def _build_lr_claim_road_plan(
+    game: Any,
+    player: Any,
+    candidates: Optional[Sequence[Mapping[str, Any]]] = None,
+    *,
+    legal_roads: Any = None,
+    owned: Any = None,
+) -> Dict[str, Any]:
+    """S5a: LR-priority road — optimizer ranks claim + dual-purpose sticky tips.
+
+    Arms when LR has priority: live 1-edge claim and/or stored/fresh LR claim
+    project (``takes_now`` / ``claim_now``). Sticky settle edges are offered as
+    dual-purpose alternatives.
+    """
+    claim_edges = _collect_live_lr_claim_edges(game, player, candidates)
+
+    # Also pull LR project head edge when engine says claim-now (multi-edge).
+    try:
+        from core.ai_lr_project import (
+            build_lr_project,
+            get_stored_lr_project,
+            remaining_lr_project_roads,
+        )
+
+        stored = get_stored_lr_project(player, game)
+        rem = remaining_lr_project_roads(game, player) if stored else []
+        proj = stored
+        if not rem:
+            proj = build_lr_project(game, player, candidates)
+            if proj:
+                rem = [
+                    _road_key_from_any(r)
+                    for r in list(proj.get("roads_to_build") or [])
+                ]
+                rem = [r for r in rem if r]
+        takes_proj = bool(
+            isinstance(proj, Mapping)
+            and (proj.get("takes_now") or str(proj.get("kind") or "") == "lr_claim")
+        )
+        if takes_proj and rem:
+            head = rem[0]
+            already = {
+                _road_key_from_any(c.get("edge") or c.get("road")) for c in claim_edges
+            }
+            if head and head not in already:
+                claim_edges.append(
+                    {
+                        "edge": head,
+                        "road": list(head),
+                        "path": [list(e) for e in rem[:3]],
+                        "takes_now": bool(proj.get("takes_now")),
+                        "steals": bool(proj.get("steals")),
+                        "claim_now": True,
+                        "gain": proj.get("length_gain"),
+                    }
+                )
+    except Exception:
+        pass
+
+    if not claim_edges:
+        return {}
+
+    owned_keys = owned if owned is not None else player_owned_road_keys(game, player)
+    opt = _optimize_lr_priority_plan(
+        game,
+        player,
+        claim_edges=claim_edges,
+        legal_roads=legal_roads if legal_roads is not None else candidate_road_set(
+            [dict(c) for c in list(candidates or []) if isinstance(c, Mapping)]
+        ),
+        owned=owned_keys,
+    )
+    if opt:
+        # Normalize roads_to_build to road keys
+        roads = []
+        for r in list(opt.get("roads_to_build") or []):
+            key = _road_key_from_any(r)
+            if key:
+                roads.append(key)
+        if roads:
+            opt["roads_to_build"] = roads
+            opt["next_road"] = roads[0]
+        return opt
+
+    # Fallback: first live claim edge (legacy S5a)
+    if claim_edges:
+        key = _road_key_from_any(claim_edges[0].get("edge") or claim_edges[0].get("road"))
+        if key:
             return {
                 "kind": "lr_claim",
                 "roads_to_build": [key],
@@ -670,6 +1111,71 @@ def _build_lr_claim_road_plan(
                 "blocked": False,
             }
     return {}
+
+
+def _alt_race_road_plan_if_urgent(
+    game: Any,
+    player: Any,
+    legal_candidates: Sequence[Mapping[str, Any]],
+    legal_roads: Any,
+    *,
+    exclude_tid: Optional[int] = None,
+) -> Dict[str, Any]:
+    """If another M/H race needs a road, return that plan (postpone calm settle).
+
+    Used when the sticky settle is already connected / low-urgency: building a
+    road is justified only by urgency elsewhere (real race), not by inventing
+    detours to the settle-ready site.
+    """
+    try:
+        from core.strategy_race_ba import race_ba_focus
+    except Exception:
+        return {}
+    try:
+        focus = race_ba_focus(game, player)
+    except Exception:
+        return {}
+    if not isinstance(focus, Mapping) or not focus.get("apply"):
+        return {}
+    if str(focus.get("focus") or "").lower() != "road":
+        return {}
+    next_road = _road_key_from_any(focus.get("next_road"))
+    if not next_road:
+        return {}
+    alt_tid = _as_int(focus.get("target_id"))
+    if exclude_tid is not None and alt_tid is not None and int(alt_tid) == int(exclude_tid):
+        return {}
+    if legal_roads and next_road not in legal_roads:
+        return {}
+    return {
+        "kind": "new_settlement",
+        "target_settlement_id": alt_tid,
+        "roads_to_build": [list(next_road)],
+        "next_road": list(next_road),
+        "route_source": "alt_race_urgent_road",
+        "strategy_reason": str(focus.get("reason") or "alt_race"),
+        "target_label": (
+            f"alt_race@{alt_tid}" if alt_tid is not None else "alt_race"
+        ),
+        "dig_note": str(focus.get("dig_note") or ""),
+    }
+
+
+def _store_last_road_plan(game: Any, player: Any, plan: Mapping[str, Any]) -> None:
+    """WP-DIG2: persist last road plan (incl. top-3) for CS Dig fields."""
+    if not isinstance(plan, Mapping) or not plan:
+        return
+    try:
+        if player is not None:
+            setattr(player, "last_road_plan", dict(plan))
+            setattr(player, "last_ai_road_plan", dict(plan))
+    except Exception:
+        pass
+    try:
+        if game is not None:
+            setattr(game, "last_ai_road_plan", dict(plan))
+    except Exception:
+        pass
 
 
 def build_ai_road_plan(
@@ -690,6 +1196,9 @@ def build_ai_road_plan(
       4. Fresh multi-edge LR project (grow/claim)
       5. Empty
 
+    Settle-ready sticky site (already connected): never invent detours to it.
+    A road is allowed then only if another M/H race urgently needs one.
+
     ``commit_project=False``: plan only (no sticky/project store). Used by
     ``road_allowed_for_ai`` so a guard probe cannot arm a random grow path.
     """
@@ -700,8 +1209,14 @@ def build_ai_road_plan(
     legal_roads = candidate_road_set(legal_candidates)
     owned = player_owned_road_keys(game, player)
 
-    # --- 1) Live 1-edge LR claim ---
-    lr_claim = _build_lr_claim_road_plan(game, player, legal_candidates)
+    # --- 1) LR priority (live claim + road_optimizer dual-purpose) ---
+    lr_claim = _build_lr_claim_road_plan(
+        game,
+        player,
+        legal_candidates,
+        legal_roads=legal_roads,
+        owned=owned,
+    )
     if lr_claim:
         if commit_project:
             try:
@@ -712,22 +1227,32 @@ def build_ai_road_plan(
                     or (list(lr_claim.get("roads_to_build") or [None])[0])
                 )
                 if nr:
+                    takes = bool(lr_claim.get("takes_now", True))
+                    roads_store = []
+                    for r in list(lr_claim.get("roads_to_build") or [nr]):
+                        key = _road_key_from_any(r)
+                        if key:
+                            roads_store.append(list(key))
+                    if not roads_store:
+                        roads_store = [list(nr)]
                     store_lr_project(
                         game,
                         player,
                         {
-                            "kind": "lr_claim",
-                            "roads_to_build": [list(nr)],
+                            "kind": "lr_claim" if takes else "lr_grow",
+                            "roads_to_build": roads_store,
                             "next_road": list(nr),
-                            "claim_after_n": 1,
-                            "takes_now": True,
+                            "claim_after_n": 1 if takes else max(1, len(roads_store)),
+                            "takes_now": takes,
+                            "steals": bool(lr_claim.get("steals")),
                             "route_source": lr_claim.get("route_source"),
                             "strategy_reason": lr_claim.get("strategy_reason"),
-                            "target_label": "LR claim",
+                            "target_label": lr_claim.get("target_label") or "LR priority",
                         },
                     )
             except Exception:
                 pass
+        _store_last_road_plan(game, player, lr_claim)
         return lr_claim
 
     # --- 2) Stored LR project remaining edges ---
@@ -741,7 +1266,7 @@ def build_ai_road_plan(
         remaining_lr = remaining_lr_project_roads(game, player)
         if remaining_lr:
             first = remaining_lr[0]
-            if not legal_roads or first in legal_roads:
+            if not legal_roads or _normalise_road_key(first) in legal_roads:
                 stored = get_stored_lr_project(player, game)
                 plan = lr_project_to_road_plan(
                     dict(stored)
@@ -762,32 +1287,172 @@ def build_ai_road_plan(
     if strategy_plan:
         target_id = _as_int(strategy_plan.get("target_settlement_id"))
         if target_id is not None and future_settlement_target_is_open(game, player, target_id):
+            # R10T3 policy: if sticky settle is **already connected** (settle-ready),
+            # do **not** invent alternate multi-road detours (e.g. 19-20-21 port
+            # path toward S32). That is not urgency — S@32 should be preferred
+            # unless something else is urgent.
+            #
+            # Exception: another portfolio target is still a real M/H **race**
+            # that needs a road — then building that race road is fine and the
+            # calm settle-ready site may be postponed. Only urgency elsewhere
+            # justifies skipping an affordable connected settle.
+            settle_ready = False
+            try:
+                from core.outlook_logic import next_settlement_spots
+
+                pid = int(getattr(player, "id"))
+                settle_ready = int(target_id) in set(next_settlement_spots(game, pid) or [])
+            except Exception:
+                settle_ready = False
+
+            if settle_ready:
+                alt_plan = _alt_race_road_plan_if_urgent(
+                    game, player, legal_candidates, legal_roads, exclude_tid=int(target_id)
+                )
+                if alt_plan:
+                    return alt_plan
+                return {}
+
             # First honour sticky/strategy route.
-            raw_roads = [_road_key_from_any(r) for r in list(strategy_plan.get("roads_to_build", []) or [])]
-            raw_roads = [r for r in raw_roads if r]
+            # Path steps stay directed network→tip ([15,14] not tip-first [13,14]);
+            # legal/owned membership uses undirected road_id via _normalise_road_key.
+            try:
+                from core.strategy_sticky import (
+                    orient_path_roads_network_to_tip,
+                    remaining_roads_for_player,
+                )
+
+                raw_roads = orient_path_roads_network_to_tip(
+                    player,
+                    strategy_plan.get("roads_to_build", []) or [],
+                    tip_id=int(target_id),
+                )
+                roads_to_build = remaining_roads_for_player(
+                    player,
+                    strategy_plan.get("roads_to_build", []) or [],
+                    tip_id=int(target_id),
+                )
+            except Exception:
+                raw_roads = [
+                    list(r)
+                    for r in (
+                        _road_key_from_any(x)
+                        for x in list(strategy_plan.get("roads_to_build", []) or [])
+                    )
+                    if r
+                ]
+                roads_to_build = [
+                    r for r in raw_roads if _normalise_road_key(r) not in owned
+                ]
             if raw_roads:
-                roads_to_build = [r for r in raw_roads if r not in owned]
                 if roads_to_build and len(roads_to_build) <= MAX_AI_SETTLEMENT_ROAD_DISTANCE:
                     first_road = roads_to_build[0]
+                    first_id = _normalise_road_key(first_road)
                     if (
-                        (not legal_roads or first_road in legal_roads)
-                        and route_path_is_clear_for_player(game, player, raw_roads, target_id)
+                        (not legal_roads or first_id in legal_roads)
+                        and route_path_is_clear_for_player(
+                            game, player, raw_roads, target_id
+                        )
                     ):
+                        # WP-ROAD2: prefer dual-purpose tip edge over branch-away
+                        dual = _prefer_dual_tip_road_over_branch(
+                            game,
+                            player,
+                            strategy_first=first_road,
+                            sticky_path=raw_roads,
+                            settle_tid=int(target_id),
+                            legal_roads=legal_roads,
+                            legal_candidates=legal_candidates,
+                            owned=owned,
+                        )
+                        if dual:
+                            _store_last_road_plan(game, player, dual)
+                            return dual
                         scored = score_new_settlement_road_path(
                             game,
                             player,
                             dict(strategy_plan)
                             | {
-                                "route_all_roads": raw_roads,
-                                "roads_to_build": roads_to_build,
-                                "next_road": first_road,
+                                "route_all_roads": [list(r) for r in raw_roads],
+                                "roads_to_build": [list(r) for r in roads_to_build],
+                                "next_road": list(first_road),
                                 "route_source": "s5a_sticky_or_strategy_path",
                             },
                         )
                         if not scored.get("blocked"):
+                            _store_last_road_plan(game, player, scored)
                             return scored
+                elif not roads_to_build:
+                    # Sticky path fully owned but next_settlement_spots missed —
+                    # still refuse alternate discovery toward this settle; allow
+                    # only an urgent alt race road (same policy as settle_ready).
+                    alt_plan = _alt_race_road_plan_if_urgent(
+                        game, player, legal_candidates, legal_roads, exclude_tid=int(target_id)
+                    )
+                    if alt_plan:
+                        return alt_plan
+                    return {}
 
             # If strategy only supplies the settlement target, discover short paths.
+            # WP-R4: prefer fresh reachability path_map before outlook BFS.
+            try:
+                from core.constants import REACHABILITY_MAPS
+                from core.player_reachability import (
+                    SENTINEL,
+                    ensure_reachability_maps,
+                    maps_are_fresh,
+                    path_to_target,
+                    remaining_roads_to_target,
+                )
+                from core.strategy_sticky import (
+                    orient_path_roads_network_to_tip,
+                    remaining_roads_for_player,
+                )
+
+                if bool(REACHABILITY_MAPS):
+                    ensure_reachability_maps(game, player)
+                if maps_are_fresh(player):
+                    rem = remaining_roads_to_target(player, int(target_id))
+                    raw_map = path_to_target(player, int(target_id))
+                    map_roads = orient_path_roads_network_to_tip(
+                        player, raw_map or [], tip_id=int(target_id)
+                    )
+                    to_build = remaining_roads_for_player(
+                        player, raw_map or [], tip_id=int(target_id)
+                    )
+                    if (
+                        map_roads
+                        and to_build
+                        and 1 <= int(rem) < SENTINEL
+                        and len(to_build) <= MAX_AI_SETTLEMENT_ROAD_DISTANCE
+                        and route_path_is_clear_for_player(
+                            game, player, map_roads, int(target_id)
+                        )
+                    ):
+                        first_road = to_build[0]
+                        first_id = _normalise_road_key(first_road)
+                        if not legal_roads or first_id in legal_roads:
+                            scored_map = score_new_settlement_road_path(
+                                game,
+                                player,
+                                {
+                                    "target_settlement_id": int(target_id),
+                                    "route_all_roads": [list(r) for r in map_roads],
+                                    "roads_to_build": [list(r) for r in to_build],
+                                    "next_road": list(first_road),
+                                    "roads_remaining": len(to_build),
+                                    "distance": len(map_roads),
+                                    "route_source": "player_reachability.path_map",
+                                },
+                            )
+                            if not scored_map.get("blocked") and scored_map.get(
+                                "roads_to_build"
+                            ):
+                                _store_last_road_plan(game, player, scored_map)
+                                return scored_map
+            except Exception:
+                pass
+
             paths = find_reachable_new_settlement_paths(
                 game,
                 player,
@@ -823,7 +1488,9 @@ def build_ai_road_plan(
                 project.get("next_road")
                 or (list(project.get("roads_to_build") or [None])[0])
             )
-            if first and (not legal_roads or first in legal_roads):
+            if first and (
+                not legal_roads or _normalise_road_key(first) in legal_roads
+            ):
                 plan = lr_project_to_road_plan(project)
                 if plan:
                     if commit_project:

@@ -256,6 +256,17 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Phase C2 WP-R6: free-form arm label stored on batch_summary / result.json",
     )
     p.add_argument(
+        "--perf",
+        type=str,
+        default=None,
+        metavar="on|off",
+        help=(
+            "Batch performance dig pack: on = lean (shadow/MGLOG/probes/snapshot/screen off); "
+            "off = full digs (transparency). Orthogonal to --arm seat map. "
+            "Also: --arm control+perf or --arm perf. Dual-run for wall vs digs."
+        ),
+    )
+    p.add_argument(
         "--la-soft-bias",
         type=str,
         default=None,
@@ -315,6 +326,11 @@ def _print_batch_summary(summary: Dict[str, Any]) -> None:
         if arm.get("explicit_142_recalc_by_seat"):
             console.info(
                 f"  explicit_recalc  = {arm.get('explicit_142_recalc_by_seat')}"
+            )
+        if summary.get("perf_mode") or arm.get("perf_mode"):
+            console.info(
+                f"  perf_mode        = "
+                f"{summary.get('perf_mode') or arm.get('perf_mode')}"
             )
         if summary.get("dice_from_batch") or arm.get("dice_from_batch"):
             console.info(
@@ -428,15 +444,28 @@ def main(argv: Optional[List[str]] = None) -> int:
             seed=seed,
             seed_base=seed_base,
             arm_name=args.arm_name,
+            perf=args.perf,
         )
         for err in arm_config.get("errors") or []:
             console.warn(f"arm config: {err}")
-        if arm_config.get("arm_name") or tokens or args.arm:
+        if arm_config.get("arm_name") or tokens or args.arm or args.perf:
             console.info(f"  arm_name         = {arm_config.get('arm_name')}")
             console.info(
                 f"  explicit_recalc  = {arm_config.get('explicit_142_recalc_by_seat')}"
             )
             console.info(f"  arm_source       = {arm_config.get('source')}")
+            if arm_config.get("perf_mode"):
+                console.info(f"  perf_mode        = {arm_config.get('perf_mode')}")
+        # Apply dig pack once for this process (before games start)
+        if arm_config.get("perf_mode"):
+            from core.batch.perf_mode import apply_perf_mode_to_constants
+
+            applied = apply_perf_mode_to_constants(arm_config.get("perf_mode"))
+            arm_config["perf_applied"] = {
+                k: applied[k]
+                for k in ("perf_mode", "L2_SHADOW_MISS", "MGLOG", "PLAN_SNAPSHOT", "L2_TARGET_SCREEN", "LOG_WAY_COMPARE")
+                if k in applied
+            }
     except Exception as exc:
         console.warn(f"arm config failed: {exc}")
         arm_config = {}
@@ -444,7 +473,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     seat_map = arm_config.get("seat_map") if arm_config else None
     # Only pass seat map when CLI/arm actually set something (else constants apply)
     pass_seat_map = None
-    if args.arm or args.explicit_recalc or args.arm_name:
+    if args.arm or args.explicit_recalc or args.arm_name or args.perf:
         pass_seat_map = seat_map or arm_config.get("explicit_142_recalc_by_seat")
     arm_name = arm_config.get("arm_name") if arm_config else None
     la_soft_bias = str(args.la_soft_bias).strip() if args.la_soft_bias else None
@@ -521,6 +550,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "explicit_142_recalc_by_seat": pass_seat_map,
         "arm_name": arm_name,
         "la_soft_bias": la_soft_bias,
+        "perf_mode": arm_config.get("perf_mode") if arm_config else None,
+        "sidestep_s142_drive": bool(arm_config.get("sidestep_s142_drive"))
+        if arm_config and arm_config.get("sidestep_s142_drive")
+        else None,
         **shared_kwargs,
     }
     console.info(

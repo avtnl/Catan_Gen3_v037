@@ -100,13 +100,22 @@ def min_roads_to_place_n_settlements(
         out["roads_needed"] = 0
         return out
 
-    # Distance + path from current network (legal BFS)
+    # Distance + path from current network (maps → outlook → BFS)
     try:
         from core.risk_assessment import _min_empty_roads_to_reach
         from core.outlook_logic import find_reachable_new_settlement_paths
     except Exception:
         out["ok"] = False
         return out
+
+    try:
+        from core.constants import REACHABILITY_MAPS
+        from core.player_reachability import ensure_reachability_maps
+
+        if bool(REACHABILITY_MAPS):
+            ensure_reachability_maps(game, player)
+    except Exception:
+        pass
 
     # Expandable virtual network: start from owned S/C
     owned: Set[int] = set()
@@ -131,42 +140,80 @@ def min_roads_to_place_n_settlements(
         best_dist: Optional[int] = None
         best_path: List[Edge] = []
 
-        # Prefer outlook paths (carry explicit road lists); fall back to BFS dist
-        try:
-            path_rows = find_reachable_new_settlement_paths(
-                game,
-                player,
-                target_ids=list(remaining_pool),
-                max_distance=max_distance,
-            )
-        except Exception:
-            path_rows = []
-
         by_tid: Dict[int, Dict[str, Any]] = {}
-        for row in path_rows or []:
-            if not isinstance(row, Mapping):
-                continue
-            tid = _safe_int(
-                row.get("target_settlement_id")
-                or row.get("intersection_id")
-                or row.get("target_id"),
-                None,
-            )
-            if tid is None or tid not in remaining_pool:
-                continue
-            dist = _safe_int(row.get("roads_remaining", row.get("distance")), None)
-            roads = []
-            for raw in list(row.get("roads_to_build") or []):
-                e = _norm_edge(raw)
-                if e:
-                    roads.append(e)
-            if dist is None:
-                dist = len(roads) if roads else None
-            if dist is None:
-                continue
-            prev = by_tid.get(int(tid))
-            if prev is None or int(dist) < int(prev.get("dist") or 99):
-                by_tid[int(tid)] = {"dist": int(dist), "roads": roads}
+
+        # First pick: prefer per-player reachability maps (independent tips; no
+        # multi-target BFS stop-at-nearer quirk). Later picks need virtual
+        # expansion past chosen sites — maps alone are insufficient then.
+        if not chosen:
+            try:
+                from core.constants import REACHABILITY_MAPS
+                from core.player_reachability import (
+                    SENTINEL,
+                    maps_are_fresh,
+                    path_to_target,
+                    remaining_roads_to_target,
+                )
+
+                if bool(REACHABILITY_MAPS) and maps_are_fresh(player):
+                    for tid in list(remaining_pool):
+                        rd = remaining_roads_to_target(player, int(tid))
+                        if rd is None or int(rd) >= SENTINEL or int(rd) < 1:
+                            continue
+                        if int(rd) > max_distance:
+                            continue
+                        roads: List[Edge] = []
+                        for raw in path_to_target(player, int(tid)):
+                            e = _norm_edge(raw)
+                            if e:
+                                roads.append(e)
+                        by_tid[int(tid)] = {
+                            "dist": int(rd),
+                            "roads": roads,
+                            "source": "reachability_map",
+                        }
+            except Exception:
+                pass
+
+        missing = [t for t in remaining_pool if int(t) not in by_tid]
+        if missing:
+            try:
+                path_rows = find_reachable_new_settlement_paths(
+                    game,
+                    player,
+                    target_ids=list(missing),
+                    max_distance=max_distance,
+                )
+            except Exception:
+                path_rows = []
+            for row in path_rows or []:
+                if not isinstance(row, Mapping):
+                    continue
+                tid = _safe_int(
+                    row.get("target_settlement_id")
+                    or row.get("intersection_id")
+                    or row.get("target_id"),
+                    None,
+                )
+                if tid is None or tid not in remaining_pool:
+                    continue
+                dist = _safe_int(row.get("roads_remaining", row.get("distance")), None)
+                roads = []
+                for raw in list(row.get("roads_to_build") or []):
+                    e = _norm_edge(raw)
+                    if e:
+                        roads.append(e)
+                if dist is None:
+                    dist = len(roads) if roads else None
+                if dist is None:
+                    continue
+                prev = by_tid.get(int(tid))
+                if prev is None or int(dist) < int(prev.get("dist") or 99):
+                    by_tid[int(tid)] = {
+                        "dist": int(dist),
+                        "roads": roads,
+                        "source": str(row.get("route_source") or "outlook"),
+                    }
 
         for tid in list(remaining_pool):
             if tid in by_tid:

@@ -1,10 +1,13 @@
 """Phase C2 WP-R0: per-seat explicit Victory-Way / L2 reassess trigger codes.
 
 Product default (new games):
-  - AI seats: ``[2, [4, 4]]`` (ETA setback OR every 4 own turns)
-  - Human seats: ``[0]`` (sticky only; closed-table L2 still applies)
+  - AI + human seats: ``[0]`` — no explicit extra L2; closed-table **a/b/c**
+    gates only (need_next_target / board shocks / LA-LR / …), same lean posture
+    as S142 triggers default-off.
+  - Opt-in schedule ``[2, [4, 4]]`` (setback OR every 4 own turns) via
+    ``--arm product`` / ``setback_every4`` / ``EXPLICIT_142_RECALC_SCHEDULE_SETBACK_EVERY4``.
 
-Lab sticky baseline: ``run_headless --arm control`` (all seats ``[0]``).
+Lab sticky / a/b/c baseline: ``run_headless --arm control`` (all seats ``[0]``).
 CLI ``--explicit-recalc`` / ``--arm`` override by seat id.
 
 Codes
@@ -20,8 +23,8 @@ Codes
 
 9  reserved (every_own_turn) — not implemented
 
-Product AI default remains ``[2, [4, 4]]`` (6/7 opt-in via arm).
-Multi-entry lists are OR'd. See docs/PhaseC2_way_reassess_experiment_plan.md.
+Multi-entry lists are OR'd. See docs/PhaseC2_way_reassess_experiment_plan.md
+and docs/L2_sync_transparency_shadow_plan.md Phase G (a/b/c L2 cadence).
 """
 
 from __future__ import annotations
@@ -72,7 +75,7 @@ EXPLICIT_L2_CODE7_MAX_PER_GAME: int = 4
 EXPLICIT_L2_WP3_MAX_PER_GAME: int = 6  # combined 6+7 fires per seat per game
 EXPLICIT_L2_WP3_ONCE_PER_OWN_TURN: bool = True
 
-# Lab arm template (not product default): setback + every-4 + threat + LR tooling
+# Lab arm template: setback + every-4 + threat + LR tooling
 EXPLICIT_142_RECALC_LAB_WP3: List[Any] = [2, [4, 4], 6, 7]
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
@@ -87,20 +90,23 @@ EXPLICIT_RECALC_MILESTONE_VPS: Tuple[int, ...] = (2, 4, 6, 8)
 """VP values that fire code 5 on first crossing."""
 
 EXPLICIT_RECALC_DEFAULT_RAW: List[Any] = [0]
-"""Player field default before Game apply (also human product / sticky control)."""
+"""Player field default before Game apply (also product / sticky control)."""
 
-EXPLICIT_142_RECALC_PRODUCT_AI: List[Any] = [2, [4, 4]]
-"""AI product policy: setback + every 4 own turns."""
+EXPLICIT_142_RECALC_PRODUCT_AI: List[Any] = [0]
+"""AI product policy: none — closed-table a/b/c L2 only."""
 
 EXPLICIT_142_RECALC_PRODUCT_HUMAN: List[Any] = [0]
 """Human product policy: no explicit extra L2."""
 
+EXPLICIT_142_RECALC_SCHEDULE_SETBACK_EVERY4: List[Any] = [2, [4, 4]]
+"""Opt-in: setback + every 4 own turns (former product AI default)."""
+
 # All-AI template (docs / fallback). Live init prefers is_human helpers.
 EXPLICIT_142_RECALC_BY_SEAT: Dict[int, List[Any]] = {
-    1: [2, [4, 4]],
-    2: [2, [4, 4]],
-    3: [2, [4, 4]],
-    4: [2, [4, 4]],
+    1: [0],
+    2: [0],
+    3: [0],
+    4: [0],
 }
 
 # Way pick: product sticky; lab can set constants.EXPLICIT_WAY_PICK = "best"
@@ -316,7 +322,7 @@ def _product_human_raw() -> List[Any]:
 
 
 def product_raw_for_player(player: Any) -> List[Any]:
-    """Product policy for one seat: AI ``[2,[4,4]]``, human ``[0]``."""
+    """Product policy for one seat: AI and human default ``[0]`` (a/b/c L2 only)."""
     if bool(getattr(player, "is_human", False)):
         return _product_human_raw()
     return _product_ai_raw()
@@ -393,6 +399,7 @@ __all__ = [
     "EXPLICIT_RECALC_DEFAULT_RAW",
     "EXPLICIT_142_RECALC_PRODUCT_AI",
     "EXPLICIT_142_RECALC_PRODUCT_HUMAN",
+    "EXPLICIT_142_RECALC_SCHEDULE_SETBACK_EVERY4",
     "EXPLICIT_142_RECALC_BY_SEAT",
     "EXPLICIT_WAY_PICK_BEST",
     "EXPLICIT_WAY_PICK_STICKY",

@@ -316,6 +316,23 @@ def build_compare_from_l2(
         locked = _safe_int(
             abstract.get("preferred_way_id") or abstract.get("way_id"), None
         )
+    # After sticky clear / LA-only: prefer previous commitment way as locked baseline
+    if locked is None:
+        prev_c = getattr(player, "_prev_sticky_for_switch", None) or getattr(
+            player, "prev_sticky_commitment", None
+        )
+        if isinstance(prev_c, Mapping):
+            locked = _safe_int(prev_c.get("locked_way_id"), None)
+    # If best == locked, expose true #2 as alt when available (honest Dig gain)
+    if (
+        locked is not None
+        and best_w is not None
+        and int(locked) == int(best_w)
+        and len(list(audits or [])) >= 2
+    ):
+        alt2 = audit_way_id(audits[1])
+        if alt2 is not None and int(alt2) != int(best_w):
+            best_w = alt2
 
     # After sticky commit, locked may already be best — use sticky switch meta
     prev_locked = None

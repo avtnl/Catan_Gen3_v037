@@ -266,22 +266,39 @@ def _canon_seat_color(color: Any) -> str:
     return ""
 
 
-def radius_for_show(turn_color: Any, owner_color: Any) -> int:
+def radius_for_show(
+    turn_color: Any,
+    owner_color: Any,
+    *,
+    path_distance: Any = None,
+) -> int:
     """v4 P0e: Show circle radius from turn×owner matrix (ignore CS baked radii).
 
     Port black-dot base = 5; own seat ring = 8; next seats +4 (12/16/20).
+
+    WP-R5: optional ``path_distance`` (empty-road / hop dist) soft-modulates the
+    seat matrix — d=3 rings are +2px vs d=2 — without changing the seat ladder.
+    Road path overlays remain **future** (Show draws circles only).
     """
     turn = _canon_seat_color(turn_color)
     owner = _canon_seat_color(owner_color)
+    base = int(PORT_DOT_RADIUS)
     if turn and owner:
         row = SHOW_RADIUS_MATRIX.get(turn) or {}
         if owner in row:
-            return int(row[owner])
-    if owner:
-        return int(PLAYER_RADIUS_BY_COLOR.get(owner, SHOW_RING_OWN))
-    if turn:
-        return int(SHOW_RING_OWN)
-    return int(PORT_DOT_RADIUS)
+            base = int(row[owner])
+        elif owner:
+            base = int(PLAYER_RADIUS_BY_COLOR.get(owner, SHOW_RING_OWN))
+    elif owner:
+        base = int(PLAYER_RADIUS_BY_COLOR.get(owner, SHOW_RING_OWN))
+    elif turn:
+        base = int(SHOW_RING_OWN)
+
+    # Soft dist→radius (optional): only when caller passes a usable hop/empty dist
+    d = _safe_int(path_distance, None)
+    if d is not None and int(d) == 3:
+        return int(base) + 2
+    return int(base)
 
 
 def radius_for_player_color(color: Any) -> int:
@@ -716,6 +733,16 @@ def _merge_geometry_settles_for_pln2(
     except Exception:
         target_ids = []
 
+    # WP-R3: prefer fresh reachability maps (never hard-exclude candidacy)
+    try:
+        from core.constants import REACHABILITY_MAPS
+        from core.player_reachability import ensure_reachability_maps
+
+        if bool(REACHABILITY_MAPS):
+            ensure_reachability_maps(game, player)
+    except Exception:
+        pass
+
     try:
         paths = list(
             find_reachable_new_settlement_paths(
@@ -727,6 +754,66 @@ def _merge_geometry_settles_for_pln2(
         paths = []
 
     best: Dict[int, Dict[str, Any]] = {}
+    # Map-first hop hints: pathlength from own S/C only (PLN2 ∈{2,3} is from
+    # buildings, not road-network tips).
+    try:
+        from core.constants import REACHABILITY_MAPS
+        from core.player_reachability import SENTINEL, maps_are_fresh
+
+        if bool(REACHABILITY_MAPS) and maps_are_fresh(player):
+            sc_starts: List[int] = []
+            try:
+                sc_starts.extend(
+                    int(x) for x in list(getattr(player, "settlements", []) or [])
+                )
+                sc_starts.extend(
+                    int(x) for x in list(getattr(player, "cities", []) or [])
+                )
+            except Exception:
+                sc_starts = []
+            pl_map = getattr(player, "pathlength_map", None)
+            rd_map = getattr(player, "real_distance_map", None)
+            path_map = getattr(player, "path_map", None)
+            for raw_tid in target_ids:
+                tid = _safe_int(raw_tid)
+                if tid is None or not sc_starts:
+                    continue
+                hop = SENTINEL
+                best_start = None
+                for s in sc_starts:
+                    try:
+                        pl = int(pl_map[int(s)][int(tid)])
+                    except Exception:
+                        continue
+                    if pl in (2, 3) and pl < hop:
+                        hop = pl
+                        best_start = int(s)
+                if hop not in (2, 3) or best_start is None:
+                    continue
+                roads = []
+                rem = hop
+                try:
+                    roads = list(path_map[best_start][int(tid)] or [])
+                    rem = int(rd_map[best_start][int(tid)])
+                    if rem >= SENTINEL:
+                        rem = hop
+                except Exception:
+                    roads = []
+                    rem = hop
+                best[int(tid)] = {
+                    "dist": int(hop),
+                    "path": {
+                        "target_settlement_id": int(tid),
+                        "start_intersection_id": best_start,
+                        "roads_to_build": list(roads),
+                        "roads_remaining": int(rem),
+                        "distance": int(hop),
+                        "route_source": "player_reachability.path_map",
+                    },
+                }
+    except Exception:
+        pass
+
     for path in paths:
         if not isinstance(path, Mapping):
             continue
@@ -1048,7 +1135,14 @@ def build_plan_snapshot(
                     except Exception:
                         pstate = None
                 if wid is not None:
-                    req = parse_way_requirements(wid, player_state=pstate)
+                    # WP5: optional façade when player present (csv residual; Dig)
+                    req = parse_way_requirements(
+                        wid,
+                        player_state=pstate,
+                        game=game,
+                        player=player,
+                        use_min_road_cover=False,
+                    )
                 if req is None and isinstance(preferred.get("way_requirements"), WayRequirements):
                     req = preferred.get("way_requirements")
                 # Overlay residual counts when present (keeps post-upgrade need honest)
@@ -1192,6 +1286,96 @@ def build_plan_snapshot(
     # playboard — not only portfolio top-N (score truncation dropped d=3 twice).
     try:
         settles = _merge_geometry_settles_for_pln2(game, player, settles, se_pick_id=se_pick_id)
+    except Exception:
+        pass
+
+    # Phase P: mark inferior S/C after all merges (portfolio + own cities + geometry)
+    try:
+        from core.l2_target_screen import (
+            annotate_plan_rows_with_screen,
+            l2_target_screen_mode,
+            screen_portfolio_targets,
+        )
+
+        if l2_target_screen_mode(game) != "off":
+            screen_bag = None
+            try:
+                screen_bag = getattr(player, "last_l2_target_screen", None)
+            except Exception:
+                screen_bag = None
+            if not isinstance(screen_bag, Mapping):
+                try:
+                    screen_bag = getattr(game, "_last_l2_target_screen", None)
+                except Exception:
+                    screen_bag = None
+            wid = None
+            try:
+                wid = _safe_int(preferred.get("preferred_way_id") or preferred.get("way_id"))
+            except Exception:
+                wid = None
+            # Screen any S/C ids not already in bag (geometry / city merges)
+            if wid:
+                known = set()
+                if isinstance(screen_bag, Mapping):
+                    known = {
+                        int(k)
+                        for k in dict(screen_bag.get("by_id") or {}).keys()
+                        if str(k).lstrip("-").isdigit()
+                    }
+                extra = []
+                for row in list(settles) + list(cities):
+                    tid = _safe_int(row.get("id"))
+                    if tid and int(tid) not in known:
+                        extra.append(
+                            {
+                                "target_id": int(tid),
+                                "kind": str(row.get("kind") or "S"),
+                            }
+                        )
+                if extra:
+                    try:
+                        extra_screen = screen_portfolio_targets(
+                            game,
+                            player,
+                            extra,
+                            way_id=int(wid),
+                            default_kind="S",
+                            stash=False,
+                        )
+                        base = dict(screen_bag) if isinstance(screen_bag, Mapping) else {}
+                        by_id = dict(base.get("by_id") or {})
+                        for k, v in dict(extra_screen.get("by_id") or {}).items():
+                            by_id[int(k)] = v
+                        base["by_id"] = by_id
+                        base["inferior"] = list(base.get("inferior") or []) + list(
+                            extra_screen.get("inferior") or []
+                        )
+                        screen_bag = base
+                    except Exception:
+                        pass
+            settles = annotate_plan_rows_with_screen(settles, screen_bag)
+            cities = annotate_plan_rows_with_screen(cities, screen_bag)
+            # Inferior rows may omit ETA (operator OK) — but never blank the SE pick.
+            se_lab = None
+            if se_pick_id is not None:
+                se_lab = f"S{int(se_pick_id)}"
+                # City pick uses C{id}
+                for row in cities:
+                    if int(row.get("id") or 0) == int(se_pick_id):
+                        se_lab = f"C{int(se_pick_id)}"
+                        break
+            for row in settles + cities:
+                if int(row.get("inferior") or 0) != 1:
+                    continue
+                lab = str(row.get("label") or "")
+                if se_lab and lab == se_lab:
+                    # Keep Tgt/ETA for sticky SE New; drop inferior tag for dig clarity
+                    row["inferior"] = 0
+                    row.pop("inferior_reason", None)
+                    continue
+                row["eta"] = None
+                row["target"] = None
+                row["eta_win"] = None
     except Exception:
         pass
 
@@ -1462,10 +1646,21 @@ def build_plan_show_entries(
     """
     own_color = _player_color_name(game, player)
     own_pid = _safe_int(getattr(player, "id", None))
-    own_rad = radius_for_show(own_color, own_color)
     own_entries: List[Dict[str, Any]] = []
     opp_entries: List[Dict[str, Any]] = []
     seen_own: set = set()
+
+    # WP-R5: freshen maps so Show dist / opp roads_needed can use reachability
+    try:
+        from core.constants import REACHABILITY_MAPS
+        from core.player_reachability import ensure_dig_seat_maps, maps_are_fresh, sc_hop_distance
+
+        if bool(REACHABILITY_MAPS):
+            ensure_dig_seat_maps(game, player)
+        maps_ok = maps_are_fresh(player)
+    except Exception:
+        maps_ok = False
+        sc_hop_distance = None  # type: ignore
 
     rows = list(catalog_rows or [])
     for s in rows:
@@ -1475,6 +1670,14 @@ def build_plan_show_entries(
         if tid is None:
             continue
         dist = _safe_int(s.get("dist"), 0) or 0
+        map_dist = None
+        if maps_ok and sc_hop_distance is not None:
+            try:
+                map_dist = sc_hop_distance(player, int(tid))
+            except Exception:
+                map_dist = None
+            if map_dist in (2, 3):
+                dist = int(map_dist)
         is_pick = se_pick_id is not None and int(tid) == int(se_pick_id)
         if dist not in (2, 3) and not is_pick:
             continue
@@ -1493,17 +1696,19 @@ def build_plan_show_entries(
         except Exception:
             pass
         seen_own.add(tid)
-        own_entries.append(
-            {
-                "kind": "settle",
-                "id": tid,
-                "player_id": own_pid,
-                "color": own_color,
-                "radius": own_rad,
-                "dist": dist,
-                "risk": s.get("risk"),
-            }
-        )
+        own_rad = radius_for_show(own_color, own_color, path_distance=dist)
+        entry_own: Dict[str, Any] = {
+            "kind": "settle",
+            "id": tid,
+            "player_id": own_pid,
+            "color": own_color,
+            "radius": own_rad,
+            "dist": dist,
+            "risk": s.get("risk"),
+        }
+        if map_dist is not None:
+            entry_own["map_dist"] = int(map_dist)
+        own_entries.append(entry_own)
         threats: List[Any] = []
         raw_th = s.get("threats") or s.get("threat_opponents")
         if isinstance(raw_th, (list, tuple)):
@@ -1514,24 +1719,53 @@ def build_plan_show_entries(
         for th in threats:
             if not isinstance(th, Mapping):
                 continue
-            if not _opp_threat_showable(th):
+            th_local = dict(th)
+            pid = _safe_int(th_local.get("player_id") or th_local.get("id") or th_local.get("pid"))
+            # WP-R5: refresh opp roads_needed from their reachability maps when possible
+            if pid is not None:
+                try:
+                    from core.player_reachability import (
+                        SENTINEL,
+                        ensure_dig_seat_maps,
+                        maps_are_fresh,
+                        remaining_roads_to_target,
+                    )
+
+                    opp_pl = None
+                    for p in list(getattr(game, "players", []) or []):
+                        if p is None:
+                            continue
+                        if int(getattr(p, "id", -1) or -1) == int(pid):
+                            opp_pl = p
+                            break
+                    if opp_pl is not None:
+                        ensure_dig_seat_maps(game, opp_pl)
+                        if maps_are_fresh(opp_pl):
+                            rd = remaining_roads_to_target(opp_pl, int(tid))
+                            if rd is not None and 0 <= int(rd) < SENTINEL:
+                                th_local["roads_needed"] = int(rd)
+                except Exception:
+                    pass
+            if not _opp_threat_showable(th_local):
                 continue
-            pid = _safe_int(th.get("player_id") or th.get("id") or th.get("pid"))
             if pid is None or (own_pid is not None and int(pid) == int(own_pid)):
                 continue
             if int(pid) in seen_opp:
                 continue
             seen_opp.add(int(pid))
             opp_color = _color_for_pid(game, pid)
+            roads_n = _safe_int(th_local.get("roads_needed"), None)
             opp_entries.append(
                 {
                     "kind": "opp",
                     "player_id": int(pid),
                     "id": tid,
                     "color": opp_color,
-                    "radius": radius_for_show(own_color, opp_color),
-                    "roads_needed": _safe_int(th.get("roads_needed"), None),
-                    "risk": _opp_threat_risk_level(th),
+                    "radius": radius_for_show(
+                        own_color, opp_color, path_distance=roads_n
+                    ),
+                    "roads_needed": roads_n,
+                    "risk": _opp_threat_risk_level(th_local),
                 }
             )
     # Never drop own d=2/3 settles for the soft cap; trim opp rings first
@@ -1801,7 +2035,7 @@ def pln2_table_for_dig(row: Mapping[str, Any]) -> Dict[str, Any]:
     Returns ``headers``, ``rows`` (each: new, target, eta, dist, risk, delta, why, se_pick),
     ``asof``, ``overflow``, ``empty``.
     """
-    headers = ("New", "Tgt", "ETA", "Dist", "Risk", "Δt", "Why")
+    headers = ("New", "Tgt", "ETA", "Dist", "Risk", "△t", "Why")
     se_pick = str(row.get("plan_se_pick") or "").strip()
     plan_why = str(row.get("plan_why") or "").strip()
     asof = str(row.get("plan_asof_rt") or "").strip()
@@ -1959,7 +2193,7 @@ def plan_lines_for_dig(row: Mapping[str, Any]) -> List[Tuple[str, str]]:
         lines.append(("note", "No PLN2 catalog at this sample (L0 or PLAN_SNAPSHOT off)"))
         return lines
     # Header-ish summary
-    lines.append(("hdr", "New  Tgt  ETA  Dist  Risk  Δt  Why"))
+    lines.append(("hdr", "New  Tgt  ETA  Dist  Risk  △t  Why"))
     for r in tbl.get("rows") or []:
         why = r.get("why") or ""
         mark = "*" if r.get("se_pick") else ""
@@ -2003,11 +2237,8 @@ def str_field_slots(row: Optional[Mapping[str, Any]]) -> List[Tuple[str, str]]:
         ("Given up", "_given_up"),
         ("Sticky", "_sticky_chip"),
         ("Rec tgt", "rec_target_id"),
-        ("ETA", "_eta_hdr"),
-        ("  plan", "_eta_plan"),
-        ("  prev", "_eta_prev"),
-        # refinements: skip Type=target when it duplicates sticky timing noise
-        ("  Dt", "_eta_delta"),
+        # Dig §5: single block marker (Dig draws title+hdr+Plan+Prev)
+        ("ETA-Table", "_eta_block"),
     ]
     if not row:
         return base
@@ -2120,6 +2351,193 @@ def _plan_eta_from_pln2_sticky(row: Mapping[str, Any]) -> Optional[float]:
     return _safe_float(row.get("turns"), None)
 
 
+def is_str_eta_commit_row(row: Mapping[str, Any]) -> bool:
+    """True when STR ETA-Table may refresh (Way change or VP/L2 explore).
+
+    Operator lock (improving_SE_v6): table stays static except Way change, or
+    same Way with VP gained that triggers L2.
+    """
+    wc = str(row.get("way_changed") or "").strip().lower()
+    if wc in ("1", "true", "yes", "y"):
+        return True
+    mode = str(row.get("refresh_mode") or "").strip().lower()
+    detail = " ".join(
+        str(row.get(k) or "")
+        for k in (
+            "refresh_mode_detail",
+            "l2_force_reason",
+            "l2_gate",
+            "sticky_invalidate_reason",
+            "way_switch_cause",
+            "target_switch_cause",
+        )
+    ).lower()
+    if mode in ("explore", "explicit", "l2"):
+        # VP / TFR endgame L2, forced recalc, explicit 142, structure milestone
+        needles = (
+            "dcard_vp",
+            "dcard_tfr",
+            "vp_drawn",
+            "force_strategy_recalc",
+            "explicit_142",
+            "explicit_explore",
+            "need_next_target",
+            "own_city",
+            "own_settlement",
+            "own_largest_army",
+            "own_longest_road",
+            "way_change",
+        )
+        if any(n in detail for n in needles):
+            return True
+        if wc in ("1", "true", "yes"):
+            return True
+    return False
+
+
+def _fmt_eta_num(v: Any) -> str:
+    try:
+        if v is None or v == "" or v == "—":
+            return "—"
+        f = float(v)
+        if abs(f - round(f)) < 1e-9:
+            return str(int(round(f)))
+        # Dig §5 examples use two decimals (4.25); strip trailing zeros
+        return f"{f:.2f}".rstrip("0").rstrip(".")
+    except Exception:
+        return "—"
+
+
+def _fmt_eta_dt(v: Any) -> str:
+    try:
+        if v is None or v == "" or v == "—":
+            return "—"
+        f = float(v)
+        if abs(f) < 1e-9:
+            return "0"
+        # Match Plan/Prev precision (e.g. +0.5, +0.25)
+        s = f"{f:+.2f}".rstrip("0").rstrip(".")
+        if s in ("+", "-", "+.", "-."):
+            return "0"
+        return s
+    except Exception:
+        return "—"
+
+
+def str_eta_table_model(
+    row: Mapping[str, Any],
+    *,
+    rows: Optional[Sequence[Mapping[str, Any]]] = None,
+    cursor: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Static Plan/Prev victory-ETA snapshot for Dig STR (WP-J).
+
+    Prefers last commit row (Way change / VP+L2 explore) ≤ cursor for the seat.
+    Does **not** recompute from live PLN2 sticky (that washed the table every scrub).
+
+    Plan: Old=prev_turns, New=turns|eta_locked, Dt=New−Old  
+    Prev: after commit, Plan-old copied → Old=New=that value, Dt=0  
+    Summary △t: Plan.New − Prev.New
+    """
+    commit = dict(row or {})
+    if rows is not None and cursor is not None and 0 <= int(cursor) < len(rows):
+        try:
+            pid = None
+            try:
+                pid = int(float((row or {}).get("player_id")))
+            except Exception:
+                try:
+                    pid = int(float(rows[int(cursor)].get("player_id")))
+                except Exception:
+                    pid = None
+            found = None
+            for i in range(int(cursor), -1, -1):
+                r = rows[i]
+                if pid is not None:
+                    try:
+                        if int(float(r.get("player_id"))) != int(pid):
+                            continue
+                    except Exception:
+                        continue
+                if is_str_eta_commit_row(r):
+                    found = r
+                    break
+            if found is not None:
+                commit = dict(found)
+        except Exception:
+            pass
+
+    plan_new = _safe_float(commit.get("eta_locked"), None)
+    if plan_new is None:
+        plan_new = _safe_float(commit.get("turns"), None)
+    plan_old = _safe_float(commit.get("prev_turns"), None)
+    if plan_old is None and plan_new is not None:
+        # No prev sample — treat as flat
+        plan_old = plan_new
+    plan_dt = None
+    if plan_old is not None and plan_new is not None:
+        plan_dt = round(float(plan_new) - float(plan_old), 1)
+
+    # Prev holds the pre-update Plan value (static until next commit)
+    prev_val = plan_old
+    prev_dt = 0.0 if prev_val is not None else None
+    summary_dt = None
+    if plan_new is not None and prev_val is not None:
+        summary_dt = round(float(plan_new) - float(prev_val), 1)
+
+    return {
+        "plan_old": plan_old,
+        "plan_new": plan_new,
+        "plan_dt": plan_dt,
+        "prev_old": prev_val,
+        "prev_new": prev_val,
+        "prev_dt": prev_dt,
+        "summary_dt": summary_dt,
+        "commit": commit,
+    }
+
+
+# Dig §5: triangle+t column mark (Dig GUI draws a real triangle; string keeps △).
+ETA_DT_MARK = "△t"
+
+
+def format_str_eta_table_line(
+    key: str,
+    row: Mapping[str, Any],
+    *,
+    rows: Optional[Sequence[Mapping[str, Any]]] = None,
+    cursor: Optional[int] = None,
+) -> str:
+    """Format one STR ETA-Table data line (hdr / Plan / Prev).
+
+    Dig §5 layout (no duplicated Type/Plan/Prev labels in Dig — Dig draws the
+    title separately and uses empty field labels for these keys):
+
+        ETA-Table
+        Type    Old     New     △t
+        Plan    4.25    4.7     +0.5
+        Prev    4.25    4.25    0
+    """
+    model = str_eta_table_model(row, rows=rows, cursor=cursor)
+    # Fixed columns so Dig doesn't smash Prev/New together (was "Prev Prev4.25")
+    if key == "_eta_hdr":
+        return f"{'Type':<6} {'Old':>6} {'New':>6}  {ETA_DT_MARK}"
+    if key == "_eta_plan":
+        return (
+            f"{'Plan':<6} {_fmt_eta_num(model['plan_old']):>6} "
+            f"{_fmt_eta_num(model['plan_new']):>6}  {_fmt_eta_dt(model['plan_dt'])}"
+        )
+    if key == "_eta_prev":
+        return (
+            f"{'Prev':<6} {_fmt_eta_num(model['prev_old']):>6} "
+            f"{_fmt_eta_num(model['prev_new']):>6}  {_fmt_eta_dt(model['prev_dt'])}"
+        )
+    # Legacy key kept for older Dig builds / tests
+    if key == "_eta_delta":
+        return f"{ETA_DT_MARK:<6} {_fmt_eta_dt(model['summary_dt'])}"
+    return ""
+
+
 __all__ = [
     "SHOW_RADIUS_MATRIX",
     "PLAYER_RADIUS_BY_COLOR",
@@ -2148,4 +2566,8 @@ __all__ = [
     "plan_lines_for_dig",
     "why2_lines_for_dig",
     "str_field_slots",
+    "is_str_eta_commit_row",
+    "str_eta_table_model",
+    "format_str_eta_table_line",
+    "ETA_DT_MARK",
 ]

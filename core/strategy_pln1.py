@@ -131,8 +131,12 @@ def build_pln1_snapshot(
         from core.strategy_way_residual import compute_way_residual
 
         board = getattr(game, "board", None) if game is not None else None
+        pref = dict(preferred) if isinstance(preferred, dict) else {}
+        if game is not None and "_game" not in pref:
+            pref = dict(pref)
+            pref["_game"] = game
         res = compute_way_residual(
-            way_id, player, preferred=preferred, board=board
+            way_id, player, preferred=pref, board=board
         ) or {}
     except Exception:
         res = {}
@@ -447,18 +451,10 @@ def pln1_lines_for_dig(row: Mapping[str, Any]) -> List[Tuple[str, str]]:
     if def_comp or wid:
         way_line = f"{wid} | {def_comp}" if wid and def_comp else (wid or def_comp)
         lines.append(("Way", way_line))
-    if now:
-        lines.append(("Now", f"{now}" + (f"  ({word})" if word else "")))
-    if posture:
-        foc = f" · focus {focus}" if focus else ""
-        cl = f"  — {clause}" if clause else ""
-        lines.append(("DC", f"{posture}{foc}{cl}"))
-    elif also and also.startswith("DC:"):
-        lines.append(("Also", also))
-    if also and not also.startswith("DC:"):
-        lines.append(("Also", also))
-    if parked:
-        lines.append(("Parked", parked))
+    # Dig §6: PLN1 panel draws the component table + one red priority line.
+    # Do **not** emit Now/Also/Parked/DC prose here — Dig used to reprint them
+    # under R/DC and look unfinished.
+    _ = (now, word, also, parked, posture, focus, clause)
     return lines
 
 

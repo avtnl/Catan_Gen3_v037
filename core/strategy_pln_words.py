@@ -363,15 +363,25 @@ def format_road_path_compact(roads_fp: Any) -> str:
     return s
 
 
-def dt_color_favourable(delta: Any) -> str:
-    """Return 'green' if Dt≤0 (player ahead/tied), 'red' if Dt>0, else ''."""
+def dt_color_favourable(delta: Any, *, invert: bool = False) -> str:
+    """STR / PLN2 Dig convention: green if △t≤0 (ahead/tied), red if △t>0.
+
+    Dig §7 (v7): PLN2 uses the same polarity as STR (``invert=False``).
+    ``invert=True`` kept for experiments only.
+    """
     try:
         if delta is None or delta == "" or delta == "—":
             return ""
         v = float(delta)
     except Exception:
         return ""
-    return "green" if v <= 0 else "red"
+    tone = "green" if v <= 0 else "red"
+    if invert:
+        if tone == "green":
+            return "red"
+        if tone == "red":
+            return "green"
+    return tone
 
 
 __all__ = [

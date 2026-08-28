@@ -247,13 +247,20 @@ class TurnDetails:
                     f.write(f"{deal}\n")
 
 class ResourceCardDashboard:
-    """Tracks resource card distribution across the game."""
-   
+    """Tracks resource card distribution across the game.
+
+    ``resource_production_game_player_view`` is the cumulative public viewer→viewed
+    table (now). ``resource_production_game_player_view_lag`` holds up to 4
+    round-end snapshots (index 0 = 1 round ago … index 3 = 4 rounds ago).
+    AI belief for ``RCARD_MEMORY_OPPONENTS=N`` is ``now − lag[N-1]``.
+    """
+
     def __init__(
         self,
         resource_production_game_total: List[int],
         resource_production_game_player: List[List[int]],
-        resource_production_game_player_view: List[List[int]]
+        resource_production_game_player_view: List[List[int]],
+        resource_production_game_player_view_lag: Optional[List[List[List[int]]]] = None,
     ) -> None:
         """Initialize a ResourceCardDashboard.
 
@@ -261,10 +268,41 @@ class ResourceCardDashboard:
             resource_production_game_total: Total resources distributed [Wheat, Ore, Wood, Brick, Sheep, Gold].
             resource_production_game_player: Per-player resources [[player_id, Wheat, Ore, Wood, Brick, Sheep, Gold], ...].
             resource_production_game_player_view: Each player's view of others' resources [[viewer_id, viewed_id, Wheat, Ore, Wood, Brick, Sheep , Gold, QM_Added, QM_Discarded], ...].
+            resource_production_game_player_view_lag: Optional ring of prior round-end views.
         """
         self.resource_production_game_total = resource_production_game_total
         self.resource_production_game_player = resource_production_game_player
         self.resource_production_game_player_view = resource_production_game_player_view
+        try:
+            from core.rcard_view_memory import copy_player_view
+
+            self.resource_production_game_player_view_lag = [
+                copy_player_view(item)
+                for item in (resource_production_game_player_view_lag or [])
+            ]
+        except Exception:
+            self.resource_production_game_player_view_lag = list(
+                resource_production_game_player_view_lag or []
+            )
+
+    def snapshot_player_view_end_of_round(self) -> None:
+        """Push current player_view into the lag ring (call at round boundary)."""
+        from core.rcard_view_memory import shift_lag_ring
+
+        self.resource_production_game_player_view_lag = shift_lag_ring(
+            getattr(self, "resource_production_game_player_view_lag", None),
+            self.resource_production_game_player_view,
+        )
+
+    def player_view_memory(self, rounds: Any = None) -> List[List[int]]:
+        """AI belief table: full now, or now − lag for last N rounds."""
+        from core.rcard_view_memory import player_view_memory as _mem
+
+        return _mem(
+            self.resource_production_game_player_view,
+            getattr(self, "resource_production_game_player_view_lag", None),
+            rounds,
+        )
 
 class Settings:
     """Manages game settings."""
@@ -1405,6 +1443,13 @@ class Game:
                     f"robber blocks {self._format_resource_vector_for_twitter(blocked_vector, absolute=True)}",
                 )
 
+        # Keep ResourceCardDashboard totals / player_view in sync with public production
+        # (same shape as IP distribute_initial_resources) so lag/memory deltas work.
+        try:
+            self.apply_production_to_rcard_dashboard(produced_by_player)
+        except Exception:
+            pass
+
         return {
             "roll": roll,
             "produced_by_player": produced_by_player,
@@ -1414,6 +1459,70 @@ class Game:
             "produced_total": produced_total,
             "blocked_total": blocked_total,
         }
+
+    def apply_production_to_rcard_dashboard(
+        self, produced_by_player: Mapping[int, Sequence[int]]
+    ) -> None:
+        """Add known production into dashboard totals, per-player, and all viewer rows."""
+        dashes = list(getattr(self, "resource_card_dashboard", []) or [])
+        if not dashes:
+            return
+        for player_id, vec in (produced_by_player or {}).items():
+            try:
+                pid = int(player_id)
+            except Exception:
+                continue
+            counts = [int(x or 0) for x in list(vec or [])[:6]]
+            while len(counts) < 6:
+                counts.append(0)
+            if not any(counts):
+                continue
+            for dash in dashes:
+                total = list(getattr(dash, "resource_production_game_total", None) or [0] * 6)
+                while len(total) < 6:
+                    total.append(0)
+                for i, c in enumerate(counts):
+                    total[i] = int(total[i] or 0) + int(c)
+                dash.resource_production_game_total = total
+
+                for p in list(getattr(dash, "resource_production_game_player", None) or []):
+                    if not p or int(p[0] or 0) != pid:
+                        continue
+                    for i, c in enumerate(counts):
+                        idx = i + 1
+                        if idx < len(p):
+                            p[idx] = int(p[idx] or 0) + int(c)
+
+                for view in list(getattr(dash, "resource_production_game_player_view", None) or []):
+                    # Public production: every viewer updates the viewed seat's known counts
+                    if not view or int(view[1] or 0) != pid:
+                        continue
+                    for i, c in enumerate(counts):
+                        idx = i + 2
+                        if idx < len(view):
+                            view[idx] = int(view[idx] or 0) + int(c)
+
+    def snapshot_rcard_player_view_end_of_round(self) -> None:
+        """Freeze current player_view into the lag ring (end of a completed round)."""
+        for dash in list(getattr(self, "resource_card_dashboard", []) or []):
+            try:
+                dash.snapshot_player_view_end_of_round()
+            except Exception:
+                pass
+
+    def get_rcard_player_view_memory(self, rounds: Any = None) -> List[List[int]]:
+        """AI belief opponent-view table under ``RCARD_MEMORY_OPPONENTS`` (or override)."""
+        dashes = list(getattr(self, "resource_card_dashboard", []) or [])
+        if not dashes:
+            return []
+        try:
+            return dashes[0].player_view_memory(rounds)
+        except Exception:
+            from core.rcard_view_memory import copy_player_view
+
+            return copy_player_view(
+                getattr(dashes[0], "resource_production_game_player_view", None)
+            )
 
     def sync_round_turn(self) -> None:
         """Synchronize round and turn with Board.
@@ -1995,6 +2104,39 @@ class Game:
                     "ok": False,
                     "error": str(_wp5_exc)[:120],
                 }
+            # If this pass was L0 but a/b/c flags are now set (often latched mid/after
+            # refresh), re-enter once as explore so PLN2 ETAs are not frozen forever
+            # (dig symptom: P1/P3 plan_asof stuck at R1 with empty Tgt/ETA).
+            try:
+                if (
+                    str(resolved_mode) == "hand_only"
+                    and not bool(getattr(self, "_l2_flag_reentry", False))
+                    and player is not None
+                ):
+                    from core.strategy_reconsider import (
+                        any_significant_flag,
+                        get_reconsider_flags,
+                    )
+
+                    if any_significant_flag(get_reconsider_flags(player)):
+                        self._l2_flag_reentry = True
+                        try:
+                            return self.refresh_strategy_context(
+                                reason=str(reason or "flag_reentry_explore"),
+                                allow_during_forced_flow=allow_during_forced_flow,
+                                mode="explore",
+                                force=True,
+                            )
+                        finally:
+                            try:
+                                self._l2_flag_reentry = False
+                            except Exception:
+                                pass
+            except Exception:
+                try:
+                    self._l2_flag_reentry = False
+                except Exception:
+                    pass
             # Phase L salvage: terminal reminder if S4 would help (bounce after escape)
             try:
                 from core.partial_way_salvage import maybe_signal_s4_needed
@@ -2295,6 +2437,16 @@ class Game:
         """
         if self.phase != "Execution":
             return None
+
+        # Seed per-player reachability maps once when Execution begins (post-IP / load).
+        if not bool(getattr(self, "_reachability_maps_seeded", False)):
+            try:
+                from core.player_reachability import rebuild_all_maintained_seats
+
+                self.last_reachability_seed = rebuild_all_maintained_seats(self)
+                self._reachability_maps_seeded = True
+            except Exception:
+                self.last_reachability_seed = {"ok": False}
 
         self.get_current_player()
         self.clear_all_player_turn_details()
@@ -2823,6 +2975,37 @@ class Game:
                     priority = apply_slr_c_action_priority(priority, pick_turn_focus(self, _p))
             except Exception:
                 pass
+            # WP-ARB1: when LR claim owns Dig Why / plan label, BA family = Build road
+            # (not city TwB divert while LR claim is live).
+            try:
+                _p = self.get_current_player()
+                lr_pkg = ""
+                if _p is not None:
+                    d = getattr(_p, "strategic_direction", None) or {}
+                    if isinstance(d, Mapping):
+                        lr_pkg = str(
+                            d.get("lr_plan_label")
+                            or d.get("plan_lr_pkg")
+                            or (d.get("lr_plan") or {}).get("label")
+                            or ""
+                        ).lower()
+                    snap = getattr(_p, "last_plan_snapshot", None) or {}
+                    if not lr_pkg and isinstance(snap, Mapping):
+                        lr_pkg = str(
+                            snap.get("lr_plan_label") or snap.get("plan_lr_pkg") or ""
+                        ).lower()
+                if (
+                    "claim" in lr_pkg
+                    or lr_pkg.startswith("lr claim")
+                    or "|claim|" in lr_pkg
+                ):
+                    priority = dict(priority)
+                    priority["Build road"] = 0
+                    # Soft demote city so LR tip roads win Continue
+                    if "Build city" in priority:
+                        priority["Build city"] = max(int(priority.get("Build city") or 1), 3)
+            except Exception:
+                pass
             # P2: sticky race risk M/H → chase settle/key road
             try:
                 from core.strategy_race_ba import (
@@ -2838,6 +3021,67 @@ class Game:
             except Exception:
                 pass
 
+            # WP-TFR1 / WP-DCARD2: while a DCard still wants play this turn, defer
+            # paid Build / Buy so preview can execute play first (n3d Orange R3,
+            # v6 Blue knight-before-buy).
+            _defer_paid_road_for_tfr = False
+            _defer_spend_for_dcard_play = False
+            try:
+                _p = self.get_current_player()
+                tfr_plan = getattr(self, "last_ai_tfr_plan", None) or {}
+                if not isinstance(tfr_plan, Mapping):
+                    tfr_plan = {}
+                knight_plan = getattr(self, "last_ai_knight_plan", None) or {}
+                if not isinstance(knight_plan, Mapping):
+                    knight_plan = getattr(self, "last_ai_knight_plan_post_roll", None) or {}
+                if not isinstance(knight_plan, Mapping):
+                    knight_plan = {}
+                dcard_choice = getattr(self, "last_ai_dcard_choice", None) or {}
+                if not isinstance(dcard_choice, Mapping):
+                    dcard_choice = {}
+                dcard_played = False
+                for _td_attr in ("myturn", "turn_details"):
+                    _td = getattr(self, _td_attr, None)
+                    if _td is not None and bool(getattr(_td, "dcard_played_in_turn_TF", False)):
+                        dcard_played = True
+                        break
+                tfr_wants = (
+                    bool(tfr_plan.get("play"))
+                    and bool(tfr_plan.get("legal"))
+                    and (
+                        list(tfr_plan.get("road_ids") or [])
+                        or int(tfr_plan.get("free_roads_available") or 0) > 0
+                    )
+                )
+                knight_wants = bool(knight_plan.get("play")) and bool(
+                    knight_plan.get("legal", True)
+                )
+                choice_wants = bool(dcard_choice.get("play")) and bool(
+                    dcard_choice.get("chosen")
+                )
+                # Also: HOLD won but context still wants play
+                ctx = dcard_choice.get("context") if isinstance(dcard_choice.get("context"), Mapping) else {}
+                prefer_play = bool(
+                    ctx.get("wp_tfr1_prefer_play")
+                    or ctx.get("wp_dcard2_prefer_play")
+                    or ctx.get("wp_dcard2_forced_over_hold")
+                )
+                if not dcard_played and (tfr_wants or knight_wants or choice_wants or prefer_play):
+                    priority = dict(priority)
+                    priority["Build road"] = max(int(priority.get("Build road", 3)), 8)
+                    priority["Buy development_card"] = max(
+                        int(priority.get("Buy development_card", 4)), 9
+                    )
+                    priority["Build settlement"] = max(
+                        int(priority.get("Build settlement", 2)), 7
+                    )
+                    priority["Build city"] = max(int(priority.get("Build city", 1)), 6)
+                    _defer_paid_road_for_tfr = bool(tfr_wants)
+                    _defer_spend_for_dcard_play = True
+            except Exception:
+                _defer_paid_road_for_tfr = False
+                _defer_spend_for_dcard_play = False
+
             actionable = [
                 c for c in list(getattr(self, "current_actionable_choices", []) or [])
                 if isinstance(c, dict) and bool(c.get("actionable", c.get("viable", False)))
@@ -2852,6 +3096,35 @@ class Game:
             # on a validated route toward a strategy-approved new settlement.
             actionable = [c for c in actionable if not self._should_suppress_ai_strategic_road_choice(c)]
             legal = [c for c in legal if not self._should_suppress_ai_strategic_road_choice(c)]
+
+            # WP-TFR1 / WP-DCARD2: drop paid spend rows while DCard play is pending
+            if _defer_paid_road_for_tfr or _defer_spend_for_dcard_play:
+                _block = {"build road", "buy development_card"}
+                if _defer_spend_for_dcard_play:
+                    _block |= {"build settlement", "build city"}
+
+                def _is_deferred_spend_row(row: Mapping[str, Any]) -> bool:
+                    return str(row.get("action", "") or "").strip().lower() in _block
+
+                actionable = [c for c in actionable if not _is_deferred_spend_row(c)]
+                legal = [c for c in legal if not _is_deferred_spend_row(c)]
+                try:
+                    trace = getattr(self, "current_ai_decision_trace", None)
+                    if not isinstance(trace, list):
+                        trace = []
+                        self.current_ai_decision_trace = trace
+                    trace.append(
+                        {
+                            "kind": (
+                                "wp_dcard2_defer_spend"
+                                if _defer_spend_for_dcard_play
+                                else "wp_tfr1_defer_paid_road"
+                            ),
+                            "reason": "dcard_plan_play_before_buy_build",
+                        }
+                    )
+                except Exception:
+                    pass
 
             # P1+Q2: off-way DCard — allow soft pick / block unguarded DCard fallback
             q2_allow = False
@@ -2874,6 +3147,26 @@ class Game:
             if q2_block_fallback:
                 fallback_legal = [c for c in fallback_legal if not _is_dcard_row(c)]
 
+            # WP-RISK1: hand > 7 → prefer any spend (city/settle/road/buy) over waiting
+            _hand_total = 0
+            try:
+                _p = self.get_current_player()
+                if _p is not None:
+                    hv = self._execution_hand_vector_for_player(_p)
+                    _hand_total = int(sum(int(x or 0) for x in list(hv or [])[:5]))
+                if _hand_total > 7:
+                    priority = dict(priority)
+                    for act in (
+                        "Build city",
+                        "Build settlement",
+                        "Build road",
+                        "Buy development_card",
+                    ):
+                        if act in priority:
+                            priority[act] = min(int(priority.get(act) or 9), 2)
+            except Exception:
+                _hand_total = 0
+
             selected: List[Dict[str, Any]] = []
             for c in sorted(actionable, key=lambda row: priority.get(str(row.get("action", "") or ""), 99)):
                 selected.append((dict(c) | {"_execution_source": "strategic"}))
@@ -2892,6 +3185,24 @@ class Game:
             if not selected:
                 for c in sorted(fallback_legal, key=lambda row: priority.get(str(row.get("action", "") or ""), 99)):
                     selected.append((dict(c) | {"_execution_source": "legal_fallback"}))
+            # WP-RISK1: if still empty but hand>7, force first legal spend from full legal list
+            if not selected and _hand_total > 7:
+                for c in sorted(legal, key=lambda row: priority.get(str(row.get("action", "") or ""), 99)):
+                    act = str(c.get("action", "") or "").strip().lower()
+                    if act in (
+                        "build city",
+                        "build settlement",
+                        "build road",
+                        "buy development_card",
+                    ):
+                        selected.append(
+                            dict(c)
+                            | {
+                                "_execution_source": "wp_risk1_discard_aversion",
+                                "strategic_reason": "WP-RISK1: spend before end with hand>7",
+                            }
+                        )
+                        break
 
             for idx, choice in enumerate(selected[:3], start=1):
                 source = str(choice.get("_execution_source", "strategic") or "strategic")
@@ -4520,13 +4831,47 @@ class Game:
                 scan_value(direction.get(key))
         return roads
 
+    def _filter_unowned_route_roads(
+        self,
+        roads: Sequence[Any],
+        player: Optional[Player] = None,
+    ) -> List[Tuple[int, int]]:
+        """Drop path edges the seat already owns (stale sticky roads_fp).
+
+        Without this, BA keeps preferring Build road → road-guard Wait even when
+        the sticky settle is already connected and only needs a TwB/TwP unlock.
+        """
+        raw = [self._road_key_from_any(r) for r in list(roads or [])]
+        keys = [r for r in raw if r]
+        if not keys:
+            return []
+        player = player if player is not None else self.get_current_player()
+        owned: set = set()
+        try:
+            from core.outlook_logic import player_owned_road_keys
+
+            owned = set(player_owned_road_keys(self, player) or [])
+        except Exception:
+            for edge in list(getattr(player, "roads", None) or []):
+                key = self._road_key_from_any(edge)
+                if key:
+                    owned.add(key)
+        out: List[Tuple[int, int]] = []
+        for r in keys:
+            if r in owned:
+                continue
+            if r not in out:
+                out.append(r)
+        return out
+
     def _settlement_route_plan(self) -> Dict[str, Any]:
         """Return target-lock / route-lock metadata for next/new settlements.
 
         The planner can express a target as next_settlement@X or new_settlement@X
         with one or more roads_to_build.  This helper normalises those variants so
         Best-Action can execute the exact targeted road or settlement instead of a
-        generic legal candidate.
+        generic legal candidate. Owned path edges are stripped so a completed
+        route promotes to settle-now (TwB/TwP can unlock the settle this turn).
         """
         direction = self._current_player_strategic_direction()
         if not direction:
@@ -4547,7 +4892,9 @@ class Game:
                 "location",
             ),
         )
-        roads = self._route_roads_from_direction(direction)
+        roads = self._filter_unowned_route_roads(
+            self._route_roads_from_direction(direction)
+        )
 
         kind = ""
         if support in {"new_settlement"}:
@@ -4562,6 +4909,9 @@ class Game:
         if not kind and target is not None:
             # Conservative default: a known settlement target without route roads is
             # a target-locked next settlement.
+            kind = "next_settlement"
+        # Path complete → settle now (same BA priority as next_settlement)
+        if kind == "new_settlement" and not roads and target is not None:
             kind = "next_settlement"
 
         label = "new_settle" if kind == "new_settlement" else "next_settle"
@@ -4996,6 +5346,7 @@ class Game:
                 raw = direction.get("roads_to_build")
                 if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, Mapping)):
                     roads = [r for r in list(raw) if r not in (None, "", [], ())]
+            roads = self._filter_unowned_route_roads(roads)
             if roads:
                 return "Build road"
             return "Build settlement"
@@ -6415,6 +6766,25 @@ class Game:
                         record_twp_skip_reason(self, "unlock_fallback")
                 except Exception:
                     pass
+                # WP-TWP2: invent surplus→need unlocks when scanner still empty
+                if not proposals:
+                    try:
+                        from core.rcard_optimizer import invent_unlock_twp_offers
+
+                        inv = invent_unlock_twp_offers(self, player)
+                        proposals = list(inv.get("proposals") or [])
+                        if proposals:
+                            record_twp_skip_reason(self, "wp_twp2_invent")
+                            try:
+                                self.last_twp_invent = {
+                                    "n": len(proposals),
+                                    "note": inv.get("note"),
+                                    "fully_unlocks_any": inv.get("fully_unlocks_any"),
+                                }
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             else:
                 # Dig-in: note when pool includes unlock-sourced packages
                 try:
@@ -6427,6 +6797,47 @@ class Game:
                         pass
                 except Exception:
                     pass
+
+            # WP-TWP2: always merge invented unlocks into the candidate pool
+            try:
+                from core.rcard_optimizer import invent_unlock_twp_offers
+
+                inv = invent_unlock_twp_offers(self, player)
+                extra = list(inv.get("proposals") or [])
+                if extra:
+                    seen_k = set()
+                    for p in list(proposals or []):
+                        try:
+                            d = p.as_dict() if hasattr(p, "as_dict") else {}
+                            seen_k.add(
+                                (
+                                    int(d.get("counterparty_id") or -1),
+                                    int(d.get("active_give_index") or -1),
+                                    int(d.get("active_receive_index") or -1),
+                                )
+                            )
+                        except Exception:
+                            continue
+                    added = 0
+                    for p in extra:
+                        try:
+                            d = p.as_dict() if hasattr(p, "as_dict") else {}
+                            key = (
+                                int(d.get("counterparty_id") or -1),
+                                int(d.get("active_give_index") or -1),
+                                int(d.get("active_receive_index") or -1),
+                            )
+                        except Exception:
+                            continue
+                        if key in seen_k:
+                            continue
+                        seen_k.add(key)
+                        proposals.append(p)
+                        added += 1
+                    if added:
+                        record_twp_skip_reason(self, f"wp_twp2_invent_merge:{added}")
+            except Exception:
+                pass
 
         policy_routed = []
         skipped_policy = []
@@ -6556,6 +6967,43 @@ class Game:
             )
         )
 
+        # WP-TWP2 wait gate: small hand + no unlock-now → skip TwP (Dig White R4T3)
+        try:
+            from core.rcard_optimizer import twp_wait_gate
+
+            # Peek whether any auto proposal fully fills support cost
+            unlocks_peek = False
+            for proposal in list(policy_routed or []):
+                prop = proposal[0] if isinstance(proposal, tuple) else proposal
+                try:
+                    p_dict = prop.as_dict() if hasattr(prop, "as_dict") else {}
+                    recv_i = int(p_dict.get("active_receive_index", -1) or -1)
+                    recv_n = int(p_dict.get("active_receive_count", 0) or 0)
+                    give_i = int(p_dict.get("active_give_index", -1) or -1)
+                    give_n = int(p_dict.get("active_give_count", 0) or 0)
+                    trial = list(hand_before)
+                    if 0 <= give_i < 5:
+                        trial[give_i] = max(0, int(trial[give_i]) - give_n)
+                    if 0 <= recv_i < 5:
+                        trial[recv_i] = int(trial[recv_i]) + recv_n
+                    if all(int(trial[i]) >= int(support_cost[i] or 0) for i in range(5)):
+                        unlocks_peek = True
+                        break
+                except Exception:
+                    continue
+            gate = twp_wait_gate(
+                self, player, hand=hand_before, unlocks_now=unlocks_peek
+            )
+            if bool(gate.get("wait")):
+                record_twp_skip_reason(self, str(gate.get("reason") or "wp_twp2_wait"))
+                try:
+                    self.last_twp_wait_gate = dict(gate)
+                except Exception:
+                    pass
+                return None
+        except Exception:
+            pass
+
         ranked: List[
             Tuple[Tuple[Any, ...], Any, Dict[str, Any], List[int], Any, Dict[str, Any]]
         ] = []
@@ -6658,10 +7106,120 @@ class Game:
                 )
             ranked.append((rank, proposal, p_dict, hand_after, unlocked_action, dict(policy_decision)))
 
-        if not ranked:
+        # WP-E2: prefer rcard_optimizer unlock / mutual / O→need offers
+        try:
+            from core.rcard_optimizer import optimize_rcard_actions
+
+            rbag = optimize_rcard_actions(self, player)
+            pref = list((rbag or {}).get("preferred_twp") or [])
+            pref_keys = set()
+            for off in pref:
+                if not isinstance(off, Mapping):
+                    continue
+                pref_keys.add(
+                    (
+                        int(off.get("counterparty_id") or -1),
+                        int(off.get("give_index") or -1),
+                        int(off.get("get_index") or -1),
+                    )
+                )
+            if pref_keys and ranked:
+                reranked = []
+                for item in ranked:
+                    rank, proposal, p_dict, hand_after, unlocked_action, pol = item
+                    try:
+                        key = (
+                            int(p_dict.get("counterparty_id") or -1),
+                            int(p_dict.get("active_give_index") or -1),
+                            int(p_dict.get("active_receive_index") or -1),
+                        )
+                    except Exception:
+                        key = (-1, -1, -1)
+                    # Prepend: 0 = rcard preferred unlock, 1 = other
+                    rcard_pref = 0 if key in pref_keys else 1
+                    if isinstance(rank, tuple):
+                        new_rank = (rcard_pref,) + tuple(rank)
+                    else:
+                        new_rank = (rcard_pref, rank)
+                    reranked.append(
+                        (new_rank, proposal, p_dict, hand_after, unlocked_action, pol)
+                    )
+                ranked = reranked
+                try:
+                    self.last_rcard_twp_bias = {
+                        "preferred": len(pref_keys),
+                        "note": (rbag or {}).get("note"),
+                    }
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # RCard near-complete: if no ranked TwP fully unlocks the support
+        # action, try a single two-leg bridge chain (e.g. B→Wd then O→B).
+        chain_plan = None
+        try:
+            any_full = any(
+                bool(item[4])  # unlocked_action
+                for item in ranked
+            )
+            if not any_full:
+                from core.rcard_optimizer import enumerate_two_leg_unlock_chains
+
+                bag = enumerate_two_leg_unlock_chains(self, player)
+                chosen = bag.get("chosen") if isinstance(bag, Mapping) else None
+                if isinstance(chosen, Mapping) and chosen.get("leg1") and chosen.get("leg2"):
+                    chain_plan = dict(chosen)
+        except Exception:
+            chain_plan = None
+
+        if not ranked and chain_plan is None:
             return None
 
+        def _chain_rank_entry(chosen_chain: Mapping[str, Any]):
+            leg1 = dict(chosen_chain.get("leg1") or {})
+            # Skip non-auto human legs here (Incoming panel path not wired for chains yet)
+            if bool(leg1.get("requires_human_confirmation")) or bool(
+                leg1.get("counterparty_is_human")
+            ):
+                if not bool(leg1.get("auto_executable")):
+                    return None
+            leg2 = dict(chosen_chain.get("leg2") or {})
+            if bool(leg2.get("requires_human_confirmation")) or (
+                bool(leg2.get("counterparty_is_human")) and not bool(leg2.get("auto_executable"))
+            ):
+                return None
+            hand_after_chain = list(chosen_chain.get("hand_after") or [])
+            unlocked_from_chain = self._first_action_unlocked_by_hand_delta(
+                hand_before, hand_after_chain
+            )
+            return (
+                (-1, -3, 0, 0, -100.0, 0, 0, 0, 0, 0),
+                None,
+                leg1,
+                hand_after_chain,
+                unlocked_from_chain,
+                {},
+            )
+
+        top_was_chain = False
+        if not ranked and chain_plan is not None:
+            entry = _chain_rank_entry(chain_plan)
+            if entry is not None:
+                ranked = [entry]
+                top_was_chain = True
+
         ranked.sort(key=lambda item: item[0])
+
+        # Prefer explicit two-leg chain over a partial one-leg TwP when the chain
+        # fully unlocks and the top ranked TwP does not.
+        if chain_plan is not None and ranked and not top_was_chain:
+            top_unlocked = ranked[0][4]
+            if not top_unlocked and chain_plan.get("fully_unlocks"):
+                entry = _chain_rank_entry(chain_plan)
+                if entry is not None:
+                    ranked.insert(0, entry)
+                    top_was_chain = True
 
         # T1-A: pick best after shared sort (VP + RNG already in rank key).
         # Keep T5 near-tie only when rank prefixes match except RNG (band of true equals).
@@ -6748,19 +7306,57 @@ class Game:
         elif bool(rng_meta.get("rng_used")) and int(rng_meta.get("band_size", 0) or 0) > 1:
             pq_note = f" T1-A partner VP-tie RNG (band {rng_meta.get('band_size')})."
 
+        then_twp_chain: List[Dict[str, Any]] = []
+        chain_meta: Dict[str, Any] = {}
+        try:
+            if isinstance(chain_plan, Mapping) and chain_plan.get("leg2"):
+                leg1_ref = dict(chain_plan.get("leg1") or {})
+                # Attach leg2 when the picked proposal is the chain's first leg
+                same_leg1 = (
+                    int(proposal.get("active_give_index", -9))
+                    == int(leg1_ref.get("active_give_index", -8))
+                    and int(proposal.get("active_receive_index", -9))
+                    == int(leg1_ref.get("active_receive_index", -8))
+                    and int(proposal.get("counterparty_id", -9))
+                    == int(leg1_ref.get("counterparty_id", -8))
+                )
+                if same_leg1 or not ranked or top_was_chain:
+                    then_twp_chain = [dict(chain_plan.get("leg2") or {})]
+                    chain_meta = {
+                        "label": chain_plan.get("label"),
+                        "sweetened": bool(chain_plan.get("sweetened")),
+                        "bridge_index": chain_plan.get("bridge_index"),
+                        "miss_index": chain_plan.get("miss_index"),
+                        "restorer_index": chain_plan.get("restorer_index"),
+                        "reason": "two_leg_near_complete_unlock",
+                    }
+                    if chain_plan.get("label"):
+                        best_text = f"TwP chain: {chain_plan.get('label')}"
+                        if unlocked_action:
+                            best_text = f"{best_text}; then {follow_text}"
+        except Exception:
+            then_twp_chain = []
+            chain_meta = {}
+
         return {
             "step": step,
             "action": "TwP",
-            "label": f"TwP {label}",
+            "label": f"TwP {label}" if not chain_meta else f"TwP chain {chain_meta.get('label')}",
             "status": "will_try",
             "reason": (
-                f"AI TwP support (T1-C): package-quality rank before bank"
-                + (f" unlocks {follow_text}." if unlocked_action else " improves hand before pass/TwB.")
-                + (" ditch-funded." if ditch_safe else " keep-exception unlock." if unlocked_action else "")
+                (
+                    f"AI TwP two-leg unlock chain: {chain_meta.get('label')}."
+                    if chain_meta
+                    else (
+                        f"AI TwP support (T1-C): package-quality rank before bank"
+                        + (f" unlocks {follow_text}." if unlocked_action else " improves hand before pass/TwB.")
+                        + (" ditch-funded." if ditch_safe else " keep-exception unlock." if unlocked_action else "")
+                    )
+                )
                 + (f" Human TwP mode={policy_decision.get('mode')}." if policy_decision.get('involves_human') else "")
                 + pq_note
             ),
-            "source": "ai_twp_support",
+            "source": "ai_twp_support" if not chain_meta else "ai_twp_support_chain2",
             "twp_t1": {
                 "ditch_safe": ditch_safe,
                 "unlocks": bool(unlocked_action),
@@ -6776,6 +7372,8 @@ class Game:
                 "pq": True,
             },
             "rng_meta": dict(rng_meta),
+            "twp_chain2": dict(chain_meta) if chain_meta else {},
+            "then_twp_chain": list(then_twp_chain),
             "choice": {
                 "action": "TwP",
                 "viable": True,
@@ -6790,7 +7388,7 @@ class Game:
             "hand_before": list(hand_before),
             "hand_after": list(hand_after),
             "unlocked_action": unlocked_action,
-            "best_action_label": label,
+            "best_action_label": label if not chain_meta else str(chain_meta.get("label") or label),
             "best_action_text": best_text,
             "round": getattr(self, "round", None),
             "turn": getattr(self, "turn", None),
@@ -6916,6 +7514,40 @@ class Game:
                 self.emit_twitter_event(getattr(player, "id", None), f"TwP {label}")
             except Exception:
                 pass
+
+        # Same-Continue: execute planned two-leg restore (e.g. O→B after B→Wd)
+        chain_results: List[Dict[str, Any]] = []
+        then_chain = list(plan_item.get("then_twp_chain") or [])
+        for leg in then_chain:
+            if not isinstance(leg, Mapping) or not leg:
+                continue
+            if not self._support_trade_budget_remaining():
+                break
+            try:
+                from core.player_trade import execute_twp_trade_from_dict
+
+                leg_decision = execute_twp_trade_from_dict(
+                    self, leg, require_human_confirmation=False
+                )
+                leg_dict = (
+                    leg_decision.as_dict()
+                    if hasattr(leg_decision, "as_dict")
+                    else dict(leg_decision or {})
+                )
+            except Exception as exc:
+                leg_dict = {"executed": False, "reason": str(exc)}
+            chain_results.append({"proposal": dict(leg), "decision": dict(leg_dict)})
+            if not bool(leg_dict.get("executed")):
+                break
+            self._bump_support_trade_count()
+            try:
+                self.emit_twitter_event(
+                    getattr(player, "id", None),
+                    f"TwP chain leg: {self._format_twp_proposal_label(leg)}",
+                )
+            except Exception:
+                pass
+
         try:
             for p in list(getattr(self, "players", []) or []):
                 self.update_strategy_dashboard(p)
@@ -6954,29 +7586,38 @@ class Game:
         if not isinstance(followup_item, Mapping):
             followup_item = {}
         followup_action = str(followup_item.get("action", "") or "")
+        chain_note = ""
+        if chain_results:
+            n_ok = sum(1 for c in chain_results if bool((c.get("decision") or {}).get("executed")))
+            chain_note = f"; +{n_ok} chain TwP"
+
         if followup_action not in {"Buy development_card", "Build city", "Build settlement", "Build road"}:
             # S4/R1: partial TwP → chain another support trade before risk/pass
-            chain = self._chain_next_support_trade_plan()
-            if isinstance(chain, Mapping) and chain.get("action"):
-                self._arm_support_trade_chain(chain, source="ai_twp_partial_chain")
-                return {
-                    "ok": True,
-                    "action": "TwP",
-                    "support_action": "TwP",
-                    "reason": "twp_partial_chain_ready",
-                    "message": f"TwP {label}; chain {chain.get('action')}",
-                    "twp_decision": dict(decision_dict),
-                    "proposal": dict(proposal),
-                    "chain_next": dict(chain),
-                }
+            # (skip if we already ran a planned then_twp_chain this pass)
+            if not then_chain:
+                chain = self._chain_next_support_trade_plan()
+                if isinstance(chain, Mapping) and chain.get("action"):
+                    self._arm_support_trade_chain(chain, source="ai_twp_partial_chain")
+                    return {
+                        "ok": True,
+                        "action": "TwP",
+                        "support_action": "TwP",
+                        "reason": "twp_partial_chain_ready",
+                        "message": f"TwP {label}; chain {chain.get('action')}",
+                        "twp_decision": dict(decision_dict),
+                        "proposal": dict(proposal),
+                        "chain_next": dict(chain),
+                        "then_twp_chain_results": list(chain_results),
+                    }
             return {
                 "ok": True,
                 "action": "TwP",
                 "support_action": "TwP",
                 "reason": "twp_executed_no_followup_available_after_rescan",
-                "message": f"TwP {label}",
+                "message": f"TwP {label}{chain_note}",
                 "twp_decision": dict(decision_dict),
                 "proposal": dict(proposal),
+                "then_twp_chain_results": list(chain_results),
             }
 
         followup_result = self._execute_one_ai_plan_item(player, followup_item)
@@ -6985,13 +7626,14 @@ class Game:
                 "ok": True,
                 "action": str(followup_result.get("action", followup_action) or followup_action),
                 "support_action": "TwP",
-                "combined_action": f"TwP + {followup_result.get('action', followup_action)}",
+                "combined_action": f"TwP{chain_note} + {followup_result.get('action', followup_action)}",
                 "reason": "twp_unlocked_and_executed_followup",
-                "message": f"TwP {label}; then {followup_result.get('action', followup_action)}",
+                "message": f"TwP {label}{chain_note}; then {followup_result.get('action', followup_action)}",
                 "twp_decision": dict(decision_dict),
                 "proposal": dict(proposal),
                 "followup_result": dict(followup_result),
                 "followup_plan_item": dict(followup_item),
+                "then_twp_chain_results": list(chain_results),
             }
 
         return {
@@ -6999,11 +7641,12 @@ class Game:
             "action": "TwP",
             "support_action": "TwP",
             "reason": f"twp_executed_followup_failed:{followup_result.get('reason', 'unknown')}",
-            "message": f"TwP {label}; follow-up failed",
+            "message": f"TwP {label}{chain_note}; follow-up failed",
             "twp_decision": dict(decision_dict),
             "proposal": dict(proposal),
             "followup_result": dict(followup_result),
             "followup_plan_item": dict(followup_item),
+            "then_twp_chain_results": list(chain_results),
         }
 
     def _hand_risk_rng_context(self, player: Any = None, *, tag: str = "hand_risk") -> Dict[str, Any]:
@@ -7792,6 +8435,89 @@ class Game:
             "player_id": getattr(player, "id", None),
         }
 
+    def _plan_sticky_structure_if_affordable_now(
+        self, *, step: int = 1
+    ) -> Optional[Dict[str, Any]]:
+        """If sticky/SE settle or city is legal+affordable now, BA that build.
+
+        Used when road-guard Wait would otherwise fire with a completed path
+        (owned sticky roads) and a full settle cost in hand — no TwB needed.
+        """
+        if str(getattr(self, "phase", "")) != "Execution":
+            return None
+        if str(getattr(self, "state", "")) != "ActionSelection":
+            return None
+        player = self.get_current_player()
+        if player is None or self._is_current_player_human_for_execution():
+            return None
+
+        direction = self._current_player_strategic_direction()
+        action = self._target_action_from_strategic_direction(direction)
+        if action not in {"Build settlement", "Build city"}:
+            # Path may still look like "road" if callers didn't filter — prefer
+            # settle when route remaining is empty.
+            route = self._settlement_route_plan()
+            if (
+                isinstance(route, Mapping)
+                and route.get("target_settlement_id") not in (None, "")
+                and not list(route.get("roads_to_build") or [])
+            ):
+                action = "Build settlement"
+            else:
+                return None
+
+        target_candidate = self._candidate_for_ai_twb_target(player, action, direction)
+        if not target_candidate:
+            return None
+        cost = self._execution_cost_vector_for_action(action)
+        hand = self._execution_hand_vector_for_player(player)
+        if not self._vector_can_pay(hand, cost):
+            return None
+
+        tid = None
+        try:
+            tid = int(target_candidate.get("target_id"))
+        except Exception:
+            tid = None
+        # Prefer a live scanner candidate for the same target when present
+        scan = getattr(self, "current_viable_action_scan", None)
+        cand = dict(target_candidate)
+        if isinstance(scan, Mapping) and tid is not None:
+            for c in list((scan.get("candidates") or {}).get(action, []) or []):
+                if not isinstance(c, Mapping):
+                    continue
+                try:
+                    if int(c.get("target_id") or c.get("intersection_id") or -1) == tid:
+                        cand = dict(c)
+                        break
+                except Exception:
+                    continue
+
+        choice = {
+            "action": action,
+            "viable": True,
+            "actionable": True,
+            "priority": 0,
+            "reason": "Sticky/SE structure affordable now (complete target this turn).",
+            "candidates": [cand],
+            "candidate": cand,
+        }
+        plan_item = self._plan_item_from_execution_choice(
+            choice, source="sticky_structure_now", step=step
+        )
+        if not isinstance(plan_item, Mapping) or not plan_item.get("action"):
+            return None
+        if str(plan_item.get("status") or "") in {"blocked", "route_blocked"}:
+            return None
+        if str(plan_item.get("action") or "") not in {"Build settlement", "Build city"}:
+            return None
+        plan_item = dict(plan_item)
+        plan_item["reason"] = (
+            f"Complete sticky target now: {action}"
+            + (f" @{tid}" if tid is not None else "")
+        )
+        return plan_item
+
     def _synthesize_live_need_twb_candidates(
         self,
         *,
@@ -8434,6 +9160,41 @@ class Game:
                     "dig_note": race_ba.get("dig_note"),
                 }
                 plan["source"] = str(plan.get("source") or "canonical_best_action") + "_race_ba"
+        except Exception:
+            pass
+        # Complete sticky/SE target this turn: never leave a road-guard Wait when
+        # the settle/city is already buildable, or TwP/TwB can unlock it.
+        try:
+            status = str((plan or {}).get("status") or "")
+            action = str((plan or {}).get("action") or "")
+            blocked = bool((plan or {}).get("route_blocked")) or status in {
+                "blocked",
+                "route_blocked",
+            }
+            is_wait = action in {"End turn", "Wait", "Pass"} or (
+                "Wait / Prio" in str((plan or {}).get("label") or "")
+            )
+            if blocked or is_wait:
+                # 1) Affordable sticky settle/city now (no TwB needed) — build it
+                direct = self._plan_sticky_structure_if_affordable_now(step=1)
+                if isinstance(direct, Mapping) and direct.get("action"):
+                    direct = dict(direct)
+                    direct["replaced_wait"] = True
+                    direct["prior_ba_source"] = (plan or {}).get("source")
+                    return direct
+                # 2) Unlock via TwP / TwB
+                twp_plan = self._plan_ai_trade_with_player_for_strategy(step=1)
+                if isinstance(twp_plan, Mapping) and twp_plan.get("action"):
+                    twp_plan = dict(twp_plan)
+                    twp_plan["replaced_wait"] = True
+                    twp_plan["prior_ba_source"] = (plan or {}).get("source")
+                    return twp_plan
+                twb_plan = self._plan_ai_trade_with_bank_for_strategy(step=1)
+                if isinstance(twb_plan, Mapping) and twb_plan.get("action"):
+                    twb_plan = dict(twb_plan)
+                    twb_plan["replaced_wait"] = True
+                    twb_plan["prior_ba_source"] = (plan or {}).get("source")
+                    return twb_plan
         except Exception:
             pass
         return plan
@@ -10449,8 +11210,10 @@ class Game:
         print(message)
         return result
 
-    # Official Catan: each player has 15 road pieces.
+    # Official Catan: each player has 15 road, 5 settlement, and 4 city pieces.
     MAX_PLAYER_ROADS: int = 15
+    MAX_PLAYER_SETTLEMENTS: int = 5
+    MAX_PLAYER_CITIES: int = 4
 
     def player_roads_remaining(self, player: Optional[Player] = None) -> int:
         """How many unused road pieces the player still has (0..15)."""
@@ -10466,6 +11229,36 @@ class Game:
         except Exception:
             placed = 0
         return max(0, int(self.MAX_PLAYER_ROADS) - int(placed))
+
+    def player_settlements_remaining(self, player: Optional[Player] = None) -> int:
+        """Unused settlement pieces (0..5). Cities free a settlement piece on upgrade."""
+        if player is None:
+            try:
+                player = self.get_current_player()
+            except Exception:
+                player = None
+        if player is None:
+            return 0
+        try:
+            placed = len(list(getattr(player, "settlements", []) or []))
+        except Exception:
+            placed = 0
+        return max(0, int(self.MAX_PLAYER_SETTLEMENTS) - int(placed))
+
+    def player_cities_remaining(self, player: Optional[Player] = None) -> int:
+        """Unused city pieces (0..4)."""
+        if player is None:
+            try:
+                player = self.get_current_player()
+            except Exception:
+                player = None
+        if player is None:
+            return 0
+        try:
+            placed = len(list(getattr(player, "cities", []) or []))
+        except Exception:
+            placed = 0
+        return max(0, int(self.MAX_PLAYER_CITIES) - int(placed))
 
     def execute_human_play_tfr_action(self) -> Dict[str, Any]:
         """Play Two Free Roads: consume card and start free road placement (1 or 2).
@@ -10775,6 +11568,78 @@ class Game:
         except Exception:
             pass
 
+    def _seat_in_endgame_for_dcard_l2(self, player: Any) -> bool:
+        """Soft endgame gate for VP/TFR buy → L2 (structures≥4 or effective VP≥7)."""
+        try:
+            from core.endgame_sequence import SETTLE_CAP_SOFT
+
+            n_s = len(list(getattr(player, "settlements", []) or []))
+            n_c = len(list(getattr(player, "cities", []) or []))
+            if (n_s + n_c) >= int(SETTLE_CAP_SOFT):
+                return True
+        except Exception:
+            pass
+        try:
+            vp = int(getattr(player, "victory_points", 0) or 0)
+            # Include public specials roughly via game helper if present
+            fn = getattr(self, "_victory_points_for_player", None)
+            if callable(fn):
+                vp = int(fn(player) or vp)
+            return vp >= 7
+        except Exception:
+            return False
+
+    def _maybe_force_l2_after_endgame_dcard_buy(
+        self, player: Any, card_name: Any
+    ) -> Dict[str, Any]:
+        """Endgame only: VP or TFR draw forces explore (residual / LR reconsider)."""
+        out: Dict[str, Any] = {"ok": False, "forced": False, "reason": ""}
+        cn = str(card_name or "").strip().lower()
+        is_vp = "victory" in cn or cn in ("vp", "victory_point", "victorypoint")
+        is_tfr = (
+            "two_free" in cn
+            or "road_building" in cn
+            or cn in ("tfr", "two_free_roads")
+        )
+        if not (is_vp or is_tfr):
+            out["reason"] = "not_vp_or_tfr"
+            return out
+        if not self._seat_in_endgame_for_dcard_l2(player):
+            out["reason"] = "not_endgame"
+            return out
+        reason = "flag:dcard_vp_drawn" if is_vp else "flag:dcard_tfr_drawn"
+        try:
+            from core.strategy_sticky import flag_strategy_recalc
+
+            flag_strategy_recalc(player, reason, detail={"card_name": card_name})
+            try:
+                setattr(player, "force_strategy_recalc", True)
+            except Exception:
+                pass
+            try:
+                from core.strategy_reconsider import set_reconsider_flag
+
+                set_reconsider_flag(player, "need_next_target", reason=reason)
+            except Exception:
+                pass
+            # Light milestone-style pending resolve (do not clear sticky for knight-like)
+            try:
+                setattr(
+                    player,
+                    "pending_full_resolve",
+                    {
+                        "reason": reason,
+                        "trigger": "endgame_dcard_vp_tfr",
+                        "detail": {"card_name": card_name},
+                    },
+                )
+            except Exception:
+                pass
+            out.update({"ok": True, "forced": True, "reason": reason})
+        except Exception as exc:
+            out["error"] = str(exc)
+        return out
+
     def _execute_ai_buy_dcard(self, player: Player, plan_item: Mapping[str, Any]) -> Dict[str, Any]:
         action = "Buy development_card"
         cost = self._execution_cost_vector_for_action(action)
@@ -10843,11 +11708,17 @@ class Game:
                 note_lr_tooling(self, player, reason="after_buy_dcard")
         except Exception:
             pass
+        # Endgame: VP or TFR buy → force L2 explore (shrink VP/DC residual / reconsider LR)
+        try:
+            out_l2 = self._maybe_force_l2_after_endgame_dcard_buy(player, card_name)
+        except Exception:
+            out_l2 = {"ok": False}
         out: Dict[str, Any] = {
             "ok": True,
             "action": action,
             "card_name": card_name,
             "strategy_recalc_flagged_opponents": out_flag,
+            "endgame_dcard_l2": out_l2,
         }
         # W2: buying a VP card can push total ≥ threshold.
         try:
@@ -10862,6 +11733,8 @@ class Game:
         cost = self._execution_cost_vector_for_action(action)
         if target is None:
             return {"ok": False, "action": action, "reason": "missing_target"}
+        if self.player_cities_remaining(player) <= 0:
+            return {"ok": False, "action": action, "reason": "no_city_pieces_remaining", "target_id": target}
         if target not in list(getattr(player, "settlements", []) or []):
             return {"ok": False, "action": action, "reason": "target_not_owned_settlement", "target_id": target}
         if not self._can_player_pay_execution_cost(player, cost):
@@ -10960,6 +11833,8 @@ class Game:
         cost = self._execution_cost_vector_for_action(action)
         if target is None:
             return {"ok": False, "action": action, "reason": "missing_target"}
+        if self.player_settlements_remaining(player) <= 0:
+            return {"ok": False, "action": action, "reason": "no_settlement_pieces_remaining", "target_id": target}
         if not self._can_player_pay_execution_cost(player, cost):
             return {"ok": False, "action": action, "reason": "cannot_pay_cost", "target_id": target}
         if not self.can_build_intersection_tf(target, player):
@@ -11059,19 +11934,32 @@ class Game:
                 "road_id": list(road),
             }
 
+        # Capture own LR length before mutate (WP-H)
+        length_before = None
+        try:
+            from core.longest_road import compute_longest_road_for_player
+
+            length_before = int(compute_longest_road_for_player(self, player) or 0)
+        except Exception:
+            try:
+                length_before = int(getattr(player, "size_longest_route", 0) or 0)
+            except Exception:
+                length_before = None
+
         self.board.occupy_road(road, "Road", player.color)
         if road not in list(getattr(player, "roads", []) or []):
             player.roads.append(road)
         self._deduct_execution_cost(player, cost, category="buy", message=f"built Road {list(road)}", metadata={"road_id": list(road)})
+        lr_info: Dict[str, Any] = {}
         try:
-            self.recompute_longest_road(
+            lr_info = self.recompute_longest_road(
                 reason="after_ai_build_road",
                 emit_events=True,
                 refresh_scoreboard=True,
                 actor=player,
-            )
+            ) or {}
         except Exception:
-            pass
+            lr_info = {}
         # S1 ext: LR-pursuing opponents batch-flag (road can change race without flip)
         try:
             from core.strategy_sticky import flag_opponents_after_road
@@ -11079,6 +11967,54 @@ class Game:
             out_flag = flag_opponents_after_road(self, player, road_id=list(road))
         except Exception:
             out_flag = {}
+        # Light sticky-settle risk refresh (no L2): path road can end soft races
+        sticky_risk: Dict[str, Any] = {}
+        try:
+            from core.strategy_sticky import refresh_sticky_settle_risk_after_own_road
+
+            sticky_risk = refresh_sticky_settle_risk_after_own_road(
+                self, player, road=list(road)
+            )
+        except Exception:
+            sticky_risk = {}
+        # WP-H: LR grow / sticky path complete → force L2 retarget (S5→S44 dig)
+        l2_road: Dict[str, Any] = {}
+        try:
+            from core.strategy_sticky import maybe_force_l2_after_lr_or_component_road
+
+            length_after = None
+            try:
+                ch = (lr_info or {}).get("length_changes") or {}
+                pid = int(getattr(player, "id", 0) or 0)
+                if pid in ch:
+                    length_after = int((ch[pid] or {}).get("to") or 0)
+            except Exception:
+                length_after = None
+            if length_after is None:
+                try:
+                    length_after = int(getattr(player, "size_longest_route", 0) or 0)
+                except Exception:
+                    length_after = None
+            holder_changed = bool((lr_info or {}).get("holder_changed"))
+            # Own gain of LR also counted via holder_changed + actor
+            try:
+                if holder_changed and int((lr_info or {}).get("holder_id") or -1) == int(
+                    getattr(player, "id", -2) or -2
+                ):
+                    holder_changed = True
+            except Exception:
+                pass
+            l2_road = maybe_force_l2_after_lr_or_component_road(
+                self,
+                player,
+                road=list(road),
+                length_before=length_before,
+                length_after=length_after,
+                holder_changed=holder_changed,
+                sticky_risk=sticky_risk,
+            )
+        except Exception:
+            l2_road = {}
         try:
             from core.sidestep_s142_drive import latch_opp_build_for_opponents
 
@@ -11100,6 +12036,8 @@ class Game:
             "action": action,
             "road_id": list(road),
             "strategy_recalc_flagged_opponents": out_flag,
+            "sticky_settle_risk_refresh": dict(sticky_risk) if sticky_risk else {},
+            "lr_component_l2": dict(l2_road) if l2_road else {},
         }
         try:
             out["win_check"] = self._maybe_declare_winner_after("after_ai_build_road", player)
@@ -11226,6 +12164,12 @@ class Game:
 
         result.update({"ok": True, "reason": "executed", "card_name": card_name})
         try:
+            result["endgame_dcard_l2"] = self._maybe_force_l2_after_endgame_dcard_buy(
+                player, card_name
+            )
+        except Exception:
+            result["endgame_dcard_l2"] = {"ok": False}
+        try:
             result["win_check"] = self._maybe_declare_winner_after("after_human_buy_dcard", player)
         except Exception:
             result["win_check"] = {"ok": False, "won": False, "reason": "win_check_exception"}
@@ -11255,6 +12199,9 @@ class Game:
         cost = self._execution_cost_vector_for_action(action)
         if target < 0:
             result["reason"] = "missing_target"
+            return result
+        if self.player_cities_remaining(player) <= 0:
+            result["reason"] = "no_city_pieces_remaining"
             return result
         if target not in [int(x) for x in list(getattr(player, "settlements", []) or [])]:
             result["reason"] = "target_not_owned_settlement"
@@ -11383,6 +12330,9 @@ class Game:
         cost = self._execution_cost_vector_for_action(action)
         if target < 0:
             result["reason"] = "missing_target"
+            return result
+        if self.player_settlements_remaining(player) <= 0:
+            result["reason"] = "no_settlement_pieces_remaining"
             return result
         if not self._can_player_pay_execution_cost(player, cost):
             result["reason"] = "cannot_pay_cost"
@@ -11630,6 +12580,16 @@ class Game:
             )
         except Exception:
             result["strategy_recalc_flagged_opponents"] = {}
+
+        # Light sticky-settle risk refresh (no L2) when path road advances settle race
+        try:
+            from core.strategy_sticky import refresh_sticky_settle_risk_after_own_road
+
+            result["sticky_settle_risk_refresh"] = refresh_sticky_settle_risk_after_own_road(
+                self, player, road=list(road)
+            )
+        except Exception:
+            result["sticky_settle_risk_refresh"] = {}
 
         try:
             self.update_strategy_dashboard(player)
@@ -12827,6 +13787,11 @@ class Game:
             # once the table has advanced to P1 of the next round.
             if finished_last_player and completed_round > 0:
                 try:
+                    # Lag ring: capture player_view as of end of completed_round
+                    self.snapshot_rcard_player_view_end_of_round()
+                except Exception as exc:
+                    print(f"game.advance_turn | rcard view lag snapshot failed: {exc}")
+                try:
                     self._auto_save_end_of_round(completed_round)
                 except Exception as exc:
                     print(f"game.advance_turn | end-of-round auto-save failed: {exc}")
@@ -13002,6 +13967,10 @@ class Game:
                     [[1, 0, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0, 0], [3, 0, 0, 0, 0, 0, 0], [4, 0, 0, 0, 0, 0, 0]],
                 ),
                 resource_production_game_player_view=row.get("resource_production_game_player_view", []),
+                resource_production_game_player_view_lag=row.get(
+                    "resource_production_game_player_view_lag",
+                    [],
+                ),
             ))
         if restored:
             self.resource_card_dashboard = restored
@@ -13551,6 +14520,22 @@ class Game:
             pass
         self._sync_all_turn_detail_mirrors_from_ledger()
         self.get_current_player()
+
+        # Reachability maps: do not trust saved matrices / leftover freshness.
+        # Gen2 reseeded after IP; Gen3 reseeds at begin_execution_turn — clear
+        # the once-flag and dirty seats so the next Execution turn (or ensure_*)
+        # rebuilds from the restored board.
+        try:
+            self._reachability_maps_seeded = False
+            from core.player_reachability import mark_dirty, rebuild_all_maintained_seats
+
+            for p in list(getattr(self, "players", None) or []):
+                mark_dirty(p)
+            if str(getattr(self, "phase", "") or "") == "Execution":
+                self.last_reachability_seed = rebuild_all_maintained_seats(self)
+                self._reachability_maps_seeded = True
+        except Exception:
+            self._reachability_maps_seeded = False
 
         if self.phase == "Execution":
             try:

@@ -77,7 +77,7 @@ DICEROLL_SET_TF: bool = False
 NAME_DR_FILE: str = "DiceRolls_4_Players_13_Mar_2025_00_22_10.txt"
 """File name for dice roll sequence."""
 
-NO_GUI_AT_ALL_TF: bool = True
+NO_GUI_AT_ALL_TF: bool = False
 """Headless lab mode: when True, no interactive GUI presentation and no sounds.
 
 False → normal product path (GUI + audio).
@@ -143,6 +143,34 @@ opponent unplayed DCard triplets, and opponent DCard buy types in Events.
 Human always sees full own DCard triplets. When True: full dig-in / Check-Mode UI.
 (Overview term: Check-Mode; former constant name was DEBUG_MODE.)"""
 
+# Opponent RCard public-view memory (AI / Strategy-Engine belief — not Dig truth).
+# "all" = unlimited (today's full cumulative player_view).
+# 1..4 = remember only evidence from the last N completed rounds
+# (= now_view − view_from_N_rounds_ago on ResourceCardDashboard).
+RCARD_MEMORY_OPPONENTS = "all"  # type: ignore[var-annotated]
+"""AI belief window for opponent RCards via dashboard player_view delta.
+
+- ``\"all\"`` (default): use full ``resource_production_game_player_view``.
+- ``1``..``4``: ``player_view_now - player_view_lag[N]`` (N rounds ago).
+Truth hands on ``Player.rcards`` stay available for Dig / CHECK_MODE.
+See ``core.rcard_view_memory`` and MANUAL.md.
+"""
+
+WAY_NEED_CONSIDER_HAND_DEFAULT: bool = False
+"""Default for ``way_resource_need(..., consider_hand=)``.
+
+False = Player One structure residual only (ignore hand) — Dig/whole-way ETA mass.
+True = also subtract hand (self truth / opponent RCARD_MEMORY belief).
+See ``docs/way_resource_need_plan.md``.
+"""
+
+REACHABILITY_MAPS: bool = True
+"""When True, maintain per-player ``path_map`` / ``pathlength_map`` / ``real_distance_map``
+via ``core.player_reachability`` and prefer map queries over fresh BFS in Tier H/M callers
+(with BFS fallback on miss/stale). Default True for AI seats. See
+``docs/player_reachability_maps_plan.md``.
+"""
+
 SIDESTEP_COMPARE: bool = False
 """Legacy PLN2 Side compare dumps (R-cadence). Default off — S142 uses a/b/c triggers."""
 
@@ -195,10 +223,12 @@ EXPECTED_HAND_DEBUG_TOP_N: int = 20
 """Number of EH-ranked candidates written to MG debug logging."""
 
 # ── Phase C2 / product: explicit Victory-Way / L2 reassess ───────────────────
-# Product (new games): AI seats [2, [4, 4]] (setback OR every 4 own turns);
-# human seats [0] (sticky + closed-table L2 only). Applied by is_human in
+# Product (new games): AI + human seats [0] — L2 only via closed-table a/b/c
+# gates (need_next_target / board shocks / LA-LR, etc.), same posture as S142
+# triggers default-off. Opt-in schedule [2,[4,4]] via --arm product / setback_every4
+# or EXPLICIT_142_RECALC_SCHEDULE_SETBACK_EVERY4. Applied by is_human in
 # core/explicit_142_recalc.apply_product_defaults_to_players.
-# Lab sticky baseline: run_headless --arm control (all [0]).
+# Lab sticky / a/b/c baseline: run_headless --arm control (all [0]).
 # Mixed list: ints and [4, n]. Codes: 0=none 1=vp 2=setback 3=hard 4=[4,n] 5=milestones
 # CLI: --explicit-recalc / --arm  (MANUAL.md Phase C2)
 
@@ -211,17 +241,24 @@ EXPLICIT_RECALC_EVERY_N_DEFAULT: int = 2
 EXPLICIT_RECALC_MILESTONE_VPS: tuple = (2, 4, 6, 8)
 """VP milestones for code 5."""
 
-EXPLICIT_142_RECALC_PRODUCT_AI: list = [2, [4, 4]]
-"""Default explicit_142_recalc for AI seats (setback + every 4 own turns).
+EXPLICIT_142_RECALC_PRODUCT_AI: list = [0]
+"""Default explicit_142_recalc for AI seats: none — a/b/c L2 gates only.
 
-WP3 codes 6/7 are **not** included (opt-in via arm / seat map / LAB_WP3).
+Opt-in timer/setback: ``EXPLICIT_142_RECALC_SCHEDULE_SETBACK_EVERY4`` /
+``--arm product`` / ``--arm setback_every4``. WP3 codes 6/7 via LAB_WP3 / arm.
 """
 
 EXPLICIT_142_RECALC_PRODUCT_HUMAN: list = [0]
 """Humans: no explicit extra L2 (sticky + P1–P3 closed-table gates only)."""
 
+EXPLICIT_142_RECALC_SCHEDULE_SETBACK_EVERY4: list = [2, [4, 4]]
+"""Opt-in schedule (kept): ETA setback OR every 4 own turns.
+
+Former product AI default; use for lab A/B vs a/b/c-only (``--arm product``).
+"""
+
 EXPLICIT_142_RECALC_LAB_WP3: list = [2, [4, 4], 6, 7]
-"""Lab arm: product AI + sticky-target threat (6) + LR tooling (7)."""
+"""Lab arm: setback+every4 + sticky-target threat (6) + LR tooling (7)."""
 
 EXPLICIT_L2_CODE6_MAX_PER_GAME: int = 4
 """Max code-6 (threat) latches per seat per game."""
@@ -233,15 +270,15 @@ EXPLICIT_L2_WP3_MAX_PER_GAME: int = 6
 """Max combined code 6+7 latches per seat per game."""
 
 EXPLICIT_142_RECALC_BY_SEAT: dict = {
-    1: [2, [4, 4]],
-    2: [2, [4, 4]],
-    3: [2, [4, 4]],
-    4: [2, [4, 4]],
+    1: [0],
+    2: [0],
+    3: [0],
+    4: [0],
 }
-"""Documentation / all-AI template seat map (same as product AI).
+"""Documentation / all-AI template seat map (same as product AI = a/b/c only).
 
 Live Game init uses **is_human** via ``apply_product_defaults_to_players`` when
-no CLI seat map is passed — humans get ``EXPLICIT_142_RECALC_PRODUCT_HUMAN``.
+no CLI seat map is passed — both AI and human get ``[0]`` unless overridden.
 CLI ``--arm`` / ``--explicit-recalc`` still override by seat id.
 """
 
@@ -288,6 +325,49 @@ Values:
 
 Default product intent: ``filter_and_force_switch`` (operator lock improving_SE_v3).
 Set ``off`` for A/B control arms.
+"""
+
+# L2 sync-first / transparency / shadow overlook dig
+# Plan: docs/L2_sync_transparency_shadow_plan.md
+L2_SYNC_FIRST: str = "on"
+"""Sync-first filter before deep L2 scoring (``can_realize_way`` on candidate pool).
+
+Values:
+  - ``off`` — historical: cap then score then fit-demote
+  - ``on`` — filter candidates to sync-fit before EH/board audits (lab/product intent)
+"""
+
+L2_DOSSIER: str = "cs"
+"""Emit L2 candidate dossier for dig / CS.
+
+Values:
+  - ``off`` — no dossier
+  - ``cs`` — compact fields on CS + ``game._last_l2_way_dossier``
+  - ``full`` — also append ``l2_dossier.jsonl`` when batch path set
+"""
+
+L2_SHADOW_MISS: str = "on"
+"""Observe-only shadow: abstract-rank all sync-fit ways vs L2 winner; log cap misses."""
+
+L2_ADAPTIVE_K: str = "on"
+"""Adaptive K' among fit ways (score-all-fit when n_fit small; else min(n_fit, stage K))."""
+
+L2_SHADOW_EVERY_N: int = 1
+"""Run shadow overlook dig every N L2 fires per seat (1 = every L2)."""
+
+L2_MISS_MIN_GAIN: float = 1.0
+"""Minimum abstract-turns gain to count as ``l2_cap_miss``."""
+
+L2_SCORE_ALL_FIT_MAX: int = 12
+"""If n_fit ≤ this and adaptive K on, deep-score all sync-fit ways."""
+
+L2_TARGET_SCREEN: str = "mark_only"
+"""C/S target screen (RP / RemTR / bottleneck / TR) — Phase P.
+
+Values:
+  - ``off`` — no target screen
+  - ``mark_only`` — PLN2/dossier mark inferior without ETA; keep combo pool (product)
+  - ``prune`` — drop screened targets before EH combo search (lab; after mid R2)
 """
 
 # WP6: Longest Road recompute scoping (see lr_recompute_opt / game.recompute_longest_road)

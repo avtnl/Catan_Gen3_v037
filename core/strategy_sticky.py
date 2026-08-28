@@ -64,6 +64,7 @@ def _audit_get(audit: Any, key: str, default: Any = None) -> Any:
 
 
 def _road_key(edge: Any) -> Optional[Tuple[int, int]]:
+    """Undirected road_id (min, max). Ownership / legal sets use this only."""
     try:
         if isinstance(edge, Mapping):
             a = edge.get("a", edge.get(0))
@@ -80,6 +81,11 @@ def _road_key(edge: Any) -> Optional[Tuple[int, int]]:
 
 
 def _normalize_roads(roads: Any) -> List[List[int]]:
+    """Dedupe to undirected road_ids ``[min, max]`` (order of first occurrence).
+
+    Do **not** use this for path execution order. Paths need directed steps
+    from the player's network toward the tip — see ``orient_path_roads_network_to_tip``.
+    """
     out: List[List[int]] = []
     seen = set()
     for edge in list(roads or []):
@@ -89,6 +95,140 @@ def _normalize_roads(roads: Any) -> List[List[int]]:
         seen.add(key)
         out.append([int(key[0]), int(key[1])])
     return out
+
+
+def _network_nodes_for_player(player: Any) -> set:
+    """Intersections on this player's S/C + road network."""
+    nodes: set = set()
+    try:
+        for sid in list(getattr(player, "settlements", []) or []):
+            nodes.add(int(sid))
+        for cid in list(getattr(player, "cities", []) or []):
+            nodes.add(int(cid))
+    except Exception:
+        pass
+    try:
+        for edge in list(getattr(player, "roads", []) or []):
+            key = _road_key(edge)
+            if key is None:
+                continue
+            nodes.add(int(key[0]))
+            nodes.add(int(key[1]))
+    except Exception:
+        pass
+    return nodes
+
+
+def orient_path_roads_network_to_tip(
+    player: Any,
+    roads: Any,
+    tip_id: Any = None,
+) -> List[List[int]]:
+    """Orient / order path edges as directed steps ``[from, to]`` toward *tip*.
+
+    Core distinction (Gen2 / Outlook):
+      - **road_id** = undirected ``[min, max]`` (board edge identity)
+      - **path step** = directed ``[from, to]`` along the route from the player's
+        network toward the settlement tip (e.g. network@15 → ``[15, 14]`` then
+        ``[14, 13]`` for tip@13 — never tip-first ``[13, 14]`` as the next build)
+
+    Accepts mixed undirected ids or directed steps; returns directed steps in
+    network→tip build order. Empty if *roads* is empty.
+    """
+    tip = _safe_int(tip_id, None)
+    undirected: List[Tuple[int, int]] = []
+    seen = set()
+    for edge in list(roads or []):
+        key = _road_key(edge)
+        if key is None or key in seen:
+            continue
+        seen.add(key)
+        undirected.append(key)
+    if not undirected:
+        return []
+
+    network = _network_nodes_for_player(player)
+    adj: Dict[int, List[int]] = {}
+    for a, b in undirected:
+        adj.setdefault(int(a), []).append(int(b))
+        adj.setdefault(int(b), []).append(int(a))
+
+    # Infer tip: degree-1 node in the subgraph that is not already on the network
+    if tip is None:
+        leaves = [n for n, nbrs in adj.items() if len(nbrs) == 1 and n not in network]
+        if len(leaves) == 1:
+            tip = int(leaves[0])
+        elif leaves:
+            tip = int(max(leaves))  # stable-ish pick
+        else:
+            # both ends on network or cycle — keep undirected id order as last resort
+            return [[int(a), int(b)] for a, b in undirected]
+
+    # BFS from network nodes that touch the path subgraph → reconstruct tip path
+    from collections import deque
+
+    starts = [n for n in network if n in adj]
+    if not starts:
+        # Path not yet attached: orient so tip is the last node if possible
+        # Prefer a leaf that is the tip, walk the unique path
+        if tip in adj and len(adj) <= len(undirected) + 1:
+            # pick other leaf as start
+            leaves = [n for n, nbrs in adj.items() if len(nbrs) == 1]
+            start = None
+            for leaf in leaves:
+                if int(leaf) != int(tip):
+                    start = int(leaf)
+                    break
+            if start is None and leaves:
+                start = int(leaves[0])
+            if start is not None:
+                steps: List[List[int]] = []
+                prev = None
+                cur = start
+                guard = 0
+                while cur is not None and guard < 64:
+                    guard += 1
+                    nbrs = [x for x in adj.get(cur, []) if x != prev]
+                    if not nbrs:
+                        break
+                    nxt = nbrs[0]
+                    steps.append([int(cur), int(nxt)])
+                    if int(nxt) == int(tip):
+                        return steps
+                    prev, cur = cur, nxt
+        return [[int(a), int(b)] for a, b in undirected]
+
+    parent: Dict[int, Optional[int]] = {}
+    q: deque = deque()
+    for s in sorted(starts):
+        if s not in parent:
+            parent[int(s)] = None
+            q.append(int(s))
+    while q:
+        u = q.popleft()
+        for v in sorted(adj.get(u, [])):
+            if int(v) in parent:
+                continue
+            parent[int(v)] = int(u)
+            q.append(int(v))
+
+    if tip not in parent:
+        # Tip not reachable through given edges from network — return
+        # undirected leftovers (caller may still discover a path).
+        return [[int(a), int(b)] for a, b in undirected]
+
+    nodes_rev: List[int] = []
+    cur: Optional[int] = int(tip)
+    guard = 0
+    while cur is not None and guard < 64:
+        guard += 1
+        nodes_rev.append(int(cur))
+        cur = parent.get(int(cur))
+    nodes_rev.reverse()
+    steps = []
+    for i in range(len(nodes_rev) - 1):
+        steps.append([int(nodes_rev[i]), int(nodes_rev[i + 1])])
+    return steps
 
 
 def get_sticky_commitment(player: Any) -> Optional[Dict[str, Any]]:
@@ -287,6 +427,15 @@ def flag_opponents_after_structure(
         invalidate_board_way_portfolio_cache(game, f"structure:{reason}")
     except Exception:
         pass
+    # Reachability maps: settle amends geometry; city upgrade does not.
+    reachability: Dict[str, Any] = {}
+    if "city" not in kind and target_id is not None:
+        try:
+            from core.player_reachability import notify_settlement_built
+
+            reachability = notify_settlement_built(game, builder, int(target_id))
+        except Exception:
+            reachability = {}
     return {
         "reason": reason,
         "builder_id": builder_id,
@@ -294,6 +443,7 @@ def flag_opponents_after_structure(
         "skipped_irrelevant_player_ids": skipped_irrelevant,
         "structure": kind,
         "target_id": target_id,
+        "reachability": reachability,
     }
 
 
@@ -392,8 +542,16 @@ def flag_opponents_after_road(
         invalidate_board_way_portfolio_cache(game, f"road:{reason}")
     except Exception:
         pass
+    reachability: Dict[str, Any] = {}
+    try:
+        from core.player_reachability import notify_road_built
+
+        reachability = notify_road_built(game, builder, road_id)
+    except Exception:
+        reachability = {}
     return {
         "reason": reason,
+        "reachability": reachability,
         "builder_id": builder_id,
         "flagged_player_ids": flagged,
         "skipped_irrelevant_player_ids": skipped,
@@ -927,16 +1085,33 @@ def snapshot_opponent_board(
     }
 
 
-def remaining_roads_for_player(player: Any, roads: Sequence[Any]) -> List[List[int]]:
-    """Drop edges the player already owns (progress along the route)."""
+def remaining_roads_for_player(
+    player: Any,
+    roads: Sequence[Any],
+    tip_id: Any = None,
+) -> List[List[int]]:
+    """Drop owned edges, then return **directed** network→tip path steps.
+
+    Ownership uses undirected road_ids. Returned steps keep path direction so
+    ``roads_to_build[0]`` is always the legal next build from the network when
+    the route is attached (e.g. ``[15, 14]`` not tip-first ``[13, 14]``).
+    """
     owned = _own_road_keys(player)
-    out: List[List[int]] = []
-    for edge in _normalize_roads(roads):
+    remaining_u: List[Tuple[int, int]] = []
+    seen = set()
+    for edge in list(roads or []):
         key = _road_key(edge)
-        if key is None or key in owned:
+        if key is None or key in owned or key in seen:
             continue
-        out.append([int(key[0]), int(key[1])])
-    return out
+        seen.add(key)
+        remaining_u.append(key)
+    if not remaining_u:
+        return []
+    tip = _safe_int(tip_id, None)
+    directed = orient_path_roads_network_to_tip(player, remaining_u, tip_id=tip)
+    if directed:
+        return directed
+    return [[int(a), int(b)] for a, b in remaining_u]
 
 
 def route_edges_legal(game: Any, player: Any, roads: Sequence[Any]) -> Tuple[bool, str]:
@@ -1047,6 +1222,617 @@ def find_audit_for_way(audits: Sequence[Any], way_id: int) -> Optional[Any]:
     return None
 
 
+def _residual_new_settles(direction: Mapping[str, Any], player: Any = None) -> int:
+    """Best-effort remaining new settlements from direction / way residual."""
+    for key in (
+        "req_settles",
+        "remaining_new_settlements",
+        "required_new_intersections",
+    ):
+        v = _safe_int((direction or {}).get(key), None)
+        if v is not None and v > 0:
+            return int(v)
+    try:
+        req = (direction or {}).get("requirements")
+        if isinstance(req, Mapping):
+            v = _safe_int(
+                req.get("required_new_intersections")
+                or req.get("remaining_new_settlements")
+                or req.get("new_settlements"),
+                None,
+            )
+            if v is not None and v > 0:
+                return int(v)
+    except Exception:
+        pass
+    try:
+        from core.strategy_way_residual import compute_way_residual
+
+        bag = compute_way_residual(
+            (direction or {}).get("preferred_way_id")
+            or (direction or {}).get("way_id")
+            or getattr(player, "preferred_way_id", None),
+            player,
+            preferred=direction,
+        )
+        v = _safe_int((bag or {}).get("req_settles"), 0) or 0
+        if v > 0:
+            return int(v)
+    except Exception:
+        pass
+    return 0
+
+
+def _pick_best_open_settle_tip(
+    game: Any,
+    player: Any,
+    audits: Sequence[Any],
+    direction: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Pick an open settle tip (portfolio or geometry) for post-structure recommit.
+
+    Returns ``{target_id, roads, dist, score_key}`` or None.
+    Does not hard-ban contested/high race — shortest playboard path wins.
+    """
+    tips: List[Dict[str, Any]] = []
+
+    def _add(tid: Any, *, roads: Any = None, dist: Any = None, eta: Any = None, score: Any = None) -> None:
+        i = _safe_int(tid, None)
+        if i is None:
+            return
+        try:
+            if target_occupied_by_other(game, player, int(i)) or target_blocked_on_board(game, int(i)):
+                return
+        except Exception:
+            pass
+        if roads is not None:
+            directed = orient_path_roads_network_to_tip(player, roads, tip_id=int(i))
+            road_list = directed if directed else _normalize_roads(roads)
+        else:
+            road_list = []
+        tips.append(
+            {
+                "target_id": int(i),
+                "roads": road_list,
+                "dist": _safe_int(dist, 99) or 99,
+                "eta": _safe_float(eta, 9999.0),
+                "score": _safe_float(score, -9999.0),
+            }
+        )
+
+    # Preferred audit portfolio first
+    preferred_way = _safe_int(
+        (direction or {}).get("preferred_way_id") or (direction or {}).get("way_id"),
+        None,
+    )
+    ordered_audits = list(audits or [])
+    if preferred_way is not None:
+        ordered_audits = sorted(
+            ordered_audits,
+            key=lambda a: 0 if _safe_int(_audit_get(a, "way_id"), None) == preferred_way else 1,
+        )
+    for audit in ordered_audits:
+        for item in _portfolio_list(audit):
+            tid = _target_id_of(item)
+            if tid is None:
+                continue
+            kind = str(_target_field(item, "kind", "") or _target_field(item, "target_kind", "") or "S").upper()
+            if kind in ("C", "CITY", "CITY_UPGRADE"):
+                continue
+            roads = (
+                _target_field(item, "roads_to_build", None)
+                or _target_field(item, "path", None)
+                or _target_field(item, "roads", None)
+            )
+            _add(
+                tid,
+                roads=roads,
+                dist=_target_field(item, "distance_roads", None) or _target_field(item, "dist", None),
+                eta=_target_field(item, "self_eta", None) or _target_field(item, "eta", None),
+                score=_target_field(item, "priority_score", None) or _target_field(item, "score", None),
+            )
+        if tips:
+            break
+
+    # Geometry fallback — WP-R4: map-first, then outlook
+    if not tips and game is not None and player is not None:
+        try:
+            from core.constants import REACHABILITY_MAPS
+            from core.outlook_logic import (
+                find_reachable_new_settlement_paths,
+                next_settlement_spots,
+            )
+            from core.player_reachability import (
+                SENTINEL,
+                ensure_reachability_maps,
+                maps_are_fresh,
+                path_to_target,
+                remaining_roads_to_target,
+            )
+
+            if bool(REACHABILITY_MAPS):
+                ensure_reachability_maps(game, player)
+
+            pid = int(getattr(player, "id"))
+            spots = list(next_settlement_spots(game, pid) or [])
+
+            if maps_are_fresh(player):
+                # Prefer open tips with remaining roads ≤ 3 from maps
+                try:
+                    from core.outlook_logic import new_settlement_spots
+
+                    cand_ids = list(new_settlement_spots(game, pid) or [])[:16]
+                except Exception:
+                    cand_ids = list(spots)[:16]
+                for tid in cand_ids:
+                    rd = remaining_roads_to_target(player, int(tid))
+                    if rd is None or int(rd) >= SENTINEL or int(rd) < 1:
+                        continue
+                    if int(rd) > 3:
+                        continue
+                    _add(
+                        tid,
+                        roads=path_to_target(player, int(tid)),
+                        dist=int(rd),
+                    )
+
+            if not tips:
+                paths = find_reachable_new_settlement_paths(
+                    game, player, target_ids=spots[:12] or None, max_distance=3
+                )
+                for p in paths or []:
+                    if not isinstance(p, Mapping):
+                        continue
+                    _add(
+                        p.get("target_settlement_id")
+                        or p.get("target_id")
+                        or p.get("settlement_id"),
+                        roads=p.get("roads_to_build") or p.get("path"),
+                        dist=p.get("roads_remaining") or p.get("distance"),
+                        eta=p.get("eta"),
+                    )
+            if not tips:
+                for sid in spots[:8]:
+                    _add(sid, dist=0)
+        except Exception:
+            pass
+
+    if not tips:
+        return None
+    tips.sort(key=lambda t: (float(t["eta"]), int(t["dist"]), -float(t["score"]), int(t["target_id"])))
+    return tips[0]
+
+
+# Soft invalidate reasons that should not abandon a still-Fastest settle (WP-STICKY1).
+_SOFT_RERANK_INVALIDATE = (
+    "force_strategy_recalc",
+    "strategy_recalc",
+    "flag:lr_or_component",
+    "need_next_target",
+    "wp_h",
+    "same_way",
+)
+# New tip must beat previous ETA by at least this many turns to steal sticky.
+STICKY1_ETA_IMPROVE_MIN = 1.0
+# WP-STICKY2: block way_switch that worsens next-settle ETA by this much (Dig g002 S47→S61).
+STICKY2_ETA_WORSEN_MIN = 1.5
+_STICKY2_ALLOW_SWITCH_TOKENS = (
+    "race_",
+    "deny",
+    "occupied",
+    "blocked",
+    "impossible",
+    "explicit_142",
+    "board_fit",
+    "specials_dead",
+    "offway",
+    "s14_2",
+    "structure_surplus",
+    "holds_lr",
+    "holds_la",
+)
+
+
+def _settle_eta_from_audits_or_direction(
+    audits: Sequence[Any],
+    direction: Mapping[str, Any],
+    target_id: int,
+) -> Optional[float]:
+    """Best-effort ETA for a settle id from audits / direction catalog."""
+    tid = int(target_id)
+    for audit in list(audits or []):
+        try:
+            settles = _audit_get(audit, "plan_settles") or _audit_get(audit, "settles")
+            if isinstance(settles, Mapping):
+                row = settles.get(tid) or settles.get(str(tid))
+                if isinstance(row, Mapping):
+                    for k in ("eta", "eta_turns", "turns"):
+                        if row.get(k) is not None:
+                            return float(row.get(k))
+                elif row is not None:
+                    try:
+                        return float(row)
+                    except Exception:
+                        pass
+            # compact catalog "24:3:14.0:high:..."
+            cat = str(_audit_get(audit, "plan_catalog") or "")
+            for part in cat.split(";"):
+                if part.startswith(f"S{tid}:") or part.startswith(f"{tid}:"):
+                    bits = part.split(":")
+                    if len(bits) >= 3:
+                        try:
+                            return float(bits[2])
+                        except Exception:
+                            pass
+        except Exception:
+            continue
+    try:
+        cat = str(direction.get("plan_catalog") or "")
+        for part in cat.split(";"):
+            if part.startswith(f"S{tid}:"):
+                bits = part.split(":")
+                if len(bits) >= 3:
+                    return float(bits[2])
+    except Exception:
+        pass
+    # direction portfolio sites
+    for key in ("plan_settles", "settlement_etas", "settle_etas"):
+        bag = direction.get(key)
+        if isinstance(bag, Mapping):
+            row = bag.get(tid) or bag.get(str(tid))
+            if isinstance(row, Mapping) and row.get("eta") is not None:
+                try:
+                    return float(row.get("eta"))
+                except Exception:
+                    pass
+            try:
+                if row is not None:
+                    return float(row)
+            except Exception:
+                pass
+    return None
+
+
+def _target_still_open_for_player(
+    game: Any,
+    player: Any,
+    target_id: int,
+) -> bool:
+    """True if settle vertex is still buildable / not occupied."""
+    tid = int(target_id)
+    try:
+        for p in list(getattr(game, "players", []) or []):
+            for attr in ("settlements", "cities"):
+                owned = list(getattr(p, attr, []) or [])
+                if tid in owned or str(tid) in {str(x) for x in owned}:
+                    return False
+    except Exception:
+        pass
+    try:
+        board = getattr(game, "board", None)
+        if board is not None:
+            occ = getattr(board, "is_vertex_occupied", None) or getattr(
+                board, "vertex_occupied", None
+            )
+            if callable(occ) and bool(occ(tid)):
+                return False
+            can = getattr(board, "can_build_settlement_at", None)
+            if callable(can) and player is not None:
+                try:
+                    return bool(can(tid, getattr(player, "color", None)))
+                except TypeError:
+                    return bool(can(tid))
+    except Exception:
+        pass
+    return True
+
+
+def maybe_preserve_prev_settle_on_soft_rerank(
+    direction: Mapping[str, Any],
+    prev_commitment: Optional[Mapping[str, Any]],
+    game: Any,
+    player: Any,
+    audits: Sequence[Any],
+    *,
+    invalidate_reason: str = "",
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """WP-STICKY1: keep invested settle on soft same-way rerank unless clearly worse.
+
+    Returns (direction_out, meta). Meta empty when no preserve applied.
+    """
+    direction_out = dict(direction or {})
+    meta: Dict[str, Any] = {}
+    prev = prev_commitment if isinstance(prev_commitment, Mapping) else None
+    if not prev:
+        return direction_out, meta
+    inv = str(invalidate_reason or "").lower()
+    # Hard invalidates always allow retarget
+    if any(
+        h in inv
+        for h in (
+            "occupied",
+            "race_impossible",
+            "route_illegal",
+            "own_rec_settle_complete",
+            "own_rec_city_complete",
+            "explicit_142",
+            "specials_dead",
+            "offway_opportunity",
+            "s14_2",
+        )
+    ):
+        meta["skipped"] = "hard_invalidate"
+        return direction_out, meta
+    soft = (not inv) or any(tok in inv for tok in _SOFT_RERANK_INVALIDATE)
+    if not soft:
+        meta["skipped"] = f"not_soft:{inv[:40]}"
+        return direction_out, meta
+
+    prev_tid = _safe_int(prev.get("locked_rec_target_id"), None)
+    prev_way = _safe_int(prev.get("locked_way_id"), None)
+    prev_kind = str(prev.get("locked_target_kind") or "").upper()
+    if prev_tid is None:
+        return direction_out, meta
+    if prev_kind and prev_kind not in ("S", "SETTLE", "SETTLEMENT", "NEW_SETTLEMENT", ""):
+        meta["skipped"] = f"prev_kind:{prev_kind}"
+        return direction_out, meta
+
+    new_way = _safe_int(
+        direction_out.get("preferred_way_id") or direction_out.get("way_id"),
+        None,
+    )
+    if prev_way is not None and new_way is not None and int(prev_way) != int(new_way):
+        meta["skipped"] = "way_changed"
+        return direction_out, meta
+
+    new_tid = _safe_int(
+        direction_out.get("recommendation_target_id")
+        or direction_out.get("settlement_target_id")
+        or direction_out.get("target_id"),
+        None,
+    )
+    if new_tid is None or int(new_tid) == int(prev_tid):
+        meta["skipped"] = "same_or_no_new_tid"
+        return direction_out, meta
+
+    if not _target_still_open_for_player(game, player, int(prev_tid)):
+        meta["skipped"] = "prev_occupied"
+        return direction_out, meta
+
+    eta_prev = _settle_eta_from_audits_or_direction(audits, direction_out, int(prev_tid))
+    eta_new = _settle_eta_from_audits_or_direction(audits, direction_out, int(new_tid))
+    # Also compare direction's own preferred eta if present
+    try:
+        if eta_new is None and direction_out.get("eta_turns") is not None:
+            eta_new = float(direction_out.get("eta_turns"))
+    except Exception:
+        pass
+
+    improve = None
+    if eta_prev is not None and eta_new is not None:
+        improve = float(eta_prev) - float(eta_new)  # positive = new faster
+        if improve >= float(STICKY1_ETA_IMPROVE_MIN):
+            meta["skipped"] = "new_eta_clearly_better"
+            meta["eta_prev"] = eta_prev
+            meta["eta_new"] = eta_new
+            meta["improve"] = improve
+            return direction_out, meta
+
+    # Preserve previous settle tip; refresh roads toward it if available
+    direction_out["recommendation_target_id"] = int(prev_tid)
+    direction_out["settlement_target_id"] = int(prev_tid)
+    direction_out["supporting_action_type"] = "new_settlement"
+    direction_out["wp_sticky1_preserved_target"] = int(prev_tid)
+    direction_out["wp_sticky1_blocked_target"] = int(new_tid)
+    # Prefer repath for prev tid from audits
+    try:
+        fixed = repath_roads_for_locked_target(
+            audits,
+            player,
+            target_id=int(prev_tid),
+            way_id=prev_way or new_way,
+            fallback_roads=prev.get("locked_roads_to_build"),
+        )
+        if fixed:
+            direction_out["roads_to_build"] = list(fixed)
+        elif prev.get("locked_roads_to_build"):
+            direction_out["roads_to_build"] = list(prev.get("locked_roads_to_build") or [])
+    except Exception:
+        if prev.get("locked_roads_to_build"):
+            direction_out["roads_to_build"] = list(prev.get("locked_roads_to_build") or [])
+
+    meta.update(
+        {
+            "preserved": True,
+            "prev_tid": int(prev_tid),
+            "blocked_tid": int(new_tid),
+            "eta_prev": eta_prev,
+            "eta_new": eta_new,
+            "improve": improve,
+            "invalidate_reason": inv,
+        }
+    )
+    return direction_out, meta
+
+
+def maybe_block_way_switch_worse_settle_eta(
+    direction: Mapping[str, Any],
+    prev_commitment: Optional[Mapping[str, Any]],
+    game: Any,
+    player: Any,
+    audits: Sequence[Any],
+    *,
+    invalidate_reason: str = "",
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """WP-STICKY2: keep prior way+settle when switch worsens next-settle ETA.
+
+    Dig (g002 R6T4): Engine/way_switch to S61 while S47 still eta 0.8 ≪ 3.2.
+    Allows switch when invalidate cites race/deny/occupied/board-fit/etc.
+    """
+    direction_out = dict(direction or {})
+    meta: Dict[str, Any] = {}
+    prev = prev_commitment if isinstance(prev_commitment, Mapping) else None
+    if not prev:
+        return direction_out, meta
+
+    prev_way = _safe_int(prev.get("locked_way_id"), None)
+    prev_tid = _safe_int(prev.get("locked_rec_target_id"), None)
+    new_way = _safe_int(
+        direction_out.get("preferred_way_id") or direction_out.get("way_id"),
+        None,
+    )
+    new_tid = _safe_int(
+        direction_out.get("recommendation_target_id")
+        or direction_out.get("settlement_target_id")
+        or direction_out.get("target_id")
+        or direction_out.get("plan_se_pick_id"),
+        None,
+    )
+    # plan_se_pick may be "S61"
+    if new_tid is None:
+        se = str(direction_out.get("plan_se_pick") or "")
+        if se.upper().startswith("S"):
+            try:
+                new_tid = int(se[1:].split(":")[0])
+            except Exception:
+                new_tid = None
+
+    if prev_way is None or new_way is None or int(prev_way) == int(new_way):
+        meta["skipped"] = "same_or_missing_way"
+        return direction_out, meta
+    if prev_tid is None:
+        meta["skipped"] = "no_prev_settle"
+        return direction_out, meta
+
+    inv = str(invalidate_reason or "").lower()
+    if any(tok in inv for tok in _STICKY2_ALLOW_SWITCH_TOKENS):
+        meta["skipped"] = f"allow_reason:{inv[:48]}"
+        return direction_out, meta
+
+    if not _target_still_open_for_player(game, player, int(prev_tid)):
+        meta["skipped"] = "prev_occupied"
+        return direction_out, meta
+
+    eta_prev = _settle_eta_from_audits_or_direction(audits, direction_out, int(prev_tid))
+    # Prefer new tip ETA; fall back to se_pick / catalog first settle on new way
+    eta_new = None
+    if new_tid is not None:
+        eta_new = _settle_eta_from_audits_or_direction(audits, direction_out, int(new_tid))
+    if eta_new is None:
+        try:
+            cat = str(direction_out.get("plan_catalog") or "")
+            for part in cat.split(";"):
+                if part.upper().startswith("S") and ":" in part:
+                    bits = part.split(":")
+                    if len(bits) >= 3:
+                        eta_new = float(bits[2])
+                        if new_tid is None:
+                            try:
+                                new_tid = int(bits[0][1:])
+                            except Exception:
+                                pass
+                        break
+        except Exception:
+            eta_new = None
+
+    if eta_prev is None or eta_new is None:
+        meta["skipped"] = "missing_eta"
+        meta["eta_prev"] = eta_prev
+        meta["eta_new"] = eta_new
+        return direction_out, meta
+
+    worsen = float(eta_new) - float(eta_prev)
+    meta["eta_prev"] = eta_prev
+    meta["eta_new"] = eta_new
+    meta["worsen"] = worsen
+    if worsen < float(STICKY2_ETA_WORSEN_MIN):
+        meta["skipped"] = "eta_ok"
+        return direction_out, meta
+
+    # Block switch: restore previous way + settle tip
+    direction_out["preferred_way_id"] = int(prev_way)
+    direction_out["way_id"] = int(prev_way)
+    direction_out["recommendation_target_id"] = int(prev_tid)
+    direction_out["settlement_target_id"] = int(prev_tid)
+    direction_out["supporting_action_type"] = str(
+        direction_out.get("supporting_action_type") or "new_settlement"
+    )
+    direction_out["wp_sticky2_blocked_way"] = int(new_way)
+    direction_out["wp_sticky2_kept_way"] = int(prev_way)
+    if prev.get("locked_roads_to_build"):
+        direction_out["roads_to_build"] = list(prev.get("locked_roads_to_build") or [])
+    try:
+        fixed = repath_roads_for_locked_target(
+            audits,
+            player,
+            target_id=int(prev_tid),
+            way_id=int(prev_way),
+            fallback_roads=prev.get("locked_roads_to_build"),
+        )
+        if fixed:
+            direction_out["roads_to_build"] = list(fixed)
+    except Exception:
+        pass
+
+    meta.update(
+        {
+            "blocked": True,
+            "prev_way": int(prev_way),
+            "new_way": int(new_way),
+            "prev_tid": int(prev_tid),
+            "new_tid": int(new_tid) if new_tid is not None else None,
+            "invalidate_reason": inv,
+            "reason": "wp_sticky2_worse_settle_eta",
+        }
+    )
+    return direction_out, meta
+
+
+def try_commit_settle_tip_before_specials(
+    direction: Mapping[str, Any],
+    game: Any,
+    player: Any,
+    audits: Sequence[Any],
+) -> Optional[Dict[str, Any]]:
+    """If settle residual remains and direction has no tid, lock best open settle tip.
+
+    Prevents post-city ``sticky_commit_la_only`` while 1×S (e.g. S44) is still open.
+    """
+    if not isinstance(direction, Mapping):
+        return None
+    rem_s = _residual_new_settles(direction, player)
+    need_next = False
+    try:
+        from core.strategy_reconsider import get_reconsider_flags
+
+        flags = get_reconsider_flags(player) or {}
+        need_next = bool(flags.get("need_next_target"))
+    except Exception:
+        need_next = bool(getattr(player, "force_strategy_recalc", False))
+    if rem_s <= 0 and not need_next:
+        return None
+    # Already has a structure tid in direction — normal commit handles it
+    existing_tid = _safe_int(
+        direction.get("recommendation_target_id")
+        or direction.get("settlement_target_id")
+        or direction.get("target_id"),
+        None,
+    )
+    if existing_tid is not None and rem_s <= 0:
+        return None
+    tip = _pick_best_open_settle_tip(game, player, audits, direction)
+    if tip is None:
+        return None
+    enriched = dict(direction)
+    enriched["recommendation_target_id"] = tip["target_id"]
+    enriched["settlement_target_id"] = tip["target_id"]
+    enriched["supporting_action_type"] = "new_settlement"
+    if tip.get("roads"):
+        enriched["roads_to_build"] = list(tip["roads"])
+    enriched["sticky_settle_tip_source"] = "post_structure_geo_tip"
+    return commit_from_direction(enriched, game, player)
+
+
 def commit_from_direction(
     direction: Mapping[str, Any],
     game: Any,
@@ -1105,8 +1891,11 @@ def commit_from_direction(
             "opp_roads_near": [],
             "sticky_version": 3,
         }
-    # S18: prefer portfolio roads for this tid; drop orphan edges for other sites
-    roads = remaining_roads_for_player(player, direction_local.get("roads_to_build") or [])
+    # S18: prefer portfolio roads for this tid; drop orphan edges for other sites.
+    # Orient network→tip so roads_to_build[0] is the legal next directed step.
+    roads = remaining_roads_for_player(
+        player, direction_local.get("roads_to_build") or [], tip_id=tid
+    )
     if not roads_serve_target(roads, tid):
         roads = []
     # City upgrades do not need road routes
@@ -1274,16 +2063,35 @@ def repath_roads_for_locked_target(
     """S18: roads_to_build for locked settle target from live portfolio only."""
     tid = _safe_int(target_id, None)
     if tid is None:
-        return remaining_roads_for_player(player, fallback_roads or [])
+        return remaining_roads_for_player(player, fallback_roads or [], tip_id=None)
     _audit, target = find_target_in_audits(
         audits, tid, preferred_way_id=_safe_int(way_id, None)
     )
     if target is not None:
-        fresh = _normalize_roads(_target_field(target, "roads_to_build", []))
-        return remaining_roads_for_player(player, fresh)
-    fb = _normalize_roads(fallback_roads or [])
+        fresh = _target_field(target, "roads_to_build", [])
+        return remaining_roads_for_player(player, fresh, tip_id=tid)
+    # WP-R4: path_map before empty-fallback "at site" (empty fb ⇒ roads_serve_target True)
+    try:
+        from core.player_reachability import (
+            SENTINEL,
+            maps_are_fresh,
+            path_to_target,
+            remaining_roads_to_target,
+        )
+
+        if maps_are_fresh(player):
+            rd = remaining_roads_to_target(player, int(tid))
+            if rd == 0:
+                return []
+            if 0 < int(rd) < SENTINEL:
+                mapped = path_to_target(player, int(tid))
+                if mapped:
+                    return remaining_roads_for_player(player, mapped, tip_id=tid)
+    except Exception:
+        pass
+    fb = list(fallback_roads or [])
     if roads_serve_target(fb, tid):
-        return remaining_roads_for_player(player, fb)
+        return remaining_roads_for_player(player, fb, tip_id=tid)
     # Orphan fallback — drop rather than keep wrong-site edges
     return []
 
@@ -1791,7 +2599,9 @@ def force_sticky_on_direction(
                 pass
         return out
 
-    roads = remaining_roads_for_player(player, commitment.get("locked_roads_to_build") or [])
+    roads = remaining_roads_for_player(
+        player, commitment.get("locked_roads_to_build") or [], tip_id=tid
+    )
     target = None
     preferred_audit = None
     if way_id is not None:
@@ -1800,7 +2610,7 @@ def force_sticky_on_direction(
     if target_hit is not None:
         target = target_hit
         fresh = remaining_roads_for_player(
-            player, _normalize_roads(_target_field(target_hit, "roads_to_build", []))
+            player, _target_field(target_hit, "roads_to_build", []), tip_id=tid
         )
         # Prefer live portfolio roads when present
         roads = fresh if fresh or _target_field(target_hit, "distance_roads", None) == 0 else roads
@@ -1893,7 +2703,7 @@ def refresh_commitment_roads(
     )
     # If portfolio missing but prev roads still serve target, keep remaining
     if not roads and roads_serve_target(prev_roads, tid):
-        roads = remaining_roads_for_player(player, prev_roads)
+        roads = remaining_roads_for_player(player, prev_roads, tip_id=tid)
     if prev_roads and not roads_serve_target(prev_roads, tid) and roads != prev_roads:
         try:
             record_last_sticky_switch(
@@ -1910,6 +2720,333 @@ def refresh_commitment_roads(
         except Exception:
             pass
     out["locked_roads_to_build"] = roads
+    return out
+
+
+def _road_on_sticky_settle_path(
+    road: Any,
+    commitment: Mapping[str, Any],
+    player: Any,
+) -> bool:
+    """True when ``road`` is (was) on the sticky settle route."""
+    key = _road_key(road)
+    if key is None:
+        return False
+    raw_roads = list(commitment.get("locked_roads_to_build") or [])
+    for edge in _normalize_roads(raw_roads):
+        if _road_key(edge) == key:
+            return True
+    # Also treat as path-related when the new edge touches the sticky settle
+    tid = _safe_int(commitment.get("locked_rec_target_id"), None)
+    if tid is not None and int(tid) in key:
+        return True
+    return False
+
+
+def maybe_force_l2_after_lr_or_component_road(
+    game: Any,
+    player: Any,
+    *,
+    road: Any = None,
+    length_before: Any = None,
+    length_after: Any = None,
+    holder_changed: bool = False,
+    sticky_risk: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """WP-H: after LR grow / path complete / component road → need_next + L2.
+
+    Dig (White 341→367): building LR road should retarget S@5 → S@44.
+    Does not clear sticky here — explore recommit + settle-tip-before-LA does.
+    """
+    out: Dict[str, Any] = {"ok": True, "forced": False, "reasons": []}
+    reasons: List[str] = []
+    try:
+        lb = int(length_before) if length_before is not None else None
+        la = int(length_after) if length_after is not None else None
+    except Exception:
+        lb = la = None
+    if lb is not None and la is not None and la > lb:
+        reasons.append("lr_length_up")
+    if holder_changed:
+        reasons.append("lr_holder_changed")
+    sr = dict(sticky_risk or {})
+    rem = sr.get("own_dist")
+    if rem is None and isinstance(sr.get("sticky_risk_refresh"), Mapping):
+        rem = sr["sticky_risk_refresh"].get("own_dist")
+    try:
+        if rem is not None and int(rem) == 0 and sr.get("applied"):
+            reasons.append("sticky_path_complete")
+    except Exception:
+        pass
+    # Road on sticky path that shortened remaining
+    try:
+        c = get_sticky_commitment(player)
+        if isinstance(c, Mapping) and road is not None:
+            prev = list(c.get("locked_roads_to_build") or [])
+            if prev and _road_on_sticky_settle_path(road, c, player):
+                rem2 = remaining_roads_for_player(
+                    player, prev, tip_id=c.get("locked_rec_target_id")
+                )
+                if len(rem2) < len(prev):
+                    reasons.append("sticky_path_advanced")
+                if not rem2:
+                    reasons.append("sticky_path_complete")
+    except Exception:
+        pass
+
+    if not reasons:
+        out["reason"] = "no_trigger"
+        return out
+
+    out["reasons"] = reasons
+    prefer_lr = bool(holder_changed) or "lr_holder_changed" in reasons
+    # WP-H2: gaining public LR must pull Victory-Way toward LR ways (n3d Red).
+    if prefer_lr:
+        reasons.append("wp_h2_prefer_lr_ways")
+        try:
+            setattr(player, "prefer_lr_ways", True)
+        except Exception:
+            pass
+        # Invalidate sticky if locked way does not include LR while we hold it
+        try:
+            c = get_sticky_commitment(player)
+            way_has_lr = False
+            if isinstance(c, Mapping):
+                way_has_lr = bool(
+                    c.get("way_lr")
+                    or c.get("longest_road")
+                    or c.get("locked_way_lr")
+                )
+            if not way_has_lr:
+                # Soft clear — next explore recommits; keep target if possible
+                clear_sticky_commitment(player)
+                reasons.append("wp_h2_clear_non_lr_sticky")
+                out["cleared_non_lr_sticky"] = True
+        except Exception:
+            pass
+
+    out["reasons"] = reasons
+    reason = "flag:lr_or_component_road:" + ",".join(reasons[:3])
+    try:
+        flag_strategy_recalc(
+            player,
+            reason,
+            detail={
+                "road": list(road) if road else None,
+                "prefer_lr_ways": bool(prefer_lr),
+            },
+        )
+    except Exception:
+        pass
+    try:
+        setattr(player, "force_strategy_recalc", True)
+    except Exception:
+        pass
+    try:
+        from core.strategy_reconsider import set_reconsider_flag
+
+        set_reconsider_flag(player, "need_next_target", reason=reason)
+    except Exception:
+        pass
+    try:
+        setattr(
+            player,
+            "pending_full_resolve",
+            {
+                "reason": reason,
+                "trigger": "wp_h_lr_component_road",
+                "detail": {"reasons": reasons, "prefer_lr_ways": bool(prefer_lr)},
+                "prefer_lr_ways": bool(prefer_lr),
+            },
+        )
+    except Exception:
+        pass
+    out["forced"] = True
+    out["prefer_lr_ways"] = bool(prefer_lr)
+    out["reason"] = reason
+    return out
+
+
+def refresh_sticky_settle_risk_after_own_road(
+    game: Any,
+    player: Any,
+    *,
+    road: Any = None,
+) -> Dict[str, Any]:
+    """Light risk reassess for sticky new_settlement after an own path road.
+
+    No full L2: when the built road advances the sticky settle route, drop owned
+    edges from ``locked_roads_to_build`` and recompute race/risk for that target
+    only (R10T3 / R9T3 dig: White [31,32] toward S32 ends Red's soft race).
+
+    Updates sticky commitment + strategic_direction risk fields and patches
+    cached plan_settles row for Dig/CS without rebuilding the whole catalog.
+    """
+    out: Dict[str, Any] = {
+        "ok": False,
+        "applied": False,
+        "reason": "no_sticky",
+    }
+    c = get_sticky_commitment(player)
+    if not isinstance(c, Mapping) or not c:
+        return out
+    kind = str(c.get("locked_target_kind") or "").lower()
+    tid = _safe_int(c.get("locked_rec_target_id"), None)
+    if tid is None:
+        out["reason"] = "no_sticky_target"
+        return out
+    if kind and ("city" in kind or kind in ("c", "la", "lr")):
+        out["reason"] = f"not_settle_kind:{kind}"
+        return out
+    # Require settle-ish lock (empty kind still ok if roads/target present)
+    if kind and not any(x in kind for x in ("settle", "s", "new_settlement", "next_settlement")):
+        if not list(c.get("locked_roads_to_build") or []):
+            out["reason"] = f"skip_kind:{kind}"
+            return out
+
+    prev_roads = list(c.get("locked_roads_to_build") or [])
+    if road is not None and prev_roads and not _road_on_sticky_settle_path(road, c, player):
+        # Road not on sticky path — still strip owned edges if any
+        rem_only = remaining_roads_for_player(player, prev_roads, tip_id=tid)
+        if rem_only == prev_roads:
+            out["reason"] = "road_not_on_sticky_path"
+            return out
+
+    remaining = remaining_roads_for_player(player, prev_roads, tip_id=tid)
+    try:
+        from core.risk_assessment import (
+            enrich_settlement_race_risk_with_eh_memory,
+            opponent_settlement_race_risk,
+        )
+
+        risk_bag = opponent_settlement_race_risk(game, player, int(tid))
+        # EH + RCARD_MEMORY_OPPONENTS for beat-risk vs threats
+        risk_bag = enrich_settlement_race_risk_with_eh_memory(
+            game,
+            player,
+            risk_bag,
+            target_id=int(tid),
+            own_distance_roads=len(remaining),
+        )
+    except Exception as exc:
+        out["reason"] = f"risk_failed:{exc}"
+        return out
+
+    risk_level = str(risk_bag.get("risk_level") or "low").lower()
+    if risk_level in ("medium",):
+        risk_level = "med"
+    threats = list(risk_bag.get("threat_opponents") or [])
+    # Own remaining distance along sticky path (0 once path edges are owned)
+    own_dist = len(remaining)
+
+    new_c = dict(c)
+    new_c["locked_roads_to_build"] = list(remaining)
+    new_c["risk_level"] = risk_level
+    new_c["locked_risk_level"] = risk_level
+    new_c["sticky_risk_refresh"] = {
+        "target_id": int(tid),
+        "own_dist": int(own_dist),
+        "risk_level": risk_level,
+        "threat_count": len(threats),
+        "reasons": list(risk_bag.get("reasons") or [])[:6],
+    }
+    set_sticky_commitment(player, new_c)
+
+    # Mirror onto strategic_direction for BA / Dig consumers
+    try:
+        direction = dict(getattr(player, "strategic_direction", None) or {})
+        direction["locked_roads_to_build"] = list(remaining)
+        direction["roads_to_build"] = list(remaining)
+        direction["risk_level"] = risk_level
+        direction["locked_risk_level"] = risk_level
+        # Patch target_portfolio entry for this settle if present
+        port = list(direction.get("target_portfolio") or [])
+        patched_port: List[Any] = []
+        for t in port:
+            if isinstance(t, Mapping):
+                td = dict(t)
+                t_id = _safe_int(td.get("target_id") or td.get("id"), None)
+                if t_id is not None and int(t_id) == int(tid):
+                    td["risk_level"] = risk_level
+                    td["distance_roads"] = int(own_dist)
+                    td["roads_to_build"] = list(remaining)
+                    td["threat_opponents"] = threats
+                patched_port.append(td)
+            else:
+                patched_port.append(t)
+        if patched_port:
+            direction["target_portfolio"] = patched_port
+        direction["sticky_risk_refresh"] = dict(new_c["sticky_risk_refresh"])
+        setattr(player, "strategic_direction", direction)
+    except Exception:
+        pass
+
+    # Patch cached plan_settles row for Dig (no full catalog rebuild)
+    try:
+        from core.strategy_plan_snapshot import (
+            _competitor_compact,
+            _encode_settle_row,
+            parse_plan_settles,
+        )
+
+        bag = getattr(player, "last_plan_bag", None) or getattr(game, "last_plan_snapshot", None)
+        if isinstance(bag, Mapping):
+            bag = dict(bag)
+            cs = dict(bag.get("cs") or {})
+            settles = parse_plan_settles(cs.get("plan_settles"))
+            comp = _competitor_compact(threats)
+            updated = False
+            new_settles: List[Dict[str, Any]] = []
+            for s in settles:
+                row = dict(s)
+                sid = _safe_int(row.get("id") or row.get("target_id"), None)
+                if sid is not None and int(sid) == int(tid):
+                    row["dist"] = int(own_dist)
+                    row["distance_roads"] = int(own_dist)
+                    row["risk"] = risk_level
+                    row["risk_level"] = risk_level
+                    row["competitors"] = comp
+                    row["threats"] = threats
+                    updated = True
+                new_settles.append(row)
+            if updated:
+                cs["plan_settles"] = ";".join(_encode_settle_row(s) for s in new_settles) or None
+                bag["cs"] = cs
+                bag["settles"] = new_settles
+                try:
+                    setattr(player, "last_plan_bag", bag)
+                except Exception:
+                    pass
+                try:
+                    if int(getattr(game, "last_plan_snapshot_player_id", -1) or -1) == int(
+                        getattr(player, "id", -2) or -2
+                    ):
+                        game.last_plan_snapshot = dict(bag)
+                except Exception:
+                    pass
+                # Also stash on direction for CS writers that read preferred
+                try:
+                    direction = dict(getattr(player, "strategic_direction", None) or {})
+                    direction["plan_settles"] = cs.get("plan_settles")
+                    setattr(player, "strategic_direction", direction)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    out.update(
+        {
+            "ok": True,
+            "applied": True,
+            "reason": "sticky_settle_risk_refreshed",
+            "target_id": int(tid),
+            "own_dist": int(own_dist),
+            "risk_level": risk_level,
+            "remaining_roads": list(remaining),
+            "prev_roads": list(prev_roads),
+            "threat_opponents": threats,
+        }
+    )
     return out
 
 
@@ -2277,10 +3414,24 @@ def _apply_sticky_layer_impl(
                         meta["applied"] = True
                         meta["held"] = True
                         meta["reason"] = "sticky_hold"
+                        meta["sticky_hold_reason"] = "sticky_hold"
                         meta["locked_way_id"] = commitment.get("locked_way_id")
                         meta["locked_rec_target_id"] = commitment.get(
                             "locked_rec_target_id"
                         )
+                        # WP-DIG2: record whether locked way matches last L2 winner
+                        try:
+                            dossier = getattr(player, "last_l2_way_dossier", None) or {}
+                            winner = dossier.get("winner") if isinstance(dossier, Mapping) else None
+                            locked_w = commitment.get("locked_way_id")
+                            if winner is not None and locked_w is not None:
+                                setattr(
+                                    player,
+                                    "l2_applied",
+                                    int(winner) == int(locked_w),
+                                )
+                        except Exception:
+                            pass
                         meta["locked_roads_to_build"] = list(
                             commitment.get("locked_roads_to_build") or []
                         )
@@ -2432,8 +3583,63 @@ def _apply_sticky_layer_impl(
     except Exception as _gate_exc:
         meta["specials_dead_commit_gate_error"] = str(_gate_exc)
 
+    # WP-STICKY1: soft same-way rerank must not abandon an invested Fastest settle
+    # (n3d Red 39→43 / g002 24→31) unless the new tip clearly improves ETA / legality.
+    try:
+        direction_out, sticky1_meta = maybe_preserve_prev_settle_on_soft_rerank(
+            direction_out,
+            prev_commitment_snapshot,
+            game,
+            player,
+            audits,
+            invalidate_reason=str(meta.get("invalidate_reason") or ""),
+        )
+        if sticky1_meta:
+            meta["wp_sticky1"] = dict(sticky1_meta)
+    except Exception as _s1_exc:
+        meta["wp_sticky1_error"] = str(_s1_exc)
+
+    # WP-STICKY2: way_switch that worsens next-settle ETA without race/deny → keep prior
+    try:
+        direction_out, sticky2_meta = maybe_block_way_switch_worse_settle_eta(
+            direction_out,
+            prev_commitment_snapshot,
+            game,
+            player,
+            audits,
+            invalidate_reason=str(meta.get("invalidate_reason") or ""),
+        )
+        if sticky2_meta:
+            meta["wp_sticky2"] = dict(sticky2_meta)
+            if sticky2_meta.get("blocked"):
+                meta["sticky_hold_reason"] = "wp_sticky2_worse_settle_eta"
+    except Exception as _s2_exc:
+        meta["wp_sticky2_error"] = str(_s2_exc)
+
     # Commit from current direction (fresh, force, or post-invalidate with consume)
     new_c = commit_from_direction(direction_out, game, player)
+    # Post-structure: if no tid (city-dev / empty portfolio), lock best settle tip
+    # before falling through to LA-only sticky (S44 vs 10×DC dig).
+    if new_c is None:
+        try:
+            tip_c = try_commit_settle_tip_before_specials(
+                direction_out, game, player, audits
+            )
+            if tip_c is not None:
+                new_c = tip_c
+                meta["settle_tip_before_specials"] = True
+                meta["settle_tip_id"] = tip_c.get("locked_rec_target_id")
+                direction_out["recommendation_target_id"] = tip_c.get(
+                    "locked_rec_target_id"
+                )
+                direction_out["settlement_target_id"] = tip_c.get("locked_rec_target_id")
+                direction_out["supporting_action_type"] = "new_settlement"
+                if tip_c.get("locked_roads_to_build"):
+                    direction_out["roads_to_build"] = list(
+                        tip_c.get("locked_roads_to_build") or []
+                    )
+        except Exception as _tip_exc:
+            meta["settle_tip_before_specials_error"] = str(_tip_exc)
     # S18: after commit, force roads from portfolio for locked tid (no orphan edges)
     if new_c is not None and new_c.get("locked_rec_target_id") is not None:
         fixed_roads = repath_roads_for_locked_target(
@@ -2656,12 +3862,24 @@ def _apply_sticky_layer_impl(
             meta["reason"] = "sticky_recommit_after_invalidate"
         else:
             meta["reason"] = "sticky_commit"
+        if meta.get("wp_sticky2", {}).get("blocked"):
+            meta["sticky_hold_reason"] = "wp_sticky2_worse_settle_eta"
+        else:
+            meta["sticky_hold_reason"] = str(meta.get("reason") or "")
         meta["locked_way_id"] = new_c.get("locked_way_id")
         meta["locked_rec_target_id"] = new_c.get("locked_rec_target_id")
         meta["locked_roads_to_build"] = list(new_c.get("locked_roads_to_build") or [])
         direction_out["locked_way_id"] = new_c.get("locked_way_id")
         direction_out["locked_rec_target_id"] = new_c.get("locked_rec_target_id")
         direction_out["locked_roads_to_build"] = list(new_c.get("locked_roads_to_build") or [])
+        try:
+            dossier = getattr(player, "last_l2_way_dossier", None) or {}
+            winner = dossier.get("winner") if isinstance(dossier, Mapping) else None
+            locked_w = new_c.get("locked_way_id")
+            if winner is not None and locked_w is not None:
+                setattr(player, "l2_applied", int(winner) == int(locked_w))
+        except Exception:
+            pass
         direction_out["locked_target_kind"] = new_c.get("locked_target_kind")
         try:
             from core.ai_lr_project import apply_lr_project_to_direction, pick_turn_focus

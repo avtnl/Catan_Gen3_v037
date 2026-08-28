@@ -511,17 +511,42 @@ def route_path_is_clear_for_player(
 
 
 def route_roads_from_nodes(nodes: Sequence[int]) -> List[RoadKey]:
-    """Convert [a,b,c] node path to [(a,b), (b,c)]."""
+    """Convert ``[a,b,c]`` node path to **directed** steps ``[(a,b), (b,c)]``.
+
+    Core distinction:
+      - **road_id** = undirected ``(min, max)`` via ``_normalise_road_key`` (ownership / legal)
+      - **path step** = directed ``(from, to)`` along the walk (network → tip)
+
+    Do not sort endpoints here — callers that need road_id identity must normalise.
+    """
     out: List[RoadKey] = []
     try:
         clean = [int(n) for n in list(nodes or [])]
     except Exception:
         return out
     for a, b in zip(clean, clean[1:]):
-        key = _normalise_road_key((a, b))
-        if key:
-            out.append(key)
+        if a == b:
+            continue
+        out.append((int(a), int(b)))
     return out
+
+
+def _as_directed_path_step(road: Any) -> RoadKey:
+    """Keep path direction when present; do not sort to road_id."""
+    try:
+        if isinstance(road, dict):
+            for key in ("road_id", "road", "edge", "target_road", "road_to_build"):
+                if key in road:
+                    return _as_directed_path_step(road.get(key))
+        values = list(road)[:2]
+        if len(values) != 2:
+            return ()  # type: ignore[return-value]
+        a, b = int(values[0]), int(values[1])
+        if a == b:
+            return ()  # type: ignore[return-value]
+        return (a, b)
+    except Exception:
+        return ()  # type: ignore[return-value]
 
 
 def find_reachable_new_settlement_paths(
@@ -590,7 +615,83 @@ def find_reachable_new_settlement_paths(
     require_legal_first = bool(legal_first_roads)
 
     results: List[Dict[str, Any]] = []
+    map_hit_targets: Set[int] = set()
+
+    # Tier H: prefer fresh per-player reachability maps (BFS fallback for misses).
+    # Never uses maps to hard-exclude candidacy — only to supply routes.
+    try:
+        from core.constants import REACHABILITY_MAPS
+        from core.player_reachability import (
+            SENTINEL,
+            maps_are_fresh,
+            path_to_target,
+            remaining_roads_to_target,
+        )
+
+        if bool(REACHABILITY_MAPS) and maps_are_fresh(player):
+            for tid in sorted(target_set):
+                rem = remaining_roads_to_target(player, tid)
+                if not (1 <= int(rem) <= int(max_distance)):
+                    continue
+                raw_path = path_to_target(player, tid)
+                if not raw_path:
+                    continue
+                # Keep directed path steps (network→tip); road_id only for ownership/legal.
+                all_roads = [_as_directed_path_step(r) for r in raw_path]
+                all_roads = [r for r in all_roads if r]
+                if not all_roads:
+                    continue
+                roads_to_build = [
+                    r for r in all_roads if _normalise_road_key(r) not in owned_roads
+                ]
+                if not roads_to_build or len(roads_to_build) > max_distance:
+                    continue
+                first_road = roads_to_build[0]
+                first_id = _normalise_road_key(first_road)
+                if require_legal_first and first_id not in legal_first_roads:
+                    continue
+                if not route_path_is_clear_for_player(game, player, all_roads, int(tid)):
+                    continue
+                # Reconstruct nodes from directed steps in order
+                route_nodes: List[int] = []
+                for a, b in all_roads:
+                    if not route_nodes:
+                        if int(a) in starts:
+                            route_nodes = [int(a), int(b)]
+                        elif int(b) in starts:
+                            route_nodes = [int(b), int(a)]
+                        else:
+                            route_nodes = [int(a), int(b)]
+                    else:
+                        prev = route_nodes[-1]
+                        if int(a) == prev:
+                            route_nodes.append(int(b))
+                        elif int(b) == prev:
+                            route_nodes.append(int(a))
+                        else:
+                            route_nodes.extend([int(a), int(b)])
+                start_id = int(route_nodes[0]) if route_nodes else -1
+                results.append({
+                    "kind": "new_settlement",
+                    "target_settlement_id": int(tid),
+                    "start_intersection_id": start_id,
+                    "route_nodes": list(route_nodes),
+                    "route_all_roads": list(all_roads),
+                    "roads_to_build": list(roads_to_build),
+                    "next_road": first_road,
+                    "distance": len(all_roads),
+                    "roads_remaining": len(roads_to_build),
+                    "target_label": f"new_settle@{int(tid)}",
+                    "route_source": "player_reachability.path_map",
+                })
+                map_hit_targets.add(int(tid))
+    except Exception:
+        map_hit_targets = set()
+
+    pending_targets = {t for t in target_set if int(t) not in map_hit_targets}
     for start in sorted(starts):
+        if not pending_targets and map_hit_targets:
+            break
         queue: List[Tuple[int, List[int]]] = [(start, [start])]
         seen: Set[Tuple[int, int]] = {(start, 0)}
         while queue:
@@ -617,15 +718,18 @@ def find_reachable_new_settlement_paths(
                     continue
                 seen.add(state_key)
 
-                if int(nxt) in target_set:
+                if int(nxt) in pending_targets:
                     all_roads = route_roads_from_nodes(new_nodes)
-                    roads_to_build = [r for r in all_roads if r not in owned_roads]
+                    roads_to_build = [
+                        r for r in all_roads if _normalise_road_key(r) not in owned_roads
+                    ]
                     if not roads_to_build:
                         continue
                     if len(roads_to_build) > max_distance:
                         continue
                     first_road = roads_to_build[0]
-                    if require_legal_first and first_road not in legal_first_roads:
+                    first_id = _normalise_road_key(first_road)
+                    if require_legal_first and first_id not in legal_first_roads:
                         continue
                     if not route_path_is_clear_for_player(game, player, all_roads, int(nxt)):
                         continue

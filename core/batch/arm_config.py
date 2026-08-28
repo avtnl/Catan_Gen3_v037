@@ -8,9 +8,9 @@ Seat map syntax (repeatable / multi-token)::
 
 Presets (right-hand side)::
 
-    0 / none / control → [0]
+    0 / none / control / abc / sticky → [0]  (a/b/c L2 only)
     dense / explore    → [1, 2, 3, [4, 2]]
-    product / product_ai / setback_every4 → [2, [4, 4]]
+    product / product_ai / setback_every4 → [2, [4, 4]]  (opt-in schedule)
     vp                 → [1]
     setback            → [2]
     hard / invalid     → [3]
@@ -21,14 +21,18 @@ Presets (right-hand side)::
 
 Named arm shortcuts (``--arm``)::
 
-    control   → all seats [0] (lab sticky baseline)
-    product / product_ai → all seats [2, [4, 4]]
+    control / abc → all seats [0] (product + lab a/b/c baseline)
+    product / product_ai / setback_every4 → all seats [2, [4, 4]] (opt-in)
     treat-p2  → seat 2 dense, others [0]
     treat-p3  → seat 3 dense, others [0]
     treat-all → all seats dense
     s142-drive → all seats [0] sticky + SIDESTEP_S142_DRIVE (matched A/B treat)
+    perf / perf-on → control seats + performance dig pack ON
+    control+perf / control+perf-off → seat arm + perf pack
 
-No ``--arm``: Game init applies product defaults (AI ``[2,[4,4]]``, human ``[0]``).
+``--perf on|off`` is orthogonal to the seat map (same as ``+perf`` suffix).
+
+No ``--arm``: Game init applies product defaults (AI + human ``[0]`` = a/b/c only).
 
 Arm metadata is stored on batch_summary / result.json for matched analysis.
 """
@@ -57,6 +61,9 @@ PRESET_RAW: Dict[str, RawList] = {
     "none": [0],
     "control": [0],
     "sticky": [0],
+    "abc": [0],  # Phase G: a/b/c L2 cadence only
+    "l2-abc": [0],
+    "l2_abc": [0],
     "dense": [1, 2, 3, [4, 2]],
     "explore": [1, 2, 3, [4, 2]],
     "pilot": [1, 2, 3, [4, 2]],
@@ -69,20 +76,46 @@ PRESET_RAW: Dict[str, RawList] = {
     "every4": [[4, 4]],
     "every5": [[4, 5]],
     "milestones": [5],
-    # Product AI policy (setback + every 4)
+    # Opt-in schedule (former product AI): setback + every 4
     "product": [2, [4, 4]],
     "product_ai": [2, [4, 4]],
     "setback_every4": [2, [4, 4]],
+    "schedule_244": [2, [4, 4]],
 }
 
 # Named experiment arms → full seat map (1..4)
-# control = pure sticky (lab baseline). product = all seats product AI list
-# (headless all-AI). Live GUI still uses is_human when no arm is passed.
-_PRODUCT = [2, [4, 4]]
+# control/abc = a/b/c-only (product default). product = opt-in [2,[4,4]] all seats.
+_SCHEDULE_244 = [2, [4, 4]]
+_ABC = [0]
 ARM_PRESETS: Dict[str, SeatMap] = {
-    "control": {1: [0], 2: [0], 3: [0], 4: [0]},
-    "product": {1: _PRODUCT, 2: _PRODUCT, 3: _PRODUCT, 4: _PRODUCT},
-    "product_ai": {1: _PRODUCT, 2: _PRODUCT, 3: _PRODUCT, 4: _PRODUCT},
+    "control": {1: _ABC, 2: _ABC, 3: _ABC, 4: _ABC},
+    "abc": {1: _ABC, 2: _ABC, 3: _ABC, 4: _ABC},
+    "l2-abc": {1: _ABC, 2: _ABC, 3: _ABC, 4: _ABC},
+    "l2_abc": {1: _ABC, 2: _ABC, 3: _ABC, 4: _ABC},
+    "product": {
+        1: _SCHEDULE_244,
+        2: _SCHEDULE_244,
+        3: _SCHEDULE_244,
+        4: _SCHEDULE_244,
+    },
+    "product_ai": {
+        1: _SCHEDULE_244,
+        2: _SCHEDULE_244,
+        3: _SCHEDULE_244,
+        4: _SCHEDULE_244,
+    },
+    "setback_every4": {
+        1: _SCHEDULE_244,
+        2: _SCHEDULE_244,
+        3: _SCHEDULE_244,
+        4: _SCHEDULE_244,
+    },
+    "schedule_244": {
+        1: _SCHEDULE_244,
+        2: _SCHEDULE_244,
+        3: _SCHEDULE_244,
+        4: _SCHEDULE_244,
+    },
     "treat-p2": {1: [0], 2: [1, 2, 3, [4, 2]], 3: [0], 4: [0]},
     "treat_p2": {1: [0], 2: [1, 2, 3, [4, 2]], 3: [0], 4: [0]},
     "treat-p3": {1: [0], 2: [0], 3: [1, 2, 3, [4, 2]], 4: [0]},
@@ -292,6 +325,7 @@ def resolve_arm_config(
     seed: Optional[int] = None,
     seed_base: Optional[int] = None,
     arm_name: Optional[str] = None,
+    perf: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build full arm config for GameManager / result / batch_summary.
 
@@ -300,12 +334,27 @@ def resolve_arm_config(
       2. ``--explicit-recalc`` tokens (merged onto constants base)
       3. ``--arm`` preset (replaces full map when no tokens)
       4. constants ``EXPLICIT_142_RECALC_BY_SEAT``
+
+    ``perf`` / ``--arm control+perf``: performance dig pack (see ``perf_mode``).
     """
+    from core.batch.perf_mode import (
+        enrich_arm_config_with_perf,
+        normalize_perf_mode,
+        parse_arm_perf_suffix,
+    )
+
     base = default_seat_map_from_constants()
     errors: List[str] = []
     source = "constants"
 
-    arm_key = str(arm or "").strip()
+    arm_raw = str(arm or "").strip()
+    arm_key, arm_perf = parse_arm_perf_suffix(arm_raw)
+    if arm_key is None and arm_raw:
+        arm_key = arm_raw
+    perf_mode = normalize_perf_mode(perf)
+    if perf_mode is None:
+        perf_mode = arm_perf
+
     if arm_key:
         preset = arm_preset_seat_map(arm_key)
         if preset is not None:
@@ -333,7 +382,7 @@ def resolve_arm_config(
     # Stable string keys for JSON
     by_seat_str = {str(k): list(v) for k, v in sorted(base.items())}
 
-    name = str(arm_name or arm or "").strip() or None
+    name = str(arm_name or arm_key or arm or "").strip() or None
     if name is None and source.startswith("arm:"):
         name = source.split(":", 1)[-1]
     if name is None and token_map:
@@ -360,7 +409,7 @@ def resolve_arm_config(
     ):
         s142_drive = True
 
-    return {
+    cfg: Dict[str, Any] = {
         "ok": not errors or bool(base),
         "errors": errors,
         "arm_name": name,
@@ -371,7 +420,11 @@ def resolve_arm_config(
         "seed": int(seed) if seed is not None else None,
         "seed_base": int(seed_base) if seed_base is not None else None,
         "sidestep_s142_drive": bool(s142_drive),
+        "perf_mode": perf_mode,
     }
+    if perf_mode:
+        cfg = enrich_arm_config_with_perf(cfg, perf=perf_mode)
+    return cfg
 
 
 def apply_arm_to_players(
@@ -413,6 +466,10 @@ def arm_metadata_for_export(arm: Optional[Mapping[str, Any]] = None) -> Dict[str
         "dice_from_batch": arm.get("dice_from_batch"),
         "seed": arm.get("seed"),
         "seed_base": arm.get("seed_base"),
+        "sidestep_s142_drive": arm.get("sidestep_s142_drive"),
+        "perf_mode": arm.get("perf_mode"),
+        "perf_flags": arm.get("perf_flags"),
+        "la_soft_bias_mode": arm.get("la_soft_bias_mode"),
     }
 
 

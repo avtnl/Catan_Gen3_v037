@@ -1006,13 +1006,138 @@ def plan_ai_dcard_choice(
 
     raw_cands = _plan_cards(game, player, window=window, allowed=allowed)
     candidates, ctx = _enrich_candidates(game, player, raw_cands)
+    # WP-E1/F: rcard touchpoints boost Knight (LA claim / steal unlock settle)
+    try:
+        from core.rcard_optimizer import suggest_dcard_touchpoints
+
+        tp = suggest_dcard_touchpoints(game, player)
+        ctx["rcard_dcard_touchpoints"] = tp
+        kbag = (tp or {}).get("knight") if isinstance(tp, Mapping) else {}
+        if isinstance(kbag, Mapping) and bool(kbag.get("want")):
+            boost = float(kbag.get("boost") or 10.0)
+            for row in candidates:
+                if str(row.get("card") or "") != "knight":
+                    continue
+                if not bool(row.get("legal")):
+                    continue
+                # Force into play competition when legal + touchpoint wants
+                row["play"] = True
+                row["norm_score"] = round(float(row.get("norm_score") or 0) + boost, 3)
+                row["rcard_touch_boost"] = boost
+                row["rcard_touch_reason"] = str(kbag.get("reason") or "rcard_knight_want")
+                # Elevate tier so HOLD doesn't beat unlock/LA knight
+                if str(row.get("tier") or "") in ("hold_plan", "weak", "soft", ""):
+                    row["tier"] = "strong"
+                break
+        for card_key, bag_key in (
+            ("year_of_plenty", "yop"),
+            ("monopoly", "monopoly"),
+        ):
+            bag = (tp or {}).get(bag_key) if isinstance(tp, Mapping) else {}
+            if not isinstance(bag, Mapping) or not bool(bag.get("want")):
+                continue
+            boost = float(bag.get("boost") or 5.0)
+            for row in candidates:
+                if str(row.get("card") or "") != card_key:
+                    continue
+                if not bool(row.get("legal")) or not bool(row.get("play")):
+                    continue
+                row["norm_score"] = round(float(row.get("norm_score") or 0) + boost, 3)
+                row["rcard_touch_boost"] = boost
+                break
+    except Exception as _tp_exc:
+        ctx["rcard_touch_error"] = str(_tp_exc)
+
+    # WP-TFR1: when TFR plan says play with free-road tips, beat HOLD / buy-path
+    # so preview executes TFR *before* Continue spends a paid road (n3d Orange R3).
+    if window == "post_roll":
+        try:
+            for row in candidates:
+                if str(row.get("card") or "") != "two_free_roads":
+                    continue
+                if not bool(row.get("legal")) or not bool(row.get("play")):
+                    continue
+                plan = row.get("plan") if isinstance(row.get("plan"), Mapping) else {}
+                n_roads = len(list(plan.get("road_ids") or []))
+                free_n = int(plan.get("free_roads_available") or plan.get("roads_to_place") or 0)
+                if n_roads <= 0 and free_n <= 0:
+                    break
+                boost = 12.0 if n_roads >= 2 or free_n >= 2 else 9.0
+                row["norm_score"] = round(float(row.get("norm_score") or 0) + boost, 3)
+                row["wp_tfr1_boost"] = boost
+                if str(row.get("tier") or "") in ("hold_plan", "weak", "soft", ""):
+                    row["tier"] = "strong"
+                ctx["wp_tfr1_prefer_play"] = True
+                break
+        except Exception as _tfr1_exc:
+            ctx["wp_tfr1_error"] = str(_tfr1_exc)
+
+        # WP-DCARD2: same boost for Knight/YOP/Monopoly when their plan says play
+        try:
+            for card_name, min_boost in (
+                ("knight", 11.0),
+                ("year_of_plenty", 9.0),
+                ("monopoly", 9.0),
+            ):
+                for row in candidates:
+                    if str(row.get("card") or "") != card_name:
+                        continue
+                    if not bool(row.get("legal")) or not bool(row.get("play")):
+                        continue
+                    plan = row.get("plan") if isinstance(row.get("plan"), Mapping) else {}
+                    reason = str(plan.get("reason") or row.get("reason") or "").lower()
+                    # Crit / plan-play reasons always force ahead of HOLD
+                    strong = any(
+                        tok in reason
+                        for tok in (
+                            "crit",
+                            "la_",
+                            "s_crit",
+                            "lr_crit",
+                            "early_path",
+                            "settle_path",
+                            "play",
+                        )
+                    ) or bool(row.get("rcard_touch_boost"))
+                    boost = float(min_boost) + (3.0 if strong else 0.0)
+                    row["norm_score"] = round(float(row.get("norm_score") or 0) + boost, 3)
+                    row["wp_dcard2_boost"] = boost
+                    if str(row.get("tier") or "") in ("hold_plan", "weak", "soft", ""):
+                        row["tier"] = "strong"
+                    ctx["wp_dcard2_prefer_play"] = card_name
+                    break
+        except Exception as _d2_exc:
+            ctx["wp_dcard2_error"] = str(_d2_exc)
+
     choice["candidates"] = candidates
     choice["context"] = ctx
 
     winner = _pick_max_score(candidates)
+    # WP-DCARD2: never HOLD when a legal plan-play card exists
+    if str(winner.get("card") or "") == "HOLD" or not bool(winner.get("play")):
+        for card_name in CARD_ORDER:
+            for row in candidates:
+                if str(row.get("card") or "") != card_name:
+                    continue
+                if not bool(row.get("legal")) or not bool(row.get("play")):
+                    continue
+                # Prefer cards we already boosted / crit-tagged
+                if (
+                    row.get("wp_tfr1_boost")
+                    or row.get("wp_dcard2_boost")
+                    or row.get("rcard_touch_boost")
+                    or str(row.get("tier") or "") in ("strong", "crit", "win_now")
+                ):
+                    winner = dict(row)
+                    ctx["wp_dcard2_forced_over_hold"] = card_name
+                    break
+            if str(winner.get("card") or "") != "HOLD" and bool(winner.get("play")):
+                break
+
     choice["winner"] = winner
     choice["winner_plan"] = winner.get("plan")
     choice["score"] = winner.get("norm_score")
+    choice["context"] = ctx
 
     if str(winner.get("card")) == "HOLD" or not bool(winner.get("play")):
         choice["play"] = False
@@ -1021,7 +1146,11 @@ def plan_ai_dcard_choice(
     else:
         choice["play"] = True
         choice["chosen"] = str(winner.get("card") or "")
-        choice["reason"] = REASON_MAX_SCORE
+        choice["reason"] = (
+            "wp_dcard2_force_play"
+            if ctx.get("wp_dcard2_forced_over_hold")
+            else REASON_MAX_SCORE
+        )
 
     if log:
         _log_choice(game, choice)

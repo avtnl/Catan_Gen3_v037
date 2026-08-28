@@ -798,12 +798,18 @@ def tfr_edges_from_lr_project(
     rem = remaining_lr_project_roads(game, player)
     if not rem:
         return []
-    # Minimal claim prefix
+    # Minimal claim prefix — then pad to free_n so TFR still places both free
+    # roads when the project has more edges (WP-TFR1 / Dig n3d Orange R3).
+    claim_n = None
     for n in range(1, min(free_n, len(rem)) + 1):
         prefix = rem[:n]
         ev = _eval_path(game, player, prefix)
         if bool(ev.get("takes_now")):
-            return [list(e) for e in prefix]
+            claim_n = n
+            break
+    if claim_n is not None:
+        take = min(free_n, len(rem))
+        return [list(e) for e in rem[:take]]
     # Grow: take up to free_n project edges
     return [list(e) for e in rem[:free_n]]
 

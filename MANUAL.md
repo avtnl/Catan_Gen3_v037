@@ -79,6 +79,45 @@ Also see the short project overview in [README.md](README.md) (or [README_NEW.md
 - `True` (**dig-in**): full debug UI for development and analysis.
 - Human still sees their own information appropriately either way.
 
+#### `RCARD_MEMORY_OPPONENTS`
+
+- Controls how much **public opponent RCard evidence** the AI / Strategy-Engine may treat as remembered (belief), via `ResourceCardDashboard.resource_production_game_player_view`.
+- **`"all"`** (default): full cumulative viewer→viewed table (previous behaviour).
+- **`1` … `4`**: belief = **current view − view from N completed rounds ago** (lag ring updated at each end-of-round). With 4 seats, `2` ≈ last 8 player-turns of public production evidence.
+- Dig / `CHECK_MODE` still use **truth** hands on `Player.rcards`; this flag does not redact Check-Mode.
+- Helpers: `Game.get_rcard_player_view_memory()`, `core/rcard_view_memory.py`.
+- **Beat-risk (settle / contested road):** when `1..4`, opponent Expected-Hand ETAs for race/spoiler threats use the **memory belief hand** (not god-view). Wired in portfolio timing, sticky settle-risk refresh, road-path scoring, and `risk_assessment.opponent_contested_road_eta`. `"all"` keeps truth hands for those EH calls.
+
+#### `REACHABILITY_MAPS` / `core/player_reachability.py`
+
+Per-player Gen2-style **path / pathlength / real_distance** matrices (67×67 on `Player`, horizon ≥5 → sentinel `99`). Plan: **`docs/player_reachability_maps_plan.md`** (**WP-R0–R6 Done**).
+
+| Flag / behaviour | Meaning |
+|------------------|---------|
+| **`REACHABILITY_MAPS=True`** (default) | Maintain maps for AI seats; Dig can rebuild human seats via `ensure_dig_seat_maps` |
+| Seed | Once at `Game.begin_execution_turn` (post-IP); **`load_game`** dirties seats and rebuilds if already in Execution |
+| Updates | `notify_road_built` / `notify_settlement_built` via sticky structure/road flags (paid + free TFR; v1 = full rebuild) |
+| Queries | `remaining_roads_to_target`, `path_to_target`, `sc_hop_distance` — map-first in outlook/risk/min-cover/portfolio/sticky/planner with BFS fallback |
+| Dig / Show | Scrub / Show-on call `ensure_dig_row_reachability`; Show keeps seat-matrix radii, optional d=3 **+2px** via `path_distance`; stamps `map_dist`; **no road overlay yet** |
+| Constraint | Maps never hard-exclude `new_settlement_spots` candidacy (Missing_S) |
+| Tests | `tests/test_player_reachability_*.py` (+ `test_pln_show_radius_p1`, Missing_S) |
+
+#### `WAY_NEED_CONSIDER_HAND_DEFAULT` / `core/way_resource_need.py`
+
+Façade for **Player One–style** mid-game Victory-Way RCard need (CSV → residual S/C/R/DC → need vector). Plan: **`docs/way_resource_need_plan.md`** (WP0–WP6 Done).
+
+| Flag / arg | Meaning |
+|------------|---------|
+| **`WAY_NEED_CONSIDER_HAND_DEFAULT`** | Default when `consider_hand` omitted (**`False`**) |
+| **`consider_hand=False`** | Structure residual only (ignore hand) — Dig / whole-way mass |
+| **`consider_hand=True`** | Subtract hand: **self = truth**; **opponent = `RCARD_MEMORY_OPPONENTS` belief** |
+| **`memory_rounds=`** | Optional override of memory window for opponent belief |
+| **`path_distance_for_next_settle=d`** | Attaches per-target `settlement_Nr` need in `meta["next_settle"]`; does **not** rewrite whole-way `req_roads` |
+
+- Whole-way roads: **Proposal A** (playboard min-road cover). Per-target: `next_settle_path_need_vector(d)` ≡ EH `settlement_Nr` (d=3 = d=2 + one road package).
+- Dig residual (`strategy_way_residual`) and portfolio costing call this façade; EH search stays in `resource_time_estimator` / `strategy_timing`.
+- **Do not** feed `need_after_hand` into EH together with a non-empty `current_hand` (double-subtract).
+
 #### `MG` vs `MGLOG` (do not confuse)
 
 | Constant | Default | Purpose | Output |
@@ -148,7 +187,7 @@ py -3.13 run_headless.py --result-path batch_runs/smoke/result.json -q
 
 Useful CLI flags: `--sequence`, `--max-round`, `--max-steps`, `--result-path`, `--no-result-file`, `--allow-human` (not recommended).
 
-**Phase C2 lab flags** (matched dice / reassess arms — see below): `--seed`, `--seed-base`, `--dice-from-batch`, `--explicit-recalc`, `--arm`, `--arm-name`.
+**Phase C2 lab flags** (matched dice / reassess arms — see below): `--seed`, `--seed-base`, `--dice-from-batch`, `--explicit-recalc`, `--arm`, `--arm-name`, **`--perf on|off`**.
 
 **Phase L LA soft bias** (lab only; product default `LA_SOFT_BIAS_MODE=off`): `--la-soft-bias off|early|mid|late`. Soft-boosts LA Victory-Way rank + tips knight hold→play when the timing gate is open. Experiment runner: `scripts/run_la_soft_bias_experiment.py` (n=25×3 early/mid/late on `lib_ip2` dice; **reuse** `batch_runs/product_244` as control — no new n=25 baseline). See `docs/PhaseL_la_soft_bias_experiment.md`.
 
@@ -437,7 +476,7 @@ Design: `docs/changes_PLAN_v1_impl.md` · coding: `docs/changes_PLAN_v2_coding.m
 
 Lab experiment: replay the **same playboard + same ordered dice sequence** under different **per-seat L2 / way-reassess policies**, log alt-way compares, and measure first-way fit.
 
-**Product default (new games):** AI seats **`[2, [4, 4]]`** (ETA setback OR every 4 own turns); **human seats `[0]`**. Way pick: **`EXPLICIT_WAY_PICK=sticky`**. Lab pure-sticky baseline: **`--arm control`**.
+**Product default (new games):** AI + human seats **`[0]`** — L2 only via closed-table **a/b/c** gates (same lean posture as S142 triggers off). Way pick: **`EXPLICIT_WAY_PICK=sticky`**. Opt-in schedule **`[2, [4, 4]]`**: **`--arm product`** / **`setback_every4`** / constant `EXPLICIT_142_RECALC_SCHEDULE_SETBACK_EVERY4`. Lab a/b/c baseline: **`--arm control`** (or **`abc`**).
 
 **Plan:** `docs/PhaseC2_way_reassess_experiment_plan.md`  
 **Code spine:** `core/explicit_142_recalc.py`, `core/strategy_explicit_recalc.py`, `core/dice_script.py`, `core/way_reassess_log.py`, `core/first_way_fit.py`, `core/batch/arm_config.py`, `core/batch/way_reassess_analyzer.py`
@@ -446,9 +485,10 @@ Lab experiment: replay the **same playboard + same ordered dice sequence** under
 
 | Constant | Role | Default |
 |----------|------|---------|
-| `EXPLICIT_142_RECALC_PRODUCT_AI` | AI product policy | `[2, [4, 4]]` |
+| `EXPLICIT_142_RECALC_PRODUCT_AI` | AI product policy | `[0]` (a/b/c only) |
 | `EXPLICIT_142_RECALC_PRODUCT_HUMAN` | Human product policy | `[0]` |
-| `EXPLICIT_142_RECALC_BY_SEAT` | All-AI template (live init uses `is_human` when no CLI map) | AI product |
+| `EXPLICIT_142_RECALC_SCHEDULE_SETBACK_EVERY4` | Opt-in setback + every-4 | `[2, [4, 4]]` |
+| `EXPLICIT_142_RECALC_BY_SEAT` | All-AI template (live init uses `is_human` when no CLI map) | all `[0]` |
 | `EXPLICIT_RECALC_SETBACK_THR` | Code **2** ETA rise threshold (own turns) | `1.0` |
 | `EXPLICIT_RECALC_EVERY_N_DEFAULT` | Bare code **4** → period n | `2` |
 | `EXPLICIT_RECALC_MILESTONE_VPS` | Code **5** VP milestones | `(2, 4, 6, 8)` |
@@ -466,20 +506,30 @@ Lab experiment: replay the **same playboard + same ordered dice sequence** under
 | 4 | every_n_own_turns | Form **`[4, n]`** (bare `4` → default n) |
 | 5 | milestones | First cross of milestone VPs |
 
-Examples: product AI **`[2, [4, 4]]`**; sticky `[0]`; dense explore **`[1, 2, 3, [4, 2]]`**.
+Examples: product **`[0]`** (a/b/c); opt-in schedule **`[2, [4, 4]]`**; dense explore **`[1, 2, 3, [4, 2]]`**.
 
 CLI **`--explicit-recalc`** / **`--arm`** override product defaults for a run (do not require editing constants for A/B arms).
 
 #### CLI recipes
 
 ```bash
-# Record sticky-control library (lab baseline — not the same as product AI)
+# Record a/b/c-only library (product default / lab baseline)
 py -3.13 run_headless.py --games 100 --batch-dir batch_runs/lib_ip2 --seed-base 1000 --arm control
 
-# Product AI policy on all seats (default without --arm is also product for AI)
+# Opt-in [2,[4,4]] schedule on all seats (former product AI)
 py -3.13 run_headless.py --games 100 --batch-dir batch_runs/product_244 --arm product
 
-# WP-P9: product [2,[4,4]] vs sticky control on matched dice (long; ~50+ min)
+# Phase G: a/b/c vs schedule on matched dice
+#   --arm control  (or abc)  vs  --arm product  (or setback_every4)
+
+# Dual perf pack (same seat arm / dice; digs lean vs full) — ditch-S142 wall evidence
+#   --perf on  = shadow/MGLOG/probes/snapshot/target-screen OFF (lean wall)
+#   --perf off = digs ON (transparency). S142 drive stays off in both packs.
+py -3.13 run_headless.py --games 3 --batch-dir batch_runs/ctrl_perf_off_n3 --seed-base 24082501 --arm control --perf off
+py -3.13 run_headless.py --games 3 --batch-dir batch_runs/ctrl_perf_on_n3 --seed-base 24082501 --dice-from-batch batch_runs/ctrl_perf_off_n3 --arm control --perf on
+# Aliases: --arm control+perf   |  --arm control+perf-off  |  --arm perf
+
+# WP-P9: [2,[4,4]] vs sticky control on matched dice (long; ~50+ min)
 py -3.13 scripts/run_wp_p9_validation.py --games 100
 # Re-analyze only:
 py -3.13 scripts/analyze_wp_p9.py --control batch_runs/lib_ip2 --product batch_runs/product_244
@@ -611,8 +661,28 @@ Practical order (build on sticky / L0–L2; do not re-plan on pure hand noise):
 | **P1+Q2** | Affordable **DCard** not on way: may **buy**, **no L2**; do not starve sticky city/settle or active **races** (specific road, specific settle, LA, LR, last DCards). Drawn DCard not playable same turn | **Implemented** (`core/strategy_offway_q2.py`); plan: `docs/P1Q2_offway_dcard_buy_plan.md`. Soft BA permission; never L2 |
 | **P2** | Coalesce dirty flags; **one** heavy job per seat when possible | **Implemented** (`core/strategy_dirty.py` + gated flaggers). Plan: `docs/P2_turn_start_l2_dirty_flags_plan.md`. Turn-start **L0 default**; L2 only on **plan-relevant** dirt. Own Q2 alone → no L2 |
 | **P3** | L2 only on: (a) need next target, (b) target blocked / race worse, (c) LA/LR shock, (d) Q1 off-way settle/city; never L2 for pure TwP/TwB/hand or off-way DCard alone | **Implemented** (`build_l2_policy_status`, reason map). Plan: `docs/P3_l2_policy_closed_table_plan.md`. Dig-in: `l2_policy.bucket` |
-| **P4** | Filter 142 → top K before EH; portfolio cap 3 in fast mode | **Implemented** (`core/l2_profile.py`, prefilter in `strategy_timing`). Plan: `docs/P4_cheap_l2_top_k_plan.md`. Fast L2: K=12, portfolio 3, no Stage3/risk; full for phase0/F9 |
+| **P4** | Filter 142 → top K before EH; thin fast explore | **Implemented** (`core/l2_profile.py`, prefilter in `strategy_timing`). Plan: `docs/P4_cheap_l2_top_k_plan.md`. Fast L2: abstract prefilter K=12, portfolio **stage Early3/Mid6/End9** (flat-3 retired), no Stage3/risk; full for phase0/F9. Sync/adaptive: `docs/L2_sync_transparency_shadow_plan.md` |
 | **P5** | NumPy EH core; profile; optional batch/GPU later | **Implemented (v1)** `core/eh_numpy.py` + `USE_NUMPY_EH`. Plan: `docs/P5_numpy_eh_performance_plan.md`. Batch EH in rank; fallback pure Python; bench: `scripts/bench_eh.py` |
+
+### L2 sync-first / transparency / shadow overlook (v037)
+
+Plan: **`docs/L2_sync_transparency_shadow_plan.md`**. Target-screen research: **`docs/L2_target_screen_research_R.md`**.
+
+| Flag (`core/constants.py`) | Role |
+|----------------------------|------|
+| `L2_SYNC_FIRST` | `on`/`off` — sync-fit filter before deep L2 score |
+| `L2_DOSSIER` | `off`/`cs`/`full` — candidate dossier on `game._last_l2_way_dossier` |
+| `L2_SHADOW_MISS` | Observe-only abstract rank of all sync-fit vs L2 winner (analyzer WP) |
+| `L2_ADAPTIVE_K` | Score all fit when `n_fit ≤ L2_SCORE_ALL_FIT_MAX` (default 12) |
+| `L2_TARGET_SCREEN` | `off`/`mark_only`/`prune` — C/S inferior screen (product default **`mark_only`**; `prune` lab) |
+
+Shared fit API: `strategy_board_fit.select_fit_ways` (Sidestep S142 reuses it).
+
+**Shadow overlook dig (Phase E):** after each L2 (when `L2_SHADOW_MISS=on`), abstract-rank all sync-fit ways vs the L2 eval set; append `batch_dir/l2_cap_miss.jsonl`. Analyze:
+
+```bash
+py -3.13 scripts/analyze_l2_cap_miss.py --batch-dir batch_runs/<batch>
+```
 
 **Race** (for Q2 guards) = contest for: **specific road**, **specific settlement**, **LA**, **LR**, or **last DCards**.
 

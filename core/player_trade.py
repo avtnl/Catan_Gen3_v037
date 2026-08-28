@@ -374,6 +374,123 @@ def proposal_fills_live_need(
     return filled > 0, filled
 
 
+def annotate_proposals_with_rcard_mutual(
+    game: Any,
+    active_player: Any,
+    proposals: Sequence[TradeProposal],
+    *,
+    live_need: Optional[Sequence[int]] = None,
+    support_action: str = "",
+) -> List[TradeProposal]:
+    """Tag TwP rows with RCard mutual-unlock scores; inject primary multi-gives.
+
+    R6T4: Wh→Wd and Wh+O→Wd must be first-class candidates when they fill/unlock
+    a partner city — not only nested decline sweeteners.
+    """
+    try:
+        from core.rcard_optimizer import enumerate_mutual_unlock_twp
+    except Exception:
+        return list(proposals or [])
+    try:
+        bag = enumerate_mutual_unlock_twp(
+            game,
+            active_player,
+            live_need=live_need,
+            support_action=support_action,
+            max_offers=16,
+        )
+    except Exception:
+        return list(proposals or [])
+    by_key: Dict[Tuple[Any, ...], Mapping[str, Any]] = {}
+    inject: List[TradeProposal] = []
+    existing_ids = set()
+    for raw in list(proposals or []):
+        if isinstance(raw, TradeProposal):
+            try:
+                existing_ids.add(_proposal_identity_key(raw))
+            except Exception:
+                pass
+    for off in list((bag or {}).get("offers") or []):
+        if not isinstance(off, Mapping):
+            continue
+        key = (
+            int(off.get("counterparty_id", -1) or -1),
+            int(off.get("give_index", -1) or -1),
+            int(off.get("get_index", -1) or -1),
+        )
+        # Prefer higher-scoring offer for the same plain pair key
+        prev = by_key.get(key)
+        if prev is None or float(off.get("score") or 0) >= float(prev.get("score") or 0):
+            by_key[key] = off
+        # Inject primary multi-give / city packages into the live pool
+        if off.get("primary_multi_give") or off.get("kind") == "TwP_mutual_city_pkg":
+            pdata = off.get("proposal")
+            if not isinstance(pdata, Mapping):
+                continue
+            try:
+                prop = trade_proposal_from_dict(pdata)
+            except Exception:
+                continue
+            try:
+                ident = _proposal_identity_key(prop)
+            except Exception:
+                ident = None
+            if ident is not None and ident in existing_ids:
+                continue
+            incent = (
+                off.get("their_incentive")
+                if isinstance(off.get("their_incentive"), Mapping)
+                else {}
+            )
+            tagged = _tag_proposal_snapshot(
+                prop,
+                extra={
+                    "rcard_mutual": True,
+                    "rcard_mutual_score": float(off.get("score") or 0),
+                    "rcard_their_unlocks": list(incent.get("newly_unlocked") or []),
+                    "rcard_our_full_unlock": bool(off.get("our_full_unlock")),
+                    "rcard_primary_multi_give": True,
+                },
+                extra_reasons=(
+                    "rcard_mutual_city_pkg",
+                    f"partner:{','.join(incent.get('newly_unlocked') or []) or 'fill'}",
+                ),
+            )
+            inject.append(tagged)
+            if ident is not None:
+                existing_ids.add(ident)
+    out: List[TradeProposal] = []
+    for raw in list(proposals or []):
+        if not isinstance(raw, TradeProposal):
+            continue
+        key = (
+            int(raw.counterparty_id),
+            int(raw.active_give_index),
+            int(raw.active_receive_index),
+        )
+        off = by_key.get(key)
+        if not off:
+            out.append(raw)
+            continue
+        incent = off.get("their_incentive") if isinstance(off.get("their_incentive"), Mapping) else {}
+        out.append(
+            _tag_proposal_snapshot(
+                raw,
+                extra={
+                    "rcard_mutual": True,
+                    "rcard_mutual_score": float(off.get("score") or 0),
+                    "rcard_their_unlocks": list(incent.get("newly_unlocked") or []),
+                    "rcard_our_full_unlock": bool(off.get("our_full_unlock")),
+                },
+                extra_reasons=(
+                    "rcard_mutual",
+                    f"partner:{','.join(incent.get('newly_unlocked') or []) or 'fill'}",
+                ),
+            )
+        )
+    return out + inject
+
+
 def annotate_proposals_with_live_need(
     proposals: Sequence[TradeProposal],
     live_need: Optional[Sequence[int]],
@@ -705,6 +822,10 @@ def find_twp_proposals(
     proposals = annotate_proposals_with_live_need(
         proposals, live_need, support_action=support_action
     )
+    # RCard optimizer: tag mutual partner unlocks (city/road/settle/DCard)
+    proposals = annotate_proposals_with_rcard_mutual(
+        game, active, proposals, live_need=live_need, support_action=support_action
+    )
 
     # T8 belt: drop exact declined keys so they never rank
     try:
@@ -718,6 +839,8 @@ def find_twp_proposals(
 
     # T1-B (Q7): after HP declines 1:1, boost same-pair 2:1 / 1:2 once
     proposals = apply_decline_escalation_boosts(game, proposals)
+    # RCard optimizer: after 1:1 decline, also boost Wh-sweetener multi-give sibling
+    proposals = apply_rcard_sweetener_escalation(game, proposals, active_player=active)
 
     # T1-A: shared package-quality rank (unlock / ditch / score / lowest VP / RNG)
     proposals = sort_proposals_by_package_quality(
@@ -763,6 +886,69 @@ def find_twp_proposals(
     return proposals
 
 
+# City upgrade cost in project resource order [Wh, O, Wd, B, Sh].
+_CITY_COST_VEC: Tuple[int, int, int, int, int] = (2, 3, 0, 0, 0)
+
+
+def _counterparty_unlock_take_allowed(
+    *,
+    counterparty: Any,
+    c_hand: Sequence[int],
+    c_missing: Sequence[int],
+    c_keep: Sequence[int],
+    c_cost: Sequence[int],
+    get_idx: int,
+    receive_count: int,
+    give_idx: int,
+    give_count: int,
+) -> Tuple[bool, str]:
+    """Whether unlock TwP may take ``receive_count`` of counterparty ``get_idx``.
+
+    Hard rule: never strip units they still need for their *declared* primary
+    missing vector.
+
+    Soft keep gate: normally do not take their last keep unit toward primary
+    cost. **Exception (R3T2 dig / win-win city pivot):** if they own a
+    settlement, the resource we give fills a city shortfall, and the resource
+    we take is not part of city cost, allow the take even when settle-sticky
+    keep would otherwise protect it (e.g. Orange O←Wd while sticky S still
+    guards Wood, but city@owned settlement wants Ore).
+    """
+    if not (0 <= get_idx < 5 and 0 <= give_idx < 5):
+        return False, "bad_index"
+    try:
+        receive_count = int(receive_count or 0)
+        give_count = int(give_count or 0)
+    except Exception:
+        return False, "bad_counts"
+    if receive_count <= 0 or give_count <= 0:
+        return False, "bad_counts"
+
+    c_after = int(c_hand[get_idx] or 0) - receive_count
+    if c_after < 0:
+        return False, "counter_lacks_resource"
+    if int(c_missing[get_idx] or 0) > 0 and c_after < int(c_missing[get_idx] or 0):
+        return False, "strips_primary_missing"
+
+    # Win-win city pivot: give fills their city need; take is not a city input.
+    city_cost = _CITY_COST_VEC
+    if int(city_cost[get_idx] or 0) <= 0:
+        settlements = list(getattr(counterparty, "settlements", None) or [])
+        if settlements and int(city_cost[give_idx] or 0) > 0:
+            city_miss_give = max(
+                0, int(city_cost[give_idx] or 0) - int(c_hand[give_idx] or 0)
+            )
+            if city_miss_give > 0 and give_count > 0:
+                return True, "win_win_city_pivot"
+
+    if int(c_keep[get_idx] or 0) > 0 and c_after < min(
+        int(c_keep[get_idx] or 0), int(c_cost[get_idx] or 0)
+    ):
+        if int(c_cost[get_idx] or 0) > 0 and c_after < 1:
+            return False, "strips_primary_keep"
+    return True, "ok"
+
+
 def find_unlock_twp_proposals(
     game: Any,
     active_player: Optional[Any] = None,
@@ -773,6 +959,7 @@ def find_unlock_twp_proposals(
     live_need: Optional[Sequence[int]] = None,
     primary_cost: Optional[Sequence[int]] = None,
     primary_action: Optional[str] = None,
+    force_offerable_indices: Optional[Sequence[int]] = None,
 ) -> List[TradeProposal]:
     """Generate project-unlock TwP deals without full mutual-appetite gates.
 
@@ -784,8 +971,13 @@ def find_unlock_twp_proposals(
     T11: optional ``live_need`` / ``primary_cost`` override aligns unlock with
     Game supporting-action vector when profile primary_missing is stale.
 
-    Does not strip a counterparty's last primary-keep unit for a resource they
-    still need for their own primary action.
+    ``force_offerable_indices``: allow spending keep units of these resources
+    (two-leg bridge chains temporarily give a settle-cost card to fetch the
+    missing one, then restore it).
+
+    Does not strip a counterparty's last primary-missing unit. Soft keep may
+    yield when the give is a win-win city-pivot (see
+    ``_counterparty_unlock_take_allowed``).
     """
     active = _resolve_player(game, active_player)
     if active is None:
@@ -828,6 +1020,15 @@ def find_unlock_twp_proposals(
     for i in range(5):
         offerable[i] = max(ditch[i], max(0, hand[i] - keep[i]))
         offerable[i] = min(offerable[i], hand[i])
+    # Two-leg bridge: temporarily allow keep-spend on named indices
+    for raw_i in list(force_offerable_indices or []):
+        try:
+            i = int(raw_i)
+        except Exception:
+            continue
+        if 0 <= i < 5 and hand[i] > 0:
+            offerable[i] = max(int(offerable[i] or 0), 1)
+            offerable[i] = min(offerable[i], hand[i])
 
     if sum(offerable) <= 0:
         return []
@@ -888,15 +1089,19 @@ def find_unlock_twp_proposals(
                         continue
                     if c_hand[get_idx] < receive_count:
                         continue
-                    # Don't take units the counter still needs for *their* primary
-                    # unless they keep enough after the gift.
-                    c_after_need_res = c_hand[get_idx] - receive_count
-                    if c_missing[get_idx] > 0 and c_after_need_res < c_missing[get_idx]:
+                    take_ok, take_reason = _counterparty_unlock_take_allowed(
+                        counterparty=counterparty,
+                        c_hand=c_hand,
+                        c_missing=c_missing,
+                        c_keep=c_keep,
+                        c_cost=c_cost,
+                        get_idx=get_idx,
+                        receive_count=receive_count,
+                        give_idx=give_idx,
+                        give_count=give_count,
+                    )
+                    if not take_ok:
                         continue
-                    if c_keep[get_idx] > 0 and c_after_need_res < min(c_keep[get_idx], c_cost[get_idx]):
-                        # Soft: allow if they retain at least one keep unit or zero cost
-                        if c_cost[get_idx] > 0 and c_after_need_res < 1:
-                            continue
 
                     # Active hand after
                     a_after = list(hand)
@@ -925,6 +1130,8 @@ def find_unlock_twp_proposals(
                     counter_score = 0.4
                     if c_missing[give_idx] > 0:
                         counter_score += 1.2 * min(give_count, c_missing[give_idx])
+                    if take_reason == "win_win_city_pivot":
+                        counter_score += 1.5  # city Ore (etc.) clearly helps them
                     if float(counter.production_pips[get_idx] or 0) >= DEFAULT_ABUNDANT_PLAYER_PIPS_MIN:
                         counter_score += 0.3  # they can replace what they gave
                     total_score = active_score + counter_score
@@ -936,6 +1143,17 @@ def find_unlock_twp_proposals(
                     active_gain[get_idx] += receive_count
                     counter_gain[give_idx] += give_count
                     counter_gain[get_idx] -= receive_count
+
+                    reason_bits = [
+                        "unlock_fallback",
+                        f"fills {need_reduced} toward {active_profile.primary_action}",
+                        f"{'full unlock' if fully else 'partial unlock'}",
+                        f"give {RESOURCE_NAMES[give_idx]}×{give_count}",
+                        f"get {RESOURCE_NAMES[get_idx]}×{receive_count}",
+                        "T11: live_need",
+                    ]
+                    if take_reason == "win_win_city_pivot":
+                        reason_bits.append("win_win_city_pivot")
 
                     prop = TradeProposal(
                         active_player_id=active_id,
@@ -959,14 +1177,7 @@ def find_unlock_twp_proposals(
                         requires_human_confirmation=requires_human,
                         auto_executable=not requires_human,
                         status="candidate",
-                        reasons=(
-                            "unlock_fallback",
-                            f"fills {need_reduced} toward {active_profile.primary_action}",
-                            f"{'full unlock' if fully else 'partial unlock'}",
-                            f"give {RESOURCE_NAMES[give_idx]}×{give_count}",
-                            f"get {RESOURCE_NAMES[get_idx]}×{receive_count}",
-                            "T11: live_need",
-                        ),
+                        reasons=tuple(reason_bits),
                         market_snapshot={
                             "source": "unlock_fallback",
                             "active_primary_action": active_profile.primary_action,
@@ -977,6 +1188,7 @@ def find_unlock_twp_proposals(
                             "fills_live_need": True,
                             "live_need_filled": int(need_reduced),
                             "t11": True,
+                            "take_reason": take_reason,
                         },
                     )
                     # Lower rank key is better. Prefer 1:1 before 2:1 when unlock
@@ -1015,6 +1227,123 @@ def find_unlock_twp_proposals(
         if len(out) >= max(0, int(max_candidates)):
             break
     return out
+
+
+def find_directed_unlock_twp_proposals(
+    game: Any,
+    active_player: Optional[Any] = None,
+    *,
+    give_index: int,
+    receive_index: int,
+    live_need: Optional[Sequence[int]] = None,
+    primary_cost: Optional[Sequence[int]] = None,
+    primary_action: Optional[str] = None,
+    max_candidates: int = 8,
+    include_human_counterparties: bool = True,
+    give_count: int = 1,
+    receive_count: int = 1,
+    allow_keep_spend: bool = True,
+) -> List[TradeProposal]:
+    """Unlock TwP filtered to a directed give→receive pair (any counterparty).
+
+    ``allow_keep_spend`` (default True) forces the give resource offerable even
+    when it is a primary-keep card — required for two-leg bridge legs (B→Wd).
+    """
+    try:
+        gi = int(give_index)
+        ri = int(receive_index)
+        gc = max(1, int(give_count or 1))
+        rc = max(1, int(receive_count or 1))
+    except Exception:
+        return []
+    if not (0 <= gi < 5 and 0 <= ri < 5) or gi == ri:
+        return []
+    props = find_unlock_twp_proposals(
+        game,
+        active_player,
+        max_candidates=max(24, int(max_candidates) * 3),
+        include_human_counterparties=include_human_counterparties,
+        live_need=live_need,
+        primary_cost=primary_cost,
+        primary_action=primary_action,
+        force_offerable_indices=[gi] if allow_keep_spend else None,
+    )
+    out = [
+        p
+        for p in props
+        if int(p.active_give_index) == gi
+        and int(p.active_receive_index) == ri
+        and int(p.active_give_count) == gc
+        and int(p.active_receive_count) == rc
+    ]
+    return out[: max(0, int(max_candidates))]
+
+
+def with_wh_sweetener(
+    proposal: TradeProposal,
+    *,
+    wheat_index: int = 0,
+    extra_wheat: int = 1,
+) -> Optional[TradeProposal]:
+    """Clone a 1:1 unlock proposal adding +Wh on the give side (acceptance sweetener).
+
+    Uses ``active_gain_vector`` / ``counterparty_gain_vector`` for the multi-resource
+    delta; ``execute_twp_trade`` applies extras when ``multi_resource_give`` is set.
+    Does not change primary give_index (still the non-Wh resource) so labels stay
+    readable; snap records the sweetener.
+    """
+    if proposal is None or not isinstance(proposal, TradeProposal):
+        return None
+    try:
+        wi = int(wheat_index)
+        extra = max(1, int(extra_wheat or 1))
+        gi = int(proposal.active_give_index)
+        gc = int(proposal.active_give_count or 0)
+        ri = int(proposal.active_receive_index)
+        rc = int(proposal.active_receive_count or 0)
+    except Exception:
+        return None
+    if not (0 <= wi < 5) or wi == gi or wi == ri or gc <= 0 or rc <= 0:
+        return None
+    a_gain = [0, 0, 0, 0, 0]
+    c_gain = [0, 0, 0, 0, 0]
+    a_gain[gi] -= gc
+    a_gain[wi] -= extra
+    a_gain[ri] += rc
+    c_gain[gi] += gc
+    c_gain[wi] += extra
+    c_gain[ri] -= rc
+    snap = dict(proposal.market_snapshot or {})
+    snap["multi_resource_give"] = True
+    snap["wh_sweetener"] = True
+    snap["extra_give_index"] = wi
+    snap["extra_give_count"] = extra
+    reasons = tuple(proposal.reasons or ()) + ("wh_sweetener",)
+    return TradeProposal(
+        active_player_id=int(proposal.active_player_id),
+        counterparty_id=int(proposal.counterparty_id),
+        active_player_is_human=bool(proposal.active_player_is_human),
+        counterparty_is_human=bool(proposal.counterparty_is_human),
+        trade_type=str(proposal.trade_type),
+        active_give_index=gi,
+        active_give_count=gc,
+        active_receive_index=ri,
+        active_receive_count=rc,
+        active_score=float(proposal.active_score) + 0.35,
+        counterparty_score=float(proposal.counterparty_score) + 0.5,
+        total_score=float(proposal.total_score) + 0.85,
+        active_gain_vector=_tuple5_int(a_gain, default=0),
+        counterparty_gain_vector=_tuple5_int(c_gain, default=0),
+        active_offer_appetite=int(proposal.active_offer_appetite),
+        active_accept_appetite=int(proposal.active_accept_appetite),
+        counterparty_offer_appetite=int(proposal.counterparty_offer_appetite),
+        counterparty_accept_appetite=max(1, int(proposal.counterparty_accept_appetite)),
+        requires_human_confirmation=bool(proposal.requires_human_confirmation),
+        auto_executable=bool(proposal.auto_executable),
+        status=str(proposal.status or "candidate"),
+        reasons=reasons,
+        market_snapshot=snap,
+    )
 
 
 def choose_best_twp_proposal(
@@ -1198,24 +1527,48 @@ def execute_twp_trade(
     if active is None or counter is None:
         return TradeDecision(False, False, proposal, "Active player or counterparty not found.")
 
-    if not _has_cards(active, proposal.active_give_index, proposal.active_give_count):
-        return TradeDecision(False, False, proposal, "Active player no longer has the offered cards.")
-    if not _has_cards(counter, proposal.active_receive_index, proposal.active_receive_count):
-        return TradeDecision(False, False, proposal, "Counterparty no longer has the requested cards.")
+    snap = proposal.market_snapshot if isinstance(proposal.market_snapshot, Mapping) else {}
+    multi = bool(snap.get("multi_resource_give"))
+    a_gain = [int(x or 0) for x in list(proposal.active_gain_vector or [])[:5]]
+    while len(a_gain) < 5:
+        a_gain.append(0)
 
-    _add_resource(active, proposal.active_give_index, -proposal.active_give_count)
-    _add_resource(counter, proposal.active_give_index, proposal.active_give_count)
-    _add_resource(counter, proposal.active_receive_index, -proposal.active_receive_count)
-    _add_resource(active, proposal.active_receive_index, proposal.active_receive_count)
+    if multi and any(int(x or 0) < 0 for x in a_gain):
+        # Multi-resource give (e.g. O+Wh → B sweetener): apply full gain vectors.
+        for i in range(5):
+            need_give = max(0, -int(a_gain[i] or 0))
+            if need_give > 0 and not _has_cards(active, i, need_give):
+                return TradeDecision(
+                    False, False, proposal, f"Active lacks multi-give resource idx={i}."
+                )
+            need_take = max(0, int(a_gain[i] or 0))  # active receives
+            if need_take > 0 and i != int(proposal.active_receive_index):
+                # Extra receives uncommon; require counter has them
+                if not _has_cards(counter, i, need_take):
+                    return TradeDecision(
+                        False, False, proposal, f"Counter lacks multi-receive idx={i}."
+                    )
+        # Counter must still have primary receive
+        if not _has_cards(counter, proposal.active_receive_index, proposal.active_receive_count):
+            return TradeDecision(False, False, proposal, "Counterparty no longer has the requested cards.")
+        for i in range(5):
+            delta = int(a_gain[i] or 0)
+            if delta == 0:
+                continue
+            _add_resource(active, i, delta)
+            _add_resource(counter, i, -delta)
+        give_v = [max(0, -int(a_gain[i] or 0)) for i in range(5)]
+        get_v = [max(0, int(a_gain[i] or 0)) for i in range(5)]
+    else:
+        if not _has_cards(active, proposal.active_give_index, proposal.active_give_count):
+            return TradeDecision(False, False, proposal, "Active player no longer has the offered cards.")
+        if not _has_cards(counter, proposal.active_receive_index, proposal.active_receive_count):
+            return TradeDecision(False, False, proposal, "Counterparty no longer has the requested cards.")
 
-    _sync_number_of_rcards(active)
-    _sync_number_of_rcards(counter)
-    _record_twp_turn_details(game, active, counter, proposal)
-    _play_twp_success_sound(game, proposal)
-
-    try:
-        from core import mglog
-
+        _add_resource(active, proposal.active_give_index, -proposal.active_give_count)
+        _add_resource(counter, proposal.active_give_index, proposal.active_give_count)
+        _add_resource(counter, proposal.active_receive_index, -proposal.active_receive_count)
+        _add_resource(active, proposal.active_receive_index, proposal.active_receive_count)
         give_v = [0, 0, 0, 0, 0]
         get_v = [0, 0, 0, 0, 0]
         try:
@@ -1227,6 +1580,15 @@ def execute_twp_trade(
                 get_v[ri] = int(proposal.active_receive_count or 0)
         except Exception:
             pass
+
+    _sync_number_of_rcards(active)
+    _sync_number_of_rcards(counter)
+    _record_twp_turn_details(game, active, counter, proposal)
+    _play_twp_success_sound(game, proposal)
+
+    try:
+        from core import mglog
+
         mglog.log_twp(
             game,
             active,
@@ -3465,6 +3827,25 @@ def evaluate_counterparty_accept(
 
     pure_surplus = not spends_keep and c_give_count <= int(exportable or 0)
 
+    # Need / surplus fit (needed before surplus-accept rules)
+    missing = list(counter.primary_missing)
+    while len(missing) < 5:
+        missing.append(0)
+    needs_recv = int(missing[c_recv_idx] or 0) > 0
+    gives_needed = int(missing[c_give_idx] or 0) > 0
+
+    # WP-I: never give away a resource still missing for primary unless this
+    # trade unlocks that primary (Dig: Orange accepting B↔Wh when Wh is needed).
+    if gives_needed and not counter_completes:
+        return (
+            False,
+            0.0,
+            [
+                f"T3 reject: counterparty still needs {RESOURCE_NAMES[c_give_idx]} "
+                f"for {counter.primary_action or 'primary'}; no unlock"
+            ],
+        )
+
     if spends_keep and counter_completes:
         reasons.append(
             f"T3 accept: counterparty spends keep {RESOURCE_NAMES[c_give_idx]} to unlock {counter.primary_action}"
@@ -3476,11 +3857,6 @@ def evaluate_counterparty_accept(
         )
         adj += 0.15
 
-    # Need / surplus fit
-    missing = list(counter.primary_missing)
-    while len(missing) < 5:
-        missing.append(0)
-    needs_recv = int(missing[c_recv_idx] or 0) > 0
     if needs_recv:
         reasons.append(f"T3: counterparty needs {RESOURCE_NAMES[c_recv_idx]}")
         adj += 0.40
@@ -3488,6 +3864,25 @@ def evaluate_counterparty_accept(
         # Receiving more of a surplus resource is weakly unattractive
         adj -= 0.15
         reasons.append(f"T3 soft: counterparty already has surplus {RESOURCE_NAMES[c_recv_idx]}")
+
+    # WP-I: surplus-for-surplus with no unlock — hard reject (junk B↔Wh style).
+    # Only when the received card is already clear_surplus (not merely "not missing"),
+    # so pure ditch for a neutral non-need can still soft-accept.
+    recv_already_surplus = int(counter.clear_surplus[c_recv_idx] or 0) > 0
+    if (
+        pure_surplus
+        and recv_already_surplus
+        and not counter_completes
+        and not needs_recv
+    ):
+        return (
+            False,
+            0.0,
+            [
+                f"T3 reject: surplus {RESOURCE_NAMES[c_give_idx]} for "
+                f"surplus {RESOURCE_NAMES[c_recv_idx]}; no primary unlock"
+            ],
+        )
 
     if counter_completes:
         reasons.append(f"T3 accept: unlocks counterparty {counter.primary_action}")
@@ -3633,11 +4028,18 @@ def twp_active_score_floor_ok(
 def _proposal_identity_key(proposal: Any) -> Tuple[int, int, int, int, int, int]:
     data = _proposal_mapping(proposal)
     try:
+        gn = int(data.get("active_give_count", 0) or 0)
+        snap = data.get("market_snapshot") if isinstance(data.get("market_snapshot"), Mapping) else {}
+        # Distinguish Wh-sweetener / multi-give from plain 1:1 so decline of
+        # the plain offer does not block the escalated sibling.
+        if snap.get("multi_resource_give") or snap.get("wh_sweetener"):
+            extra = int(snap.get("extra_give_count") or 1)
+            gn = gn + 100 + max(0, extra)
         return (
             int(data.get("active_player_id", 0) or 0),
             int(data.get("counterparty_id", 0) or 0),
             int(data.get("active_give_index", 0) or 0),
-            int(data.get("active_give_count", 0) or 0),
+            gn,
             int(data.get("active_receive_index", 0) or 0),
             int(data.get("active_receive_count", 0) or 0),
         )
@@ -3824,6 +4226,122 @@ def apply_decline_escalation_boosts(
         else:
             out.append(raw)
     return out
+
+
+def apply_rcard_sweetener_escalation(
+    game: Optional[Any],
+    proposals: Sequence[TradeProposal],
+    *,
+    active_player: Optional[Any] = None,
+) -> List[TradeProposal]:
+    """After a plain 1:1 decline, inject/boost Wh-sweetener sibling (2-resource give).
+
+    Generic RCard ladder: offer one resource first; if denied, offer the same
+    get with an extra Wheat sweetener. Complements count-based 2:1 escalation.
+    """
+    declined = parse_declined_proposal_keys(game)
+    if not declined:
+        return list(proposals or [])
+
+    pairs_1for1: set = set()
+    for aid, cid, gi, gn, ri, rn in declined:
+        if (gn, rn) == (1, 1):
+            pairs_1for1.add((aid, cid, gi, ri))
+    if not pairs_1for1:
+        return list(proposals or [])
+
+    out: List[TradeProposal] = [p for p in list(proposals or []) if isinstance(p, TradeProposal)]
+    existing = set()
+    for p in out:
+        try:
+            existing.add(_proposal_identity_key(p))
+        except Exception:
+            pass
+
+    extras: List[TradeProposal] = []
+    for aid, cid, gi, ri in pairs_1for1:
+        # Plain 1:1 is already stripped from the pool after decline — rebuild
+        # sweetener from a same-pair template or a synthetic 1:1 shell.
+        template = None
+        for p in out:
+            try:
+                if (
+                    int(p.active_player_id) == aid
+                    and int(p.counterparty_id) == cid
+                    and int(p.active_give_index) == gi
+                    and int(p.active_receive_index) == ri
+                ):
+                    template = p
+                    break
+            except Exception:
+                continue
+        if template is None:
+            template = TradeProposal(
+                active_player_id=int(aid),
+                counterparty_id=int(cid),
+                active_player_is_human=False,
+                counterparty_is_human=False,
+                trade_type=TRADE_NORMAL_1_FOR_1,
+                active_give_index=int(gi),
+                active_give_count=1,
+                active_receive_index=int(ri),
+                active_receive_count=1,
+                active_score=1.0,
+                counterparty_score=0.5,
+                total_score=1.5,
+                active_gain_vector=_tuple5_int(
+                    [(-1 if i == gi else (1 if i == ri else 0)) for i in range(5)],
+                    default=0,
+                ),
+                counterparty_gain_vector=_tuple5_int(
+                    [(1 if i == gi else (-1 if i == ri else 0)) for i in range(5)],
+                    default=0,
+                ),
+                active_offer_appetite=2,
+                active_accept_appetite=1,
+                counterparty_offer_appetite=2,
+                counterparty_accept_appetite=1,
+                requires_human_confirmation=False,
+                auto_executable=True,
+                status="candidate",
+                reasons=("rcard_escalate_shell",),
+                market_snapshot={"source": "rcard_escalate"},
+            )
+        # If template is already a sweetener, just tag it
+        snap_t = template.market_snapshot if isinstance(template.market_snapshot, Mapping) else {}
+        if snap_t.get("wh_sweetener") or snap_t.get("multi_resource_give"):
+            sweet = _tag_proposal_snapshot(
+                template,
+                extra={
+                    "pq_escalate": True,
+                    "escalate_after_1for1_decline": True,
+                    "rcard_wh_sweetener_escalate": True,
+                },
+                extra_reasons=("rcard: escalate plain→Wh sweetener after decline",),
+            )
+        else:
+            sweet = with_wh_sweetener(template)
+            if sweet is None:
+                continue
+            sweet = _tag_proposal_snapshot(
+                sweet,
+                extra={
+                    "pq_escalate": True,
+                    "escalate_after_1for1_decline": True,
+                    "rcard_wh_sweetener_escalate": True,
+                },
+                extra_reasons=("rcard: escalate plain→Wh sweetener after decline",),
+            )
+        try:
+            key = _proposal_identity_key(sweet)
+        except Exception:
+            key = None
+        if key is not None and key in existing:
+            continue
+        extras.append(sweet)
+        if key is not None:
+            existing.add(key)
+    return out + extras
 
 
 def _proposal_mapping(proposal: Any) -> Dict[str, Any]:
@@ -4084,6 +4602,15 @@ def package_quality_rank_key(
             bank_rate_give=rate,
         )
     )
+    snap = data.get("market_snapshot") if isinstance(data.get("market_snapshot"), Mapping) else {}
+    # RCard mutual: partner unlocks city/road/settle/DCard → prefer in rank
+    if snap.get("rcard_mutual"):
+        try:
+            attr = float(attr) + float(snap.get("rcard_mutual_score") or 0)
+        except Exception:
+            attr = float(attr) + 1.0
+        if list(snap.get("rcard_their_unlocks") or []):
+            attr += 1.5
     try:
         cid = int(data.get("counterparty_id", 0) or 0)
     except Exception:

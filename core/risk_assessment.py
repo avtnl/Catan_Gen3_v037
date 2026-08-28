@@ -229,6 +229,9 @@ def _min_empty_roads_to_reach(
     None means unreachable within max_depth.
 
     v5-B: cannot path through opponent-occupied S/C vertices; depth capped.
+
+    When ``REACHABILITY_MAPS`` is on and maps are fresh, prefer
+    ``min_real_distance_map_for_targeted_TWs`` (BFS fallback on miss/stale).
     """
     try:
         target = int(target_id)
@@ -238,6 +241,27 @@ def _min_empty_roads_to_reach(
         max_depth = max(1, min(3, int(max_depth)))
     except Exception:
         max_depth = 3
+
+    # Map-first (Tier H): product metric = remaining roads to build.
+    try:
+        from core.constants import REACHABILITY_MAPS
+        from core.player_reachability import (
+            SENTINEL,
+            maps_are_fresh,
+            remaining_roads_to_target,
+        )
+
+        if bool(REACHABILITY_MAPS) and maps_are_fresh(player):
+            mapped = remaining_roads_to_target(player, target)
+            if mapped == 0:
+                return 0
+            if 0 < int(mapped) <= int(max_depth):
+                return int(mapped)
+            if int(mapped) >= SENTINEL or int(mapped) > int(max_depth):
+                return None
+    except Exception:
+        pass
+
     start = _player_network_nodes(game, player)
     if not start:
         return None
@@ -643,6 +667,282 @@ def assess_new_settlement_path_risk(
     }
 
 
+def _estimate_eta_with_optional_hand(
+    game: Any,
+    actor: Any,
+    *,
+    site_id: int,
+    roads_needed: int,
+    current_hand: Optional[Sequence[Any]] = None,
+) -> Tuple[Optional[float], str]:
+    """EH (or stub) own-turns for actor to settle site_id; optional belief hand."""
+    dist = max(0, int(roads_needed or 0))
+    try:
+        from core.resource_time_estimator import estimate_action_time
+
+        board = getattr(game, "board", None)
+        if board is not None and actor is not None:
+            kw: Dict[str, Any] = {
+                "target_id": int(site_id),
+                "extra_roads_needed": dist,
+            }
+            if current_hand is not None:
+                kw["current_hand"] = list(current_hand)
+            est = estimate_action_time(board, actor, "settlement", **kw)
+            turns = None
+            if isinstance(est, Mapping):
+                turns = est.get("turns")
+            else:
+                turns = getattr(est, "turns", None)
+            if turns is not None:
+                t = float(turns)
+                if t < 9000:
+                    src = "eh_settle_plus_roads"
+                    if current_hand is not None:
+                        src = f"{src}_mem"
+                    return round(t, 2), src
+    except Exception:
+        pass
+    stub = round(float(dist) * 1.5 + 2.0, 2)
+    return stub, "stub_road_settle"
+
+
+def fill_threat_opponent_etas(
+    game: Any,
+    viewer: Any,
+    threats: Sequence[Mapping[str, Any]],
+    *,
+    race_target_id: int,
+) -> List[Dict[str, Any]]:
+    """Attach ``eta_own_turns`` using EH + ``RCARD_MEMORY_OPPONENTS`` belief hands.
+
+    *viewer* is the seat whose memory/belief applies (usually the evaluating player).
+    """
+    out: List[Dict[str, Any]] = []
+    players_by_id: Dict[int, Any] = {}
+    for p in list(getattr(game, "players", []) or []):
+        try:
+            players_by_id[int(getattr(p, "id"))] = p
+        except Exception:
+            continue
+
+    try:
+        from core.rcard_view_memory import opponent_belief_hand5
+    except Exception:  # pragma: no cover
+        opponent_belief_hand5 = None  # type: ignore
+
+    for raw in threats:
+        if not isinstance(raw, Mapping):
+            continue
+        t = dict(raw)
+        pid = t.get("player_id")
+        opp = None
+        try:
+            if pid is not None:
+                opp = players_by_id.get(int(pid))
+        except Exception:
+            opp = None
+        if opp is None:
+            col = str(t.get("color") or "")
+            for p in list(getattr(game, "players", []) or []):
+                if str(getattr(p, "color", "")) == col:
+                    opp = p
+                    break
+        if opp is None:
+            out.append(t)
+            continue
+
+        mode = str(t.get("mode") or "race").lower()
+        roads_needed = t.get("roads_needed")
+        try:
+            roads_needed_i = int(roads_needed) if roads_needed is not None else None
+        except Exception:
+            roads_needed_i = None
+        if roads_needed_i is None:
+            try:
+                site_probe = (
+                    int(t["block_site"])
+                    if mode == "block" and t.get("block_site") is not None
+                    else int(race_target_id)
+                )
+                reached = _min_empty_roads_to_reach(game, opp, site_probe, max_depth=3)
+                roads_needed_i = int(reached) if reached is not None else 2
+            except Exception:
+                roads_needed_i = 2
+
+        belief_hand = None
+        hand_meta: Dict[str, Any] = {}
+        if opponent_belief_hand5 is not None and viewer is not None:
+            try:
+                belief_hand, hand_meta = opponent_belief_hand5(game, viewer, opp)
+            except Exception:
+                belief_hand, hand_meta = None, {}
+
+        if mode == "block" and t.get("block_site") is not None:
+            site = int(t["block_site"])
+        else:
+            site = int(race_target_id)
+
+        eta, src = _estimate_eta_with_optional_hand(
+            game,
+            opp,
+            site_id=site,
+            roads_needed=int(roads_needed_i),
+            current_hand=belief_hand,
+        )
+        t["eta_own_turns"] = eta
+        t["eta_source"] = src
+        t["eta_site"] = site
+        t["eta_hand_source"] = str(hand_meta.get("source") or "truth")
+        if hand_meta.get("memory_rounds") is not None:
+            t["eta_memory_rounds"] = hand_meta.get("memory_rounds")
+        out.append(t)
+    return out
+
+
+def apply_eta_race_upgrade(
+    risk_bag: Mapping[str, Any],
+    *,
+    self_eta: Optional[float],
+    margin: float = 0.5,
+) -> Dict[str, Any]:
+    """Raise risk_level when best threat ETA races ``self_eta`` (never lowers)."""
+    out = dict(risk_bag or {})
+    if self_eta is None:
+        return out
+    try:
+        self_f = float(self_eta)
+    except Exception:
+        return out
+    etas: List[float] = []
+    for t in list(out.get("threat_opponents") or []):
+        if not isinstance(t, Mapping):
+            continue
+        raw = t.get("eta_own_turns")
+        if raw is None:
+            continue
+        try:
+            e = float(raw)
+        except Exception:
+            continue
+        if e < 9000:
+            etas.append(e)
+    if not etas:
+        return out
+    best = min(etas)
+    level = str(out.get("risk_level") or "low").lower()
+    rank = {"low": 0, "medium": 1, "med": 1, "high": 2, "blocked": 3}
+    cur = rank.get(level, 0)
+    prev = cur
+    reason = ""
+    if best + float(margin) < self_f:
+        cur = max(cur, 2)
+        reason = f"ETA race: best opp {best:.1f}t beats self {self_f:.1f}t"
+    elif best <= self_f + float(margin):
+        cur = max(cur, 1)
+        reason = f"ETA race: best opp {best:.1f}t within margin of self {self_f:.1f}t"
+    inv = {0: "low", 1: "medium", 2: "high", 3: "blocked"}
+    out["risk_level"] = inv.get(cur, level)
+    if cur > prev:
+        floors = {1: 20.0, 2: 45.0, 3: 99.0}
+        try:
+            out["risk_score"] = max(float(out.get("risk_score") or 0.0), floors.get(cur, 0.0))
+        except Exception:
+            out["risk_score"] = floors.get(cur, 0.0)
+        out["risk_class"] = max(int(out.get("risk_class") or 0), cur)
+        reasons = list(out.get("reasons") or [])
+        if reason and reason not in reasons:
+            reasons.append(reason)
+        out["reasons"] = reasons[:8]
+    out["self_eta_own_turns"] = round(self_f, 2)
+    out["best_opp_eta_own_turns"] = round(best, 2)
+    return out
+
+
+def enrich_settlement_race_risk_with_eh_memory(
+    game: Any,
+    player: Any,
+    risk_bag: Mapping[str, Any],
+    *,
+    target_id: int,
+    own_distance_roads: Optional[int] = None,
+    margin: float = 0.5,
+) -> Dict[str, Any]:
+    """Settlement beat-risk: fill opponent ETAs (EH + RCard memory) and upgrade level."""
+    out = dict(risk_bag or {})
+    threats = list(out.get("threat_opponents") or [])
+    if threats:
+        out["threat_opponents"] = fill_threat_opponent_etas(
+            game, player, threats, race_target_id=int(target_id)
+        )
+    dist = own_distance_roads
+    if dist is None:
+        try:
+            dist = _min_empty_roads_to_reach(game, player, int(target_id), max_depth=5)
+        except Exception:
+            dist = 0
+    if dist is None:
+        dist = 0
+    self_eta, self_src = _estimate_eta_with_optional_hand(
+        game, player, site_id=int(target_id), roads_needed=int(dist), current_hand=None
+    )
+    out["self_eta_own_turns"] = self_eta
+    out["self_eta_source"] = self_src
+    return apply_eta_race_upgrade(out, self_eta=self_eta, margin=float(margin))
+
+
+def opponent_contested_road_eta(
+    game: Any,
+    viewer: Any,
+    opponent: Any,
+    *,
+    path: Sequence[Any],
+    contested_road_id: Any,
+) -> Dict[str, Any]:
+    """Road beat-risk timing: EH to a contested road using viewer's RCard memory of opp."""
+    belief_hand = None
+    hand_meta: Dict[str, Any] = {"source": "truth"}
+    try:
+        from core.rcard_view_memory import opponent_belief_hand5
+
+        belief_hand, hand_meta = opponent_belief_hand5(game, viewer, opponent)
+    except Exception:
+        belief_hand, hand_meta = None, {"source": "truth"}
+    try:
+        from core.resource_time_estimator import estimate_turns_to_reach_road_in_path
+
+        kw: Dict[str, Any] = {
+            "path": path,
+            "contested_road_id": contested_road_id,
+            "current_turn": getattr(game, "turn", None),
+            "target_player_id": getattr(opponent, "id", None),
+            "num_players": len(list(getattr(game, "players", []) or [])) or 4,
+        }
+        if belief_hand is not None:
+            kw["current_hand"] = list(belief_hand)
+        est = estimate_turns_to_reach_road_in_path(
+            getattr(game, "board", None), opponent, **kw
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "eta_hand_source": hand_meta.get("source"),
+        }
+    turns = est.get("turns", est.get("expected_turns"))
+    try:
+        turns_f = float(turns) if turns is not None else None
+    except Exception:
+        turns_f = None
+    return {
+        "ok": bool(est.get("found", turns_f is not None and turns_f < 9000)),
+        "eta_own_turns": round(turns_f, 2) if turns_f is not None and turns_f < 9000 else turns_f,
+        "eta_hand_source": hand_meta.get("source"),
+        "eta_memory_rounds": hand_meta.get("memory_rounds"),
+        "estimate": est,
+    }
+
+
 def format_threat_opponents_short(threats: Sequence[Mapping[str, Any]]) -> str:
     """UI helper: 'P2, P3 (2.7t), P4' — only lowest eta shown among threats.
 
@@ -705,6 +1005,10 @@ __all__ = [
     "opponent_settlement_race_risk",
     "assess_new_settlement_path_risk",
     "format_threat_opponents_short",
+    "fill_threat_opponent_etas",
+    "apply_eta_race_upgrade",
+    "enrich_settlement_race_risk_with_eh_memory",
+    "opponent_contested_road_eta",
     "_min_empty_roads_to_reach",
     "_target_neighbors",
 ]

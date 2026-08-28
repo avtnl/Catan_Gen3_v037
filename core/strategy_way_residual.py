@@ -294,43 +294,39 @@ def compute_way_residual(
             or getattr(strategy, "largest_army", False)
         )
         table_vp = _safe_int(getattr(strategy, "victory_point_cards", 0), 0)
-        try:
-            from core.strategy_timing import (
-                PlayerStrategyState,
-                build_player_strategy_state,
-                calculate_remaining_need,
-            )
 
-            if board is not None and player is not None:
-                pstate = build_player_strategy_state(board, player)
-            else:
-                # Minimal state without board (tests / dig rebuild)
-                pstate = PlayerStrategyState(
-                    player_id=_safe_int(getattr(player, "id", 0), 0),
-                    color=str(getattr(player, "color", "") or ""),
-                    current_hand=(0.0, 0.0, 0.0, 0.0, 0.0),
-                    production_pips=(0.0, 0.0, 0.0, 0.0, 0.0),
-                    trade_rates=(4, 4, 4, 4, 4),
-                    ports=tuple(),
-                    settlements=tuple(
-                        int(x) for x in list(getattr(player, "settlements", []) or [])
-                    ),
-                    cities=tuple(int(x) for x in list(getattr(player, "cities", []) or [])),
-                    roads_count=len(list(getattr(player, "roads", []) or [])),
-                    dev_card_progress=dcard_ever_count(player),
-                )
-            rem = calculate_remaining_need(
-                strategy,
-                pstate,
-                subtract_current_roads=True,
-                subtract_development_cards=True,
-            )
-            req_cities = int(rem.remaining_city_upgrades)
-            req_settles = int(rem.remaining_new_settlements)
-            req_roads = int(rem.remaining_roads_to_build)
-            req_dcards = int(rem.remaining_dev_cards_to_buy)
-        except Exception:
-            # Fall back to table absolute − crude board counts
+    # Façade WP2: Player One residual + min-road cover (hand=no).
+    # TFR credit applied via façade helper *after* preferred.remaining overrides.
+    tfr_n = unplayed_tfr(player)
+    tfr_credit = 2 * tfr_n
+    try:
+        from core.way_resource_need import apply_tfr_road_credit, way_resource_need
+
+        game = None
+        if isinstance(preferred, Mapping):
+            game = preferred.get("_game")
+        if game is None and board is not None:
+            game = type("G", (), {"board": board, "players": [player]})()
+        need_bag = way_resource_need(
+            game,
+            player,
+            wid,
+            consider_hand=False,
+            use_min_road_cover=True,
+            apply_tfr_credit=False,
+            board=board,
+        )
+        req_cities = int(need_bag.req_cities)
+        req_settles = int(need_bag.req_settles)
+        req_roads = int(need_bag.req_roads)
+        req_dcards = int(need_bag.req_dcards)
+        way_lr = bool(need_bag.components.longest_road or way_lr)
+        way_la = bool(need_bag.components.largest_army or way_la)
+        if need_bag.components.victory_point_cards:
+            table_vp = int(need_bag.components.victory_point_cards)
+    except Exception:
+        # Fall back to table absolute − crude board counts
+        if strategy is not None:
             c_need = _safe_int(
                 getattr(strategy, "cities", 0) or getattr(strategy, "city_upgrades", 0), 0
             )
@@ -351,6 +347,11 @@ def compute_way_residual(
                 _safe_int(getattr(strategy, "development_cards_to_buy", 0), 0)
                 - dcard_ever_count(player),
             )
+        else:
+            req_cities = 0
+            req_settles = 0
+            req_roads = 0
+            req_dcards = 0
 
     # Prefer preferred.remaining overrides when explicit
     if rem_map:
@@ -372,34 +373,16 @@ def compute_way_residual(
     req_roads = max(0, _safe_int(req_roads, 0))
     req_dcards = max(0, _safe_int(req_dcards, 0))
 
-    # v5: prefer min legal road cover on playboard for remaining new settles
-    # (not CSV Roads_To_Build count). LA/LR / build sequence not planned here.
+    # WP2: TFR credit from façade helper (single formula) after overrides
     try:
-        if player is not None and req_settles > 0:
-            game = None
-            if isinstance(preferred, Mapping):
-                game = preferred.get("_game")
-            if game is None and board is not None:
-                game = type("G", (), {"board": board, "players": [player]})()
-            if game is not None:
-                from core.strategy_min_road_cover import victory_structure_road_need
+        from core.way_resource_need import apply_tfr_road_credit as _tfr
 
-                cover = victory_structure_road_need(
-                    game,
-                    player,
-                    remaining_new_settlements=int(req_settles),
-                    remaining_city_upgrades=int(req_cities),
-                )
-                if cover.get("ok") or int(cover.get("roads_needed") or 0) >= 0:
-                    req_roads = int(cover.get("roads_needed") or 0)
+        req_roads, tfr_meta = _tfr(req_roads, player, longest_road=bool(way_lr))
+        tfr_credit = int(tfr_meta.get("tfr_credit_roads") or tfr_credit)
+        tfr_n = int(tfr_meta.get("tfr_unplayed") or tfr_n)
     except Exception:
-        pass
-
-    # TFR credit: each unplayed TFR ≈ 2 free roads toward LR/road residual
-    tfr_n = unplayed_tfr(player)
-    tfr_credit = 2 * tfr_n
-    if way_lr or req_roads > 0:
-        req_roads = max(0, req_roads - tfr_credit)
+        if way_lr or req_roads > 0:
+            req_roads = max(0, req_roads - tfr_credit)
 
     # VP cards residual
     held_vp = unplayed_vp_cards(player)
@@ -417,10 +400,61 @@ def compute_way_residual(
         # Claim bar 3 (or hold +1 over max opp — keep simple claim bar for residual)
         knights_needed = max(0, 3 - army)
         rem_knight_buys = max(0, knights_needed - knights_banked)
-        # Residual DC at least knight path when LA still needed
-        req_dcards = max(req_dcards, rem_knight_buys)
+        try:
+            from core.strategy_timing import (
+                EXPECTED_DEV_CARD_BUYS_PER_KNIGHT,
+                EXPECTED_DEV_CARD_BUYS_PER_VP_CARD,
+                expected_development_card_buys,
+            )
+
+            knight_path = rem_knight_buys * int(EXPECTED_DEV_CARD_BUYS_PER_KNIGHT)
+            # Statistical knight buys (2 per knight still needed)
+            if rem_knight_buys and not knight_path:
+                knight_path = rem_knight_buys * 2
+            vp_path = 0
+            if rem_vp > 0:
+                vp_path = int(
+                    expected_development_card_buys(
+                        victory_point_cards=int(rem_vp),
+                        largest_army=False,
+                        listed_development_cards=0,
+                    )
+                )
+            # WP-D: Dig/offline Need = min(knight path, VP path) when both apply
+            # e.g. LA+2VP joint 10 → min(6, 10) = 6 while still chasing army
+            paths = [p for p in (knight_path, vp_path) if p and p > 0]
+            if paths:
+                tightened = min(paths)
+                if req_dcards > 0:
+                    req_dcards = min(int(req_dcards), tightened)
+                else:
+                    req_dcards = tightened
+            else:
+                req_dcards = max(req_dcards, rem_knight_buys)
+        except Exception:
+            req_dcards = max(req_dcards, rem_knight_buys)
     else:
         rem_knight_buys = 0
+        # LA already held: do not keep joint LA+VP CSV buy count (e.g. 10).
+        # Re-estimate expected buys from remaining VP cards only (1 VP ≈ 5 buys).
+        if rem_vp > 0:
+            try:
+                from core.strategy_timing import expected_development_card_buys
+
+                vp_buys = int(
+                    expected_development_card_buys(
+                        victory_point_cards=int(rem_vp),
+                        largest_army=False,
+                        listed_development_cards=0,
+                    )
+                )
+                # Prefer the tighter VP-only estimate over stale joint residual
+                req_dcards = min(int(req_dcards or vp_buys), vp_buys) if req_dcards else vp_buys
+            except Exception:
+                req_dcards = min(int(req_dcards or rem_vp * 5), int(rem_vp) * 5)
+        elif not need_la and rem_vp <= 0:
+            # No LA chase and no VP left — drop leftover CSV DC mass
+            req_dcards = min(int(req_dcards or 0), rem_knight_buys)
 
     # Residual tags (v4): LA → LR → n×C → n×S → n×VP
     # Order locked; dig STR/PLN1 share this list via ``way_tags``.

@@ -235,7 +235,11 @@ def way_need_weights(game: Any, player: Any, way_id: int) -> Tuple[List[float], 
             except Exception:
                 continue
         req = parse_way_requirements(
-            way_id, requirements_by_id=by_id, player_state=player
+            way_id,
+            requirements_by_id=by_id,
+            player=player,
+            game=game,
+            use_min_road_cover=False,  # WP5 façade without min-cover (csv residual)
         )
         engines = list(getattr(req, "resource_engines_needed", None) or [])
         meta["engines"] = engines
@@ -434,12 +438,52 @@ def _spot_pips(board: Any, tid: int) -> List[float]:
 
 
 def collect_d2_spot_pips(game: Any, player: Any, *, max_distance: int = 2) -> List[Tuple[int, List[float]]]:
-    """List (target_id, pips5) for reachable new settlements within max_distance roads."""
+    """List (target_id, pips5) for reachable new settlements within max_distance roads.
+
+    WP-R4: map ``min_real_distance ≤ max_distance`` is a **hint** (adds tips);
+    never excludes legal portfolio/outlook candidates.
+    """
     board = getattr(game, "board", None) if game is not None else None
     if board is None or player is None:
         return []
     spots: Dict[int, List[float]] = {}
-    # Portfolio candidates (preferred)
+
+    # Map hint shortlist (remaining roads ≤ max_distance)
+    try:
+        from core.constants import REACHABILITY_MAPS
+        from core.outlook_logic import future_settlement_target_is_open
+        from core.player_reachability import (
+            SENTINEL,
+            ensure_reachability_maps,
+            maps_are_fresh,
+        )
+
+        if bool(REACHABILITY_MAPS):
+            ensure_reachability_maps(game, player)
+        if maps_are_fresh(player):
+            vec = list(
+                getattr(player, "min_real_distance_map_for_targeted_TWs", None) or []
+            )
+            cap = max(0, int(max_distance))
+            for tid, rd in enumerate(vec):
+                try:
+                    d = int(rd)
+                except Exception:
+                    continue
+                if d < 0 or d >= SENTINEL or d > cap:
+                    continue
+                if d == 0:
+                    continue  # already connected — expand fit cares about new spots
+                try:
+                    if not future_settlement_target_is_open(game, player, int(tid)):
+                        continue
+                except Exception:
+                    continue
+                spots[int(tid)] = _spot_pips(board, int(tid))
+    except Exception:
+        pass
+
+    # Portfolio candidates (preferred — may add/overwrite pips)
     try:
         from core.ai_way_portfolio import (
             MAX_ROAD_DISTANCE,

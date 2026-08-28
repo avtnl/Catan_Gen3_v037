@@ -760,6 +760,102 @@ def _sticky_cs_enrichment(
         out.update(cs_fields_from_plan_snapshot(player))
     except Exception:
         pass
+    # L2 dossier compact fields (D2)
+    try:
+        from core.ai_way_portfolio import cs_fields_from_l2_dossier
+
+        out.update(cs_fields_from_l2_dossier(player, game))
+    except Exception:
+        out.setdefault("l2_eval_way_ids", None)
+        out.setdefault("l2_fit_n", None)
+        out.setdefault("l2_top_n", None)
+        out.setdefault("l2_winner", None)
+        out.setdefault("l2_winner_id", None)
+        out.setdefault("l2_applied", None)
+        out.setdefault("l2_runner_up", None)
+
+    # WP-DIG2: sticky hold reason + TFR roads + road optimizer top-3
+    try:
+        sticky_meta = getattr(player, "last_sticky_meta", None) if player is not None else None
+        if isinstance(sticky_meta, Mapping):
+            hold = (
+                sticky_meta.get("sticky_hold_reason")
+                or sticky_meta.get("reason")
+                or sticky_meta.get("sticky_apply_action")
+            )
+            if sticky_meta.get("held") or sticky_meta.get("wp_sticky2", {}).get("blocked"):
+                out["sticky_hold_reason"] = str(hold or "") or None
+            elif sticky_meta.get("wp_sticky1", {}).get("preserved"):
+                out["sticky_hold_reason"] = "wp_sticky1_preserved"
+            else:
+                out.setdefault("sticky_hold_reason", str(hold or "") or None)
+        else:
+            out.setdefault("sticky_hold_reason", None)
+    except Exception:
+        out.setdefault("sticky_hold_reason", None)
+
+    try:
+        tfr_roads = None
+        if game is not None:
+            tfr_plan = getattr(game, "last_ai_tfr_plan", None) or {}
+            if isinstance(tfr_plan, Mapping):
+                ids = list(tfr_plan.get("road_ids") or [])
+                if ids:
+                    bits = []
+                    for e in ids[:4]:
+                        try:
+                            a, b = int(e[0]), int(e[1])
+                            bits.append(f"{a}-{b}")
+                        except Exception:
+                            continue
+                    tfr_roads = ",".join(bits) if bits else None
+        if not tfr_roads and isinstance(out.get("plan_tfr"), str) and "|" in str(out.get("plan_tfr")):
+            # plan_tfr = action|rule|edges
+            parts = str(out.get("plan_tfr")).split("|")
+            if len(parts) >= 3 and parts[2]:
+                tfr_roads = parts[2]
+        out["tfr_plan_roads"] = tfr_roads
+    except Exception:
+        out.setdefault("tfr_plan_roads", None)
+
+    try:
+        top3 = None
+        if player is not None:
+            rp = getattr(player, "last_road_plan", None) or getattr(
+                player, "last_ai_road_plan", None
+            )
+            if isinstance(rp, Mapping):
+                ranked = list(rp.get("road_candidates_top3") or [])[:3]
+                if ranked:
+                    bits = []
+                    for row in ranked:
+                        if not isinstance(row, Mapping):
+                            continue
+                        edge = row.get("edge") or row.get("next_road") or row.get("road")
+                        try:
+                            if isinstance(edge, (list, tuple)) and len(edge) >= 2:
+                                bits.append(f"{int(edge[0])}-{int(edge[1])}")
+                        except Exception:
+                            continue
+                    top3 = ";".join(bits) if bits else None
+        if game is not None and not top3:
+            rp = getattr(game, "last_ai_road_plan", None) or {}
+            if isinstance(rp, Mapping) and rp.get("road_candidates_top3"):
+                ranked = list(rp.get("road_candidates_top3") or [])[:3]
+                bits = []
+                for row in ranked:
+                    if isinstance(row, Mapping):
+                        edge = row.get("edge") or row.get("next_road")
+                        try:
+                            if isinstance(edge, (list, tuple)) and len(edge) >= 2:
+                                bits.append(f"{int(edge[0])}-{int(edge[1])}")
+                        except Exception:
+                            pass
+                top3 = ";".join(bits) if bits else None
+        out["road_candidates_top3"] = top3
+    except Exception:
+        out.setdefault("road_candidates_top3", None)
+
     return out
 
 

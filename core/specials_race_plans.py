@@ -686,9 +686,28 @@ def maybe_merge_lr_plan_into_sticky(
                 store_lr_project(game, player, proj, merge_sticky=True)
                 stored = proj
         if stored and stored.get("roads_to_build"):
-            # Align sticky roads with plan grow if empty settle path
+            # Align sticky roads with plan grow if empty settle path.
+            # Do NOT wipe an existing settle path on claim_now when that path
+            # is dual-purpose (or simply already locked toward S/C).
             raw = getattr(player, "sticky_commitment", None)
             commitment = dict(raw) if isinstance(raw, Mapping) else {}
+            has_settle_lock = bool(
+                commitment.get("locked_roads_to_build")
+                and (
+                    commitment.get("locked_rec_target_id") is not None
+                    or str(commitment.get("locked_target_kind") or "").upper()
+                    in ("S", "SETTLE", "SETTLEMENT", "C", "CITY")
+                )
+            )
+            if has_settle_lock:
+                commitment["lr_race_plan_fp"] = plan.get("sticky_roads_fp")
+                commitment["lr_race_label"] = plan.get("label")
+                commitment["lr_deny_edges"] = list(plan.get("deny_edges") or [])[:4]
+                try:
+                    player.sticky_commitment = commitment
+                except Exception:
+                    pass
+                return True
             if not commitment.get("locked_roads_to_build") or plan.get("claim_now"):
                 commitment["locked_roads_to_build"] = list(
                     stored.get("roads_to_build") or roads

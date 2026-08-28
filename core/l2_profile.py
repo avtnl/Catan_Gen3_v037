@@ -9,7 +9,9 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, Mapping, Optional
 
 # Fast-mode defaults (plan P4-2 / P4-3)
-PORTFOLIO_TOP_N_FAST: int = 3
+# Portfolio depth uses stage Early3/Mid6/End9 (None → stage table). Historical
+# flat-3 cap kept as named constant for digs/docs only — not applied to live fast.
+PORTFOLIO_TOP_N_FAST: int = 3  # legacy flat cap; unused by fast_l2_profile
 ABSTRACT_PREFILTER_K_FAST: int = 12
 # Full dig-in: no prefilter (None) or large K
 ABSTRACT_PREFILTER_K_FULL: Optional[int] = None
@@ -34,10 +36,16 @@ class L2Profile:
 
 
 def fast_l2_profile() -> L2Profile:
+    """Cheap AI explore: prefilter K=12; portfolio K follows stage 3/6/9.
+
+    Stage caps (not flat-3) so Mid/End adaptive-K / sync-first pool widen work
+    as in ``docs/L2_sync_transparency_shadow_plan.md`` Phase F. Speed levers
+    remain: abstract prefilter, no Stage3/risk/TwP/continuations.
+    """
     return L2Profile(
         name="fast",
         abstract_prefilter_k=int(ABSTRACT_PREFILTER_K_FAST),
-        portfolio_top_n=int(PORTFOLIO_TOP_N_FAST),
+        portfolio_top_n=None,  # stage Early3 / Mid6 / End9
         stage1_include_all=False,
         stage1_current_player_only=True,
         enable_continuations=False,

@@ -375,6 +375,13 @@ class GameManager:
         if not self.arm_name and self.arm_config.get("arm_name"):
             self.arm_name = str(self.arm_config.get("arm_name") or "") or None
         self.la_soft_bias = str(la_soft_bias).strip() if la_soft_bias else None
+        self.perf_mode = None
+        try:
+            pm = self.arm_config.get("perf_mode")
+            if pm is not None and str(pm).strip() != "":
+                self.perf_mode = str(pm).strip().lower()
+        except Exception:
+            self.perf_mode = None
 
         self.games_played: int = 0
         self.game_results: List[Dict[str, Any]] = []
@@ -442,6 +449,8 @@ class GameManager:
                 kw["sidestep_s142_drive"] = True
         except Exception:
             pass
+        if self.perf_mode:
+            kw["perf_mode"] = self.perf_mode
         return kw
 
     def run_batch(self) -> Dict[str, Any]:
@@ -462,6 +471,8 @@ class GameManager:
         self.batch_way_reassess_path = self.batch_dir / "way_reassess.jsonl"
         # Phase L WP-L1: LA/LR god-view probe
         self.batch_la_lr_probe_path = self.batch_dir / "la_lr_probe.jsonl"
+        # L2 cap-miss shadow dig (Phase E)
+        self.batch_l2_cap_miss_path = self.batch_dir / "l2_cap_miss.jsonl"
         try:
             self.batch_cs_path.parent.mkdir(parents=True, exist_ok=True)
         except Exception:
@@ -496,6 +507,15 @@ class GameManager:
             )
         except Exception:
             prev_lalr_override = None
+        prev_l2miss_override = None
+        try:
+            from core.l2_cap_miss import set_l2_cap_miss_log_path
+
+            prev_l2miss_override = set_l2_cap_miss_log_path(
+                str(self.batch_l2_cap_miss_path)
+            )
+        except Exception:
+            prev_l2miss_override = None
 
         if self._dice_library:
             console.info(
@@ -506,7 +526,8 @@ class GameManager:
             f"GameManager: start batch_id={batch_id} games={self.games} "
             f"dir={self.batch_dir} cs={self.batch_cs_path} "
             f"way_reassess={self.batch_way_reassess_path} "
-            f"la_lr_probe={self.batch_la_lr_probe_path}"
+            f"la_lr_probe={self.batch_la_lr_probe_path} "
+            f"l2_cap_miss={self.batch_l2_cap_miss_path}"
         )
 
         try:
@@ -632,6 +653,12 @@ class GameManager:
                 set_la_lr_probe_log_path(prev_lalr_override)
             except Exception:
                 pass
+            try:
+                from core.l2_cap_miss import set_l2_cap_miss_log_path
+
+                set_l2_cap_miss_log_path(prev_l2miss_override)
+            except Exception:
+                pass
 
         wall = time.perf_counter() - t0
         shared = {
@@ -680,8 +707,11 @@ class GameManager:
                     arm_export["seed_base"] = self.seed_base
                 if self.arm_name:
                     arm_export["arm_name"] = self.arm_name
+            if self.perf_mode and not arm_export.get("perf_mode"):
+                arm_export["perf_mode"] = self.perf_mode
             summary["arm"] = arm_export
             summary["arm_name"] = arm_export.get("arm_name")
+            summary["perf_mode"] = arm_export.get("perf_mode") or self.perf_mode
             summary["explicit_142_recalc_by_seat"] = arm_export.get(
                 "explicit_142_recalc_by_seat"
             )

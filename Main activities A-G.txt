@@ -1,4 +1,16 @@
-Summary
+High level summary
+We built an unattended multi-game path which can run more games after each other in one batch. 
+We built a CS-probe is made (CS =  Change Strategy). The CS-probe itself didn't change the SE. (SE=Strategy-Engine).
+We made a LA/LR probe as well. The LA/LR probe did lead to some changes to improve the SE itself.
+We implemented some performance improvements to speed up the average run time of a game in a batch run by the unattended game-manger.
+We added a dedicate MGlog (MG=Multi Game) to each game played, which lead to a new product which is "Replay" (sscripts/replay_catan_game.py). Note: We need to move this script to the root!
+The CS-probe lead to a 2nd mode in "Replay" where its possible to dig in data details to validate that the SE is working correctly (of find bug to fix).
+Quite some time was spend in creating and improving the Data-panel, which is a key part of the "Replay" functionality having the dig tooling. Feeding this tool lead to some change in the SE, however we tried to add as much as data to MGlog off line.
+Due to performance we optimized at what moment in time the SE should execute the "heavy" calculations related to finding the best strategy given the game state. These calculations are mainly made by core/resource_time_estimator.py using the Estimated Hand of RCards after x turns.
+We took a sidestep to see if we could simplyfy the "heavy" calculations related to finding the best strategy given the game state. S142 proved to be simpeler. This lead to the temptation to execute these more simpeler calculations more frequent to reduce the needed turn to win a catan game.  
+
+==========
+Summary and more details below
 We built an unattended multi-game path: run_headless.py + HeadlessGameRunner + GameManager, which can run more games after each other in one batch. With NO_GUI_AT_ALL_TF=True and four AI seats, batches write per-game result.json and batch_summary.json (wins, stuck/error, dice, give-up/salvage dig fields, etc.).
 
 Initially the performance (=time to run) such a batch was pretty long. Therefore we spend quite some time and effort performance improvement.  Runtime improved from roughly ~1–2 min/game toward ~30 s/game on recent product-scale runs (perf work on Strategy-Engine / L2 policy paths).
@@ -1230,3 +1242,663 @@ Way-id and Playboard got out of sync (again) | Implementation
 • P4 — LA feasibility + give-up carve-out wiring
 • P5 — Dig/CS unfit markers
 • P6 — pln_v8 dig proof
+
+=/=
+See refinements_v1.
+1) Read and analyse
+2) Prioritize. I like to focus on layout of STR, PLN1 and PLN2. We do not have to fix everything. Fine if we park a couple of observations. Please build a "To Do" document to keep track of these.
+3) Share you priorities, so we can discuss.
+4) Once we agree on prioritize we implement.
+
+Q: Address S8/S40 ETA explain; explaination only.
+Q: How is portfolio top-N determined and what is N currently?
+Q: R9T1 has 11 candidates (2xC and 9xS) which is less than 14 and only 4 have ETA. So your answer is not satisfying me.
+Q: How are members of target_portfolio tied to L2?
+Q: Suppose target_portfolio has 2 candidates only, L2 checks best way from all 142 ways for these 2 candidates, right?
+A: No — that mixes the layers. It’s the other way around. What actually happens:
+    1) L2 does not search all 142 ways
+    It evaluates about Early 3 / Mid 6 / End 9 ways (stage cap), taken from the abstract top list (plus sticky/salvage extras sometimes). Not the full 142.
+    2) target_portfolio is per way, not a shared pair for all ways
+Q: Suppose target_portfolio has 2 candidates only, and stage is early_game, L2 checks best way from prioritized 3 ways for these 2 candidates, right?
+A: Almost — one important correction.
+    a. Early game: Yes, L2 evaluates about 3 prioritized ways (stage Early → portfolio_top_n = 3), not 142.
+    b. The “2 candidates” part — not quite. Those 2 are not a shared pair that all 3 ways are scored on. For each of the 3 ways separately:
+        1. Build that way’s own candidate pool (≤14)
+        2. If that way needs k=2 new settles → pick a best combo of 2 from its pool → that becomes that way’s target_portfolio
+        3. Score that way using its combo
+    Then L2 compares the 3 way audits and picks the best way (with its own portfolio).
+Q: If PLN2 is showing ETA this intersection is part of target_portfolio and else that intersection is not part of target_portfolio?
+A: Mostly yes for settlements.
+
+See Sidestep_v1.txt. 1. Read and analyze the document. 2. Raise questions and challenge idea's. 3. Let's discuss wiring (parallel processing). 4. Draft comprehensive implementation plan. 5. implement.
+Recap: We landed Dig PLN/Show and board-fit sync fixes, refinements STR/PLN1/PLN2 layout, and a side-by-side Sidestep ETA NumPy module in `core/sidestep_eta_matrix.py` with Q&A in `docs/Sidestep_v1_QA.md`.
+
+AvT: I propose to compare current code with new code at start of Execution phase, at start R8 and at start R16.
+-> Implementing observe-only comparison of live ETA vs sidestep at Execution start, R8, and R16—without changing the live path.
+
+AvT: Appreciate all 142 ways as well. Add colums relevant to determine residual TRCards; meaning TRCards absolute, subtracted RCards from TRCards (=elements on playboard (how many C, S and R are used to calculate residual), DCards in players hand and DCards already played), remaining RCards (=residual TRCards).
+Recap: We wired Sidestep observe-only compare at R1/R8/R16 (Side + S142/residual columns) and ran headless n=1: R1 and R8 tables landed; R16 skipped because the game ended early.
+
+Q: Can you share R1 results?
+A: Full dump: Catan01Aug2026_v1_SidestepCompare.txt.
+Q: ETA is the original ETA, Side is the new calculation, right. What is S142?
+A: A142=Same Sidestep ladder, but the best (minimum) turns over all 142 ways for that same New target.
+Q: Share results of R8.
+A: Source file: Catan01Aug2026_v1_SidestepCompare_pre_r1fix.txt (first full game; R8 already had sticky, so Side was filled).
+
+AvT: I question if ETA calculated by Side is correct. ETA can only be the same various new_settlments and upgrades if the increase in RP is equal and that is not the case. There must be something wrong in the algorithm. RP to be used is current RP + increase in RP once achieving targeted S or C!
+A: The weak spot is the horizon + convert step: it grades “clears this H or not,” not “how much better is this RP.”
+Q: Try iner horizons (e.g. mid every 1 turn: 10…18) — weak RP fails earlier rungs → Side spreads (13 vs 15 vs 18). Same Sidestep idea.
+Q: Let's run another game!
+Recap: We wired Sidestep observe-only PLN2 compares (R1/R8/R16, Side/S142 + residual TRCards), fixed R1 sticky bootstrap, switched to fine 1-turn horizons, and wrote results to `Catan01Aug2026_v1_SidestepCompare.txt` in the project root.
+
+Q: Read "Paper leading to Expected-Hand Feasibility Estimation.docx" and explain what we possibly did wrong?
+A: Most likely mistake: we treated Sidestep as an ETA replacement/alternative while implementing a pips-credit surplus ladder, instead of staying in the paper’s EH family: earliest t where expected hand (after target RP, with trades) covers residual need.
+Rcap: We wired observe-only Sidestep vs live PLN2 compare (R1/R8/R16, residual Abs/Sub/Rem, fine 1-turn ladders), then concluded Side is not EH-equivalent and should stay a debug path, not an ETA replacement.
+
+AvT: Not giving up yet. 1) Read Sidestep_v2.txt and change the algoritm accordingly. 2) Amend TRCard-residual taking all details in the 3 documents in consideration: a)doc/The 143 Ways to win at Catan – Part III.docx, b) docs/The 102 ways to win at Catan – Part I.docx and c) docs/The 143 ways to win at Catan – Part II.docx. 3) In Expected Hand there is a role for EXPECTED_HAND_CONFIDENCE_TARGET. How do add this in the equation? I think that wth these 3 changes we might get close!
+-> Reading Sidestep_v2 and the three PlayerOne docs, then tracing how EH confidence works so we can redesign residual + the ladder and fold confidence into the equation.
+-> Researching how 0.85 confidence relates to rounding/flooring, then implementing Sidestep v2 with that incorporated.
+    Research note: 0.85 is binomial confidence (≈E≈1.7–1.9 for one scarce card), not the same as flooring — complementary to v2’s floor-before-sum. Implementing v2 with that distinction.
+
+AvT: Keep the original backwards compatible (before we dived in to Sidestep). I don't care about v1. You can delete/ re-do this completely!
+-> Sidestep is a clean v2 rewrite. Live EH / L2 / PLN2 are untouched. v1 ladder math is gone.
+-> Flooring is mean-side “no fractional cards.” and 0.85 is binomial confidence (separate). Both apply.
+-> Ready for another headless n=1 when you want to see R1/R8 tables under v2?
+AvT: Yes, let's go for a new test.
+-> Want me to dig into why Conf stays ~0 on those RemTR vectors and propose a fix?
+AvT: Yes, please dig in here. With the changes made the algorithm pretty much tells us that EH would land near lowest number of turns having 0 or positive number (because of floor). With 18 own turn = 64 dice rolls, statics become pretty confident I would say! Convert RP per PLN2 in a ratio 8.5->10!
+Recap: We rewrote Sidestep to v2 and ran headless compares: RemTR/0.85 walk (no Side=60), residual A′, observe-only R1/R8/R16 tables in `Catan01Aug2026_v1_SidestepCompare.txt`.
+AvT; I don't like the huge discerpancy between ETA and Side for the ways having an ETA. Doesn't confidence go both ways; meaning shouldn't [8.5,8.5,8.5,8.5,8.5] be adjusted to [9.25,9.25,9.25,9.25,9.25]. This would balance the confidence interval between 8.5 and 10. Just an idea, do your own research.
+-> Researching a balanced confidence scale (midpoint between mean and upper bar), then updating the RemTR adjustment so Side sits closer to ETA.
+-> Your RP(9) idea is clearer: scale production by the midpoint factor 9.25/8.5 = (1 + 1/0.85)/2, instead of inflating RemTR to 10 (which pushed Side too high). Implementing that.
+-> Your RP idea fits, and research agreed it should close the ETA gap better than RemTR/0.85.
+AvT: I think we might still increase RP(9) too much. My intuition tells me that for a lot of dice rolls (say 60) this is indeed too much. No adjestment at all would likely bring us a confidence number > 0.85. If we are in end_game the number of dice rolls is pretty low, so confidence kicks in and some adjustment is needed. So adjusting RP(9) depends heavily on the multiplyer or H (10 dice rolls -> adjustment needed | 60 dice roll -> probably no adjustment needed.
+-> Making the RP confidence factor depend on dice rolls at the walk horizon: full midpoint adjust near ~10 rolls, tapering to none by ~60. Implementing a two-pass walk (Raw → n_rolls → scale RP → Side).
+-> Your intuition matches the math: long horizons already look “confident”; short ones need a boost.
+AvT: Before we do, check the internet regarding this phenonenom and see if you can find some guidance/ ideas from this?
+-> Searching for guidance on sample-size–dependent confidence margins (few trials vs many) and how that maps to our RP adjustment.
+-> Yes — the phenomenon is real and well-documented. Your intuition lines up with mainstream stats.
+-> I can either a) leave linear 10→60 and run headless now, or b) switch to a √n fade first, then run. Which do you prefer?
+AvT: Let's do 2 tests. Leave code as is (testing A). Probably add some timing to compare performace differences. Make n=3. After the first batch, amend the code to meet B), run again, compare results and performance.
+-> Adding Sidestep compare timing, running n=3 as Test A (current linear fade), then switching to √n fade (option b) for Test B and comparing results and performance.
+-> Test A finished (~8.7 min). Implementing √n fade and starting Test B.
+AvT: When is the new algo triggered. I like to take 3 approaches:
+    a) Player achieves target (new_settlement or upgrages S to C) - actually better is player increases VP (other than by drawing a DCard VP) meaning we trigger the algo when gaining LA and/or LR.
+    b) Opponents builds R, S or C gains. Here we wait till its player's turn (nor recalculation per indiv. opponent) and only check which columns get eliminated (blocked). Note: Player might still have access to target but via a different route, if distance increase (compared to the old route) we have to recalculate (this column only).
+    c) In midgame and endgame gaining a VP (excluding DCard VP, which player is not supposed to know), incl gaining LA and/or LR we should recalculate as well. IMPORTANT: Here we need fit the "way should sync with playboard requirement) to eliminate calculating ways not meeting this requirement.
+-> I'll check where Sidestep and related SE/way recalculation fire today, then map that against your a/b/c triggers (own VP/LA/LR, deferred opponent builds, playboard-sync filters).
+AvT: Did a miss how you deal with syncing board and 142 way viability?
+-> You didn’t miss a Sidestep mechanism. Board ↔ 142 viability sync is live Strategy-Engine only today. Sidestep does not call it yet.
+AvT: But it is not applied correctly (in the sitution before Sidestep). What I am asking is to change the new algo to embed the full sync requirement in this new algo. Don't change any code related to the situation before Sidestep.
+-> Understood: embed full board↔way sync inside Sidestep only; leave live L2/sticky/board-fit untouched. I'll inspect Sidestep's way-scoring paths and wire can_realize_way there.
+-> Done — sync is now inside Sidestep only
+AvT: In Sidestep_v2.txt I stated something like "Repeat for the other 3 opponents)". This is incorrect since algo is triggered for player at turn only! However Dt (D=Delta) might be relevant to access risks, not sure if we need the full matrix for this or is this a calculation specifically made to assess risks?
+-> Δt is not produced by the Sidestep matrix. It comes from live PLN2 / plan snapshot + risk helpers.
+AvT: In that case only needed for player at turn!
+-> Aligning Sidestep with turn-player only: I'll stop computing/printing the other three seats and correct the Sidestep_v2 note.
+-> Sidestep Side / S142 / board-sync now run only for the seat to move. No matrix for the other three. Δt/Rk stay PLN2 race fields on that seat’s table — not opp Sidestep walks.
+AvT: Sidestep should match L2 cadence for now. If result are satisfactory we will change triggering algo according to a, b, c anyway. In the new test I want to test a) ETA/ Side/ S142 results (situation before Sidestep vs. latest version of Sidestep and b) Performace difference if Sidestep is only triggered R1/R4/R8/R12/...
+-> Aligning Sidestep to L2-style cadence (R1 + every-4 own turns ≈ R1/R4/R8/R12), then adding and running a test that reports ETA vs Side/S142 and performance vs Sidestep-off.
+AvT: We could label R1/R4/R8/R12/… as early, mid, end to compare differences. Situation before sidestep increses number of way's when entering mid and late!
+-> I'll check how live SE expands ways in mid/late versus Sidestep's early/mid/end labels, then align R1/R4/R8/R12 reporting so we can compare phase differences.
+(a) ETA vs Side / S142 (before vs latest Sidestep)
+
+┌───────────────────────┬─────┬───────────────┬─────────┐
+│ Slice                 │ n   │ Side−ETA mean │ absmean │
+├───────────────────────┼─────┼───────────────┼─────────┤
+│ ALL                   │ 301 │ +2.00         │ 2.29    │
+├───────────────────────┼─────┼───────────────┼─────────┤
+│ Sidestep early (H=27) │ 124 │ +2.20         │ 2.28    │
+├───────────────────────┼─────┼───────────────┼─────────┤
+│ Sidestep mid (H=18)   │ 81  │ +1.12         │ 1.85    │
+├───────────────────────┼─────┼───────────────┼─────────┤
+│ Sidestep end (H=9)    │ 96  │ +2.48         │ 2.66    │
+└───────────────────────┴─────┴───────────────┴─────────┘
+
+AvT: If you compare ETA and Side, is the new algo good enough?
+-> Verdict: useful dig signal, not good enough to replace ETA yet
+AvT: If we use S142, do we change way_id more frequent than Side would?
+-> Yes — S142 would change way_id much more often. Side does not pick a way. It only times PLN2 targets under the current sticky residual. S142 is the thing that proposes a way_id (argmin Side over sync-fit ways).
+AvT: New algo should focus on S142 only and should be triggered by a/b/c not by R1/R4/R8/R12/... anymore. Performance of S142 is expected to be worse. However S142 should win (actual game over) in less turns than the situation before Sidestep. Implement needed changes to do so (incl. changes in reporting). Let's do n=3 for original only (random playboard for each game). Once done, we do another n=3 for S142 only using same playboard and same dice_rolls as original. Do you agree this is a good set-up?
+-> S142 must drive the headless treatment arm to measure turns-to-win; product SE redesign can wait. Exploring matched-batch and way-adopt hooks for the plan.
+Recap: We wired headless S142-only a/b/c adopt (`--arm s142-drive`) and ran matched n=3: treat finished ~5.7 fewer rounds on average but ~3.4× slower wall than control.
+
+AvT: We can optimizer the new S142 algorithm with some simple math:
+1) TRCards-residual for "way i": [16, 16, 16, 16, 16] and for "way j": [16,20,16,16,16] and TR for both is [4,4,4,4,4] -> no need to calculate "way j" when increasing or decreasing number of turns.
+2) TRCards-residual for "way i": [16, 16, 16, 16, 16] and for "way j": [16,20,16,16,16] and for "way i" TR=[4,4,4,4,4] and for "way j" TR=[4,2,4,4,4] and Ore position is negative after step "Next run floor current number to nearest integer"-> no need to calculate "way j" when increasing or decreasing number of turns.
+3) Perhaps you come up with some additional easy cases to add here. Like find the bottleneck, could be the the resource type with big surplus and favourable port.
+What do you think?
+-> Implementing the pruning layer in compute_s142 now: Pareto+TR dominance, RemTR dedupe, bottleneck LB, and walk abort.
+
+AvT: Execute a n=10 in same set-up. First for original (random playboard), then for latest S142 (incl. pruning) re-using same playboard and dice-rolls.
+-> Running matched n=10: control (random boards + dice) first, then S142-drive with pruning on the same seed/dice library.
+-> Read: Compared with n=3 (ΔR ≈ −5.7), n=10 is essentially flat on rounds and slightly worse on steps, with one large outlier (g2 +13R). Median still slightly favors treat (−1R), but mean does not. S142 remains much slower wall-time even with pruning.
+                Batches and analyzer output are ready under batch_runs/s142_ab_{control,treat}_n10. Say if you want a paired winner/churn dig or a prune-off matched arm next.
+
+AvT: Was average wall time per game of n=10 (with pruning) better than n=3 (no pruning)?
+-> So yes: pruned n=10 is clearly cheaper per game (and especially per round/step) than unpruned n=3. Caveat: not a same-board prune A/B — only cross-batch averages.
+AvT: ... and we know for sure that adding pruning did not lengthen number of own turns to win?
+-> No — we do not know that for sure.
+AvT: Let's test the n=3 again with the current (new) S142 code and use the same board and dice rolls. Likely turns to wins is about the same as the original test and wall time should be 25-30% less. Any other suggestions?
+-> Re-running matched n=3 on the original boards/dice with current S142+prune, then comparing rounds and wall to the old unpruned treat. Checking how prune is gated and proposing a couple of extra checks.
+-> Rounds, steps, and winners match the original S142 treat exactly. ΔR vs control stays −5.67.
+
+AvT: Next step for me is to fully adopt S142 with pruning and replace the core of current SE. Once done I want to focus on performace wins again. Any concerns?
+-> Yes — several real concerns before “fully adopt S142+prune and replace SE core.”
+     1. Evidence (biggest product risk)
+         • n=10 matched did not show fewer rounds (ΔR mean ≈ +0.1). The attractive −5.7R result is only n=3.
+         • Adopting as “S142 wins faster than sticky SE” is not supported by the better sample. Adopting as “Side-driven way pick + prune is a better planning core” is a different claim — treat it as that, and keep measuring rounds/steps after the swap.
+     2. Cost (blocks “perf later”)
+         • Even with prune, treat is still about 2.3–3.2× wall vs control. Interactive Play/Continue will feel that on every a/b/c fire (~5–8 s class calls early).
+         • Prune only bought ~7–8% on the matched n=3. Most time is still fit/TR/walk mass, not “missing prune.”
+         • If you replace SE first and optimize later, GUI/AI games may be unplayably slow until perf lands. Safer: ship behind a flag, set a wall budget (e.g. p95 S142 call < X s), then flip default.
+     3. Policy / churn
+         • Prune is Side-safe, not way-id-stable (~86% way agreement; ties). Replacing sticky with unstable argmin will thrash sticky/portfolio unless you lock a tie-break (prefer current sticky → lowest way-id → stable via).
+         • Earlier digs already saw high way churn vs sticky. Product SE that switches way often fights salvage, LA/LR giveup, PLN stickiness, and dig reproducibility.
+     4. “Replace the core” scope. Today S142 is a lab bolt-on: arm s142-drive, flags off by default, injects _external_preferred_way_id into portfolio/AP while EXPLICIT_142_RECALC_PRODUCT_AI = [2,[4,4]] sticky remains the real product path.
+
+AvT: Let's do another n=10 test. Before we do so. Can we improve the performance of the latest S132 algo by implementing more Numpy or consider Pytorch?
+-> Recommendation before next n=10: a) Skip PyTorch for S142 and b) Wire NumPy batched walks later (small effect).
+AvT: Profile one live S142 call (fit vs rem vs walk %).
+-> Takeaway: Walk / NumPy / PyTorch is not the lever. Side is <1% of a live call. So performance work should target caching / batching board-fit and RemTR, not Side walks. NumPy batching of walks would not move wall time in a meaningful way.
+
+AvT: Can you launch 2 consequetive n=10 tests as done before a) Original, b) S142 with pruning, same board same dice rolls. Will take 4 hours or more. Or can you only do 1 test and only initiate the second test after my presence (giving you instructions to do the 2nd test)?
+Recap: We finished the chained matched n=10 A/B: control then S142+prune on seed-base `23082310` in `s142_ab_{control,treat}_n10_r2` (~2.1 h wall).
+┌─────────────┬────────────────────────┬──────────────────────┐
+│             │ Control (original SE)  │ Treat (S142+prune)   │
+├─────────────┼────────────────────────┼──────────────────────┤
+│ Batch       │ s142_ab_control_n10_r2 │ s142_ab_treat_n10_r2 │
+├─────────────┼────────────────────────┼──────────────────────┤
+│ Seed-base   │ 23082310               │ same + matched dice  │
+├─────────────┼────────────────────────┼──────────────────────┤
+│ rounds_mean │ 23.2                   │ 18.9                 │
+├─────────────┼────────────────────────┼──────────────────────┤
+│ steps_mean  │ 261.3                  │ 230.7                │
+├─────────────┼────────────────────────┼──────────────────────┤
+│ wall        │ 2503 s                 │ 5104 s (2.04×)       │
+├─────────────┼────────────────────────┼──────────────────────┤
+│ wins        │ 2:4 4:4 3:1            │ 2:3 4:3 1:2 3:2      │
+└─────────────┴────────────────────────┴──────────────────────┘
+
+AvT: Let's do 1 more test n=10. Same set-up.
+┌─────────────┬────────────────────────┬──────────────────────┐
+│             │ Control                │ Treat (S142+prune)   │
+├─────────────┼────────────────────────┼──────────────────────┤
+│ Batch       │ s142_ab_control_n10_r3 │ s142_ab_treat_n10_r3 │
+├─────────────┼────────────────────────┼──────────────────────┤
+│ Seed        │ 23082320               │ matched              │
+├─────────────┼────────────────────────┼──────────────────────┤
+│ rounds_mean │ 20.2                   │ 19.6                 │
+├─────────────┼────────────────────────┼──────────────────────┤
+│ steps_mean  │ 241.6                  │ 243.1                │
+├─────────────┼────────────────────────┼──────────────────────┤
+│ wall        │ 1652 s                 │ 5467 s (3.31×)       │
+├─────────────┼────────────────────────┼──────────────────────┤
+│ wins        │ 1:3 2:2 3:3 4:2        │ 1:2 2:4 3:4 4:0      │
+└─────────────┴────────────────────────┴──────────────────────┘
+
+Scoreboard so far
+┌───┬────┬──────────┬────────┬──────────┬─────────────────────┐
+│ # │ n  │ Seed     │ ΔR     │ ΔR       │ Fewer rounds?       │
+│   │    │          │ mean   │ median   │                     │
+├───┼────┼──────────┼────────┼──────────┼─────────────────────┤
+│ 1 │ 3  │ 220822   │ −5.7   │ —        │ Yes                 │
+├───┼────┼──────────┼────────┼──────────┼─────────────────────┤
+│ 2 │ 10 │ 22082210 │ +0.1   │ −1.0     │ No (mean)           │
+├───┼────┼──────────┼────────┼──────────┼─────────────────────┤
+│ 3 │ 10 │ 23082310 │ −4.3   │ −0.5     │ Yes (mean; g9       │
+│   │    │          │        │          │ helped)             │
+├───┼────┼──────────┼────────┼──────────┼─────────────────────┤
+│ 4 │ 10 │ 23082320 │ −0.6   │ +0.5     │ Weak / mixed        │
+└───┴────┴──────────┴────────┴──────────┴─────────────────────┘
+
+AvT: Looking into all these runs, are there particular runs where ways within S142 was frequently switching between 2 or 3 way_ids?
+Recap: We ran matched S142 A/B batches (n=3 and three n=10s), profiled live calls as fit/RemTR-heavy not Side-walk, and found frequent 38/66/88 recommendation thrash with rarer sticky switches.
+              Other combination found: 114 <-> 44
+
+Way_id	LA	LR	C	S	VP
+38		Y	N	4	0	0
+66		Y	N	3	2	0
+88		Y	N	2	4	0
+
+44		N	N	3	4	0
+114		N	N	4	2	0
+
+AvT: Where do Side and S142 overlap and where do these differ?
+-> Side = a number (own-turns ETA for one need × one RP/target) and S142 = a choice (which Victory-Way to prefer), made by minimizing Side over fit ways × PLN2 targets. They share the same Side math; they differ in role, inputs, and what gets written back to SE.
+
+AvT: Which modules are tied to Side and S142?
+Core Sidestep modules (owned by Side / S142)
+┌──────────────┬────────────────────────┬──────┬──────────────┐
+│ Module       │ Role                   │ Side │     S142     │
+├──────────────┼────────────────────────┼──────┼──────────────┤
+│ core/        │ Side math: walk, side_ │ owns │   used by    │
+│ sidestep     │ with_confidence, RemTR │      │              │
+│ _eta_matrix  │ residual helpers,      │      │              │
+│ .py          │ matrices               │      │              │
+├──────────────┼────────────────────────┼──────┼──────────────┤
+│ core/        │ Observe PLN2 Side      │ owns │ also builds  │
+│ sidestep_    │ columns / dig tables ( │ dig  │ S142 dig row │
+│ compare.py   │ SIDESTEP_COMPARE)      │      │  via board   │
+│              │                        │      │    _sync     │
+├──────────────┼────────────────────────┼──────┼──────────────┤
+│ core/        │ Fit filter + compute   │ uses │     owns     │
+│ sidestep     │ _s142 (argmin Side     │      │              │
+│ _board_sync  │ over fit×targets)      │      │              │
+│ .py          │                        │      │              │
+├──────────────┼────────────────────────┼──────┼──────────────┤
+│ core/        │ Pareto / dedupe / mass │  —   │     owns     │
+│ sidestep     │ LB (no Side formula    │      │              │
+│ _s142_prune  │ change)                │      │              │
+│ .py          │                        │      │              │
+├──────────────┼────────────────────────┼──────┼──────────────┤
+│ core/        │ a/b/c triggers, latch/ │  —   │     owns     │
+│ sidestep     │ consume, adopt, [s142] │      │              │
+│ _s142_drive  │ log                    │      │              │
+│ .py          │                        │      │              │
+└──────────────┴────────────────────────┴──────┴──────────────┘
+Flags live in core/constants.py: SIDESTEP_COMPARE, SIDESTEP_S142_TRIGGERS, SIDESTEP_S142_DRIVE.
+───
+
+Wired into product / lab (callers)
+┌──────────────────────┬──────────────────────────────────────┐
+│ Module               │ Tie-in                               │
+├──────────────────────┼──────────────────────────────────────┤
+│ core/game.py         │ Turn start → compare (if on); a/b/c  │
+│                      │ latches (VP / LA-LR / opp R/S/C);    │
+│                      │ consume deferred opp builds          │
+├──────────────────────┼──────────────────────────────────────┤
+│ core/ai_way_         │ Honors _external_preferred_way_id    │
+│ portfolio.py         │ when S142 drive adopts               │
+├──────────────────────┼──────────────────────────────────────┤
+│ core/action_planner  │ always_include external preferred    │
+│ .py                  │ way                                  │
+├──────────────────────┼──────────────────────────────────────┤
+│ core/batch/arm_      │ --arm s142-drive                     │
+│ config.py            │                                      │
+├──────────────────────┼──────────────────────────────────────┤
+│ core/batch/headless  │ Stamp drive on headless games        │
+│ _runner.py / game_   │                                      │
+│ manager.py           │                                      │
+└──────────────────────┴──────────────────────────────────────┘
+No gui/ Sidestep modules (lab/headless + logs, not a panel).
+───
+
+Dependencies (not Sidestep-owned, but Side/S142 call them)
+┌─────────────────────────┬───────────────────────────────────┐
+│ Module                  │ Used for                          │
+├─────────────────────────┼───────────────────────────────────┤
+│ core/strategy_board_fit │ can_realize_way (S142 fit set)    │
+│ .py                     │                                   │
+├─────────────────────────┼───────────────────────────────────┤
+│ core/strategy_way_      │ RemTR / way residual              │
+│ residual.py             │                                   │
+├─────────────────────────┼───────────────────────────────────┤
+│ core/strategy_plan_     │ PLN2 catalog targets for S142     │
+│ snapshot.py             │                                   │
+├─────────────────────────┼───────────────────────────────────┤
+│ core/resource_time_     │ Confidence label inside side_     │
+│ estimator.py            │ with_confidence                   │
+└─────────────────────────┴───────────────────────────────────┘
+
+Recap: We ran matched S142+prune vs control n=10 A/Bs and profiled live calls: Side walk is &lt;1% wall (fit/RemTR dominate); Side is the ETA metric, S142 the way argmin in `sidestep_eta_matrix` / `sidestep_board_sync` /`sidestep_s142_drive`.
+
+=/=
+Summary by Grok
+=/=
+
+Plan approved and first vertical slice is in. Summary:
+
+Docs
+• docs/L2_sync_transparency_shadow_plan.md — full approved plan (incl. Phase R/P for C/S target screen)
+• docs/L2_target_screen_research_R.md — research draft: bottleneck / surplus / TR; reuse EH trade step + Sidestep LBs; R2 empirical gate still todo
+• MANUAL.md — flag table under strategy refresh
+
+Code landed
+┌───────┬─────────────────────────────────────────────────────┐
+│ Piece │ What                                                │
+├───────┼─────────────────────────────────────────────────────┤
+│ A1    │ Flags in core/constants.py (L2_SYNC_FIRST, L2_      │
+│       │ DOSSIER, shadow/adaptive/target-screen, …)          │
+├───────┼─────────────────────────────────────────────────────┤
+│ B1    │ strategy_board_fit.select_fit_ways — shared with    │
+│       │ Sidestep                                            │
+├───────┼─────────────────────────────────────────────────────┤
+│ C1/F  │ _apply_l2_sync_first_cap in ai_way_portfolio —      │
+│       │ sync-first + adaptive K' before deep score          │
+├───────┼─────────────────────────────────────────────────────┤
+│ D1    │ game._last_l2_way_dossier after L2 portfolio eval   │
+└───────┴─────────────────────────────────────────────────────┘
+
+Tests
+tests/test_select_fit_ways_b1.py, tests/test_l2_sync_first_cap.py (+ existing board_sync) — 10 passed
+
+Next:
+• DONE | E — shadow overlook dig + scripts/analyze_l2_cap_miss.py
+• DONE | D2 — CS compact fields
+• DONE | R2 — empirical target-screen vs EH
+• P — C/S prune after R go
+
+Say when to continue the remaining vertical slice (C smoke, E batch miss-rate dig, or adaptive-K A/B).
+
+Everything else is optional digs, dossier=full polish, miss-rate improvement work, or H cleanup when you’re ready to retire S142 drive for real.
+
+###### ADDED AFTER THIS #####
+
+Improve performance/ Transparency | Requirements:
+Performance is an important aspect. Target is a game (as part of a batch) to be played in 15 sec (240 games in 1 hour) or better. We can't achieve this in one go either. A good architecture, efficient coding, carefully chozen optimizers (favouring performance over absolute best result), using vectors and/or NumPy where feasible, deploying off-line enrichment and more will help in achieving this performance goal.
+
+1. I like L2's performance. 2. I like S142's transparancy all combinations (portflio x 142). 3. I like that S142 can easier apply strategy and board sync. 4. I like that S142 is not trigger as frequent as L2. If we can improve L2 transparancy (2) and integrate sync (3) -> which way-ids are considered Early/3, Mid/6, End/9 and why, I am willing to give up S142. Timing (4) can be applied for L2 as well. Any idea's regarding 2 and 3?
+
+Improve performance/ Transparency | Brainstorm:
+1. Idea A — L2 candidate dossier (every L2 fire)
+Emit one structured bag (CS / MGlog / Check panel), e.g.:
+┌─────────────────────┬───────────────────────────────────────┐
+│ Field               │ Purpose                               │
+├─────────────────────┼───────────────────────────────────────┤
+│ stage, K            │ early/3, mid/6, end/9                 │
+├─────────────────────┼───────────────────────────────────────┤
+│ ranked_in[]         │ way_ids in eval order + abstract      │
+│                     │ turns                                 │
+├─────────────────────┼───────────────────────────────────────┤
+│ always_include[]    │ sticky, salvage T1 expand, external   │
+│                     │ prefer                                │
+├─────────────────────┼───────────────────────────────────────┤
+│ scored[]            │ way_id, ETA/win_turns, board-fit      │
+│                     │ label                                 │
+├─────────────────────┼───────────────────────────────────────┤
+│ dropped_before_     │ id + reason (below cap / unfit /      │
+│ score[]             │ infinite)                             │
+├─────────────────────┼───────────────────────────────────────┤
+│ winner + runner_up  │ and Δ turns                           │
+└─────────────────────┴───────────────────────────────────────┘
+Conviction: you always see who was invited and why others weren’t.
+
+2. Idea B — Shadow proof (the real “not overlooking” test)
+On a/b/c (or every Nth L2): cheap pass over all sync-fit ways (abstract turns or Side — not full EH):
+best_outside_K  vs  L2_winner
+Log missed_gain = turns(L2) − turns(best_fit_outside_K).
+┌───────────────────────┬─────────────────────────────────────┐
+│ Result                │ Meaning                             │
+├───────────────────────┼─────────────────────────────────────┤
+│ missed_gain ≤ 0 (or < │ K was enough                        │
+│ ε)                    │                                     │
+├───────────────────────┼─────────────────────────────────────┤
+│ missed_gain ≥ 1 often │ Cap is dangerous → raise K or sync- │
+│                       │ first                               │
+└───────────────────────┴─────────────────────────────────────┘
+That is how you get convinced without running full EH on 142 every time.
+
+3. Idea C — Adaptive K from sync size (your instinct)
+After sync, n_fit is often ≪ 142 (endgame especially). Then fixed 3/6/9 is arbitrary.
+Examples:
+• K = min(n_fit, K_stage) — never “pretend” there are more candidates than fit
+• If n_fit ≤ 12 (or ≤ 15): score all fit (full transparency = full set)
+• If n_fit large: K = max(K_stage, ceil(α·n_fit)) with a wall budget
+S142 taught: fit set is the real universe; stage caps should be caps on that universe.
+
+4. Idea D — Sync-first pipeline (recommended core change)
+142 → can_realize_way (+ give-up carve-out)
+    → fit_ids[]          ← same predicate family as S142
+    → cheap rank fit_ids (abstract / RemTR mass)
+    → take top K (or all if small)
+    → existing L2 EH / target portfolio audits
+Effects:
+• Unfit ways never consume a scarce K slot
+• Dig shows n_fit / 142 like S142’s fit=81/142
+• Salvage/sticky still always_include if policy says so
+Board-fit already exists on audits; the gap is ordering/capping before deep score, not inventing a new predicate.
+
+5. Idea E — Reject log = S142 transparency
+For every unfit (or demoted) way: reasons[] from can_realize_way (buildings, LA/LR, VP, …). Same mental model as S142 sync column, attached to L2.
+───
+Suggested path (if you want to retire S142)
+┌──────┬──────────────────────────────────┬───────────────────┐
+│ Step │ What                             │ Addresses         │
+├──────┼──────────────────────────────────┼───────────────────┤
+│ 1    │ Dossier (A) on every L2          │ Transparency      │
+├──────┼──────────────────────────────────┼───────────────────┤
+│ 2    │ Sync-first (D) + reject reasons  │ Sync like S142    │
+│      │ (E)                              │                   │
+├──────┼──────────────────────────────────┼───────────────────┤
+│ 3    │ Shadow proof (B) on a/b/c for a  │ Conviction K is   │
+│      │ batch                            │ safe              │
+├──────┼──────────────────────────────────┼───────────────────┤
+│ 4    │ Adaptive K (C) using shadow miss │ Boundaries follow │
+│      │ rate                             │ fit               │
+├──────┼──────────────────────────────────┼───────────────────┤
+│ 5    │ Optional: a/b/c cadence for L2 ( │ Timing            │
+│      │ your point 4)                    │                   │
+└──────┴──────────────────────────────────┴───────────────────┘
+S142 can go when shadow digs show rare/no missed gains outside K under sync-first+adaptive K, and you like the dossier in Replay/CS.
+Keep S142 only as an offline oracle for those shadow digs, not as a live driver.
+
+Bottom line for your conviction question:
+Don’t raise 3/6/9 blindly. Sync first, then either score all fit when the set is small, or prove with a shadow full-fit rank that the capped L2 winner isn’t leaving ≥1 turn on the table. That’s the honest substitute for “portfolio × 142” transparency without paying S142’s wall time.
+
+Summary:
+Idea A - L2 candidate dossier on every L2 fire (transparency)
+Idea B - Shadow proof (the real “not overlooking” test)
+Idea C - Adaptive K from sync size
+Idea D - Impact of Sync-first pipeline
+Idea E - Reject log = S142 transparency
+Timing - How often was L2 fired now vs. back than and do we have any material to learn more about the differences and for instance the average time required for a L2 (now vs. back then).
+
+Improving_SE_v6.txt
+| ID | Theme | Status |
+|----|--------|--------|
+| A | PLN1 forward Target | **In progress** (WP-A) |
+| B | LR Engine Why red / blank S/R | Done |
+| C | Hot overrides New-row | **In progress** (WP-C) |
+| D | DC Need min(knight, VP) | Pending |
+| E1/E2 | rcard←dcard; unlock TwP BA | **Partial/Done** (WP-E1/E2 wired) |
+| F | Knight-before-build | **Partial/Done** (touchpoint boost at post_roll chooser) |
+| G | Dual tip / dead-edge LR | **Done** (WP-G) |
+| H | L2 retarget after LR/VP | **Done** (WP-H force L2 after LR grow / path complete) |
+| I | TwP accept quality | Pending |
+| J | Dig ETA table + PLN2 Dt invert | **Done** (WP-J) |
+
+Improvement_SE_v6.txt | Implementation order
+1. WP-A + WP-C  
+2. WP-J  
+3. WP-E1 + WP-F  
+4. WP-E2  
+5. WP-G + WP-H  
+6. WP-D + WP-I  
+7. Fresh n=3 dig checklist  
+
+Improving_SE_v7.txt | Implementation
+1. **TFR1** + **H2** (correctness)  
+2. **STICKY1** + **SYNC1** (n3d sticky/way pain)  
+3. **ARB1** + **ROAD2** (PLN1 exclusivity + dual tips)  
+4. **TWP2** + **DCARD2**  
+5. **STICKY2** + **RISK1** + **DIG2**  
+6. Fresh **n3e** dig checklist (g001+g002 themes above)
+
+rcards_memory_opponents | Requirement:
+- Keeping track of the RCards in hand of your opponents is key when playing Catan. We are using the ResouceCardDashboard withing game.py for this purpose. I like to define a constant RCARD_MEMORY_OPPONENTS that can be 1,2,3,4, all. Currently we implemented all. If RCARD_MEMORY_OPPONENTS=2 a player can remember RCards in hand of each opponent fo the last 2 rounds (=last 8 player turns). Should we a this functionality in the RFesourceCardDashboard or elsewhere?
+- For now let's use ResourceCardDashboard and its resource_production_game_player_view where we have 2 array's [[viewer_id, viewed_id, Wheat, Ore, Wood, Brick, Sheep , Gold, QM_Added, QM_Discarded], ...], one corresponding to what it is today and one corresponding to the situation 1,2,3,4 rounds ago. Meaning each turn both need to be updated. If done correctly rcard_memory_opponents is simply the current array minus the new array.
+- When estimating the risk of gotten beaten by an opponent for a) a particular road or b) settlement we need to incorporate both EH (=Expected Hand) and rcard_memory_opponents. So wire this new component in these risk related functions.
+
+rcards_memory_opponents | Implementation
+Constant
+core/constants.py — RCARD_MEMORY_OPPONENTS = "all" (default = today’s full memory).
+Set to 1…4 for a round window. Documented in MANUAL.md.
+
+Dashboard
+ResourceCardDashboard now has:
+• resource_production_game_player_view — current (now)
+• resource_production_game_player_view_lag — up to 4 round-end snapshots (index 0 = 1 round ago)
+• snapshot_player_view_end_of_round()
+• player_view_memory(rounds=None) → now if "all", else now − lag[N-1] (clamped ≥ 0)
+
+Pure helpers live in core/rcard_view_memory.py (easy to unit-test).
+
+Game wiring
+• distribute_rcards updates dashboard totals + player_view (same idea as IP)
+• End of round (with auto-save) calls snapshot_rcard_player_view_end_of_round()
+• get_rcard_player_view_memory() for AI/SE
+• Save/load restores the lag ring
+
+Tests
+tests/test_rcard_view_memory.py — 5 passed
+
+Usage
+# constants.py
+RCARD_MEMORY_OPPONENTS = 2   # last 2 rounds ≈ 8 turns at 4p
+
+# AI / SE
+belief_rows = game.get_rcard_player_view_memory()
+
+Note: Dig / Player.rcards truth is unchanged. Monopoly/TwP/etc. are not switched over to belief yet — infrastructure is ready; next step is pointing those callers at get_rcard_player_view_memory() when you want limited memory to affect play.
+
+Wiring -> Opponent beat-risk for settlements (and a helper for contested roads) now uses EH + RCARD_MEMORY_OPPONENTS.
+
+Behaviour
+┌────────────────┬────────────────────────────────────────────┐
+│ RCARD_MEMORY_  │ Opponent EH hand                           │
+│ OPPONENTS      │                                            │
+├────────────────┼────────────────────────────────────────────┤
+│ "all" (        │ Truth Player.rcards (unchanged)            │
+│ default)       │                                            │
+├────────────────┼────────────────────────────────────────────┤
+│ 1…4            │ Belief hand from player_view_now − lag[N]  │
+│                │ (typed Wh..Sh, capped by public card       │
+│                │ count)                                     │
+└────────────────┴────────────────────────────────────────────┘
+
+Own ETA still uses the evaluating seat’s real hand.
+
+Where it’s wired
+1. Settlement race / spoiler — risk_assessment.fill_threat_opponent_etas + enrich_settlement_race_risk_with_eh_memory
+2. Portfolio timing — _fill_threat_opponent_etas(..., viewer=player) → memory-aware threat ETAs → Hot/Race upgrade
+3. Sticky settle refresh after own road — same enricher
+4. Road planner path scoring toward a settle — enrich risk before scoring
+5. Contested road — new opponent_contested_road_eta(game, viewer, opponent, path=…, contested_road_id=…)
+
+Helpers
+• core/rcard_view_memory.opponent_belief_hand5
+• Threat rows gain eta_hand_source / eta_memory_rounds for Dig
+
+Tests
+tests/test_rcard_view_memory.py (+ sticky risk) — 10 passed
+
+Set e.g. RCARD_MEMORY_OPPONENTS = 2 in constants.py to exercise limited memory on race ETAs.
+
+TRCards to Victory | Requirement:
+For EH (Expected Hand) we use the needed number of RCards per Way to Victory, which we retrieve from catan_142_ways_resource_requirements.csv. However mid-game, in order to predict the remaining needed RCards per Way to Victory we need to make sure that we subtract the correct number of RCards per Way to Victory based on the playboard and RCards in hand (*) and DCards in hand. (*) In pretty much all cases we ignore RCards in hand. When subtracting we need to follow the exact RCard count as done by PlayerOne! If the next settlement is not having distance 2, but 3 or more, we need to correct this to the RCard number retrieved from catan_142_ways_resource_requirements.csv in a consistent fashion. How is this currently done and isn't it a good idea to define a specific module for this?
+
+TRCards to Victory | Implementation:
+### WP0 — Spec lock
+- Document Player One component costs = `RCARDS_FOR_*`
+- Document hand=no vs hand=yes + self/opponent sources
+- Lock distance correction: **Proposal A (LOCKED)** = min-road cover for whole-way `n_R`; per-target EH uses raw `d`. **Proposal B** (optional) = CSV +/- `(d-2)` — only if Dig still disagrees with Player One numbers
+- List first callers to migrate
+**Exit:** normative rules filled; no code.
+
+### WP1 — Module skeleton + pure costing — **Done**
+- Add `core/way_resource_need.py`
+- Wrap `strategy_cost_from_components` / remaining via `calculate_remaining_need`
+- Dataclasses + unit tests (absolute + mid-game hand=no)
+- Tests: `tests/test_way_resource_need_wp1.py`
+**Exit:** tests green; no caller migration (residual migration is WP5).
+
+### WP2 — Playboard road basis — **Done**
+- Wire `use_min_road_cover` (parity with today's `compute_way_residual` override)
+- Prefer moving **TFR credit** into facade so portfolio/residual share one road number
+- `apply_tfr_road_credit()` shared helper; min-cover also when only `board=` is passed
+- Tests: `tests/test_way_resource_need_roads.py`
+**Exit:** residual roads match current Dig fixtures.
+
+### WP3 — `consider_hand` + RCard memory
+- `resolve_hand_vector` / `way_resource_need(..., consider_hand=)`
+- Self = truth; opponent + viewer = `opponent_belief_hand5`
+- `need_after_hand[i] = max(0, need[i] - hand[i])`
+- Tests: hand=no; hand=yes self; hand=yes opp with `RCARD_MEMORY_OPPONENTS=2`
+**Exit:** belief path covered.
+
+### WP4 — Distance / next-settle correction
+- Implement locked WP0 formula
+- Optional `path_distance_for_next_settle`
+- Align with `settlement_Nr` for single-target EH
+**Exit:** d=2 vs d=3 fixtures documented + tested.
+
+### WP5 — Caller migration (behaviour-preserving, `consider_hand=False`)
+| Caller | Change |
+|--------|--------|
+| `strategy_way_residual.compute_way_residual` | req/need via facade |
+| `ai_way_portfolio` parse / victory ETA helpers | same |
+| Dig PLN1 residual (if recomputed) | prefer facade |
+| Risk beat-risk | may share `resolve_hand_vector`; ETA wiring can stay |
+
+Keep `calculate_remaining_need` as low-level primitive.
+
+### WP6 — Docs
+- Copy this plan to `docs/way_resource_need_plan.md`
+- MANUAL pointer under EH / `RCARD_MEMORY_OPPONENTS`
+- AGENTS.md "Where to change what" row
+Maps | Requirements:
+I like to restore/implement:
+        # Strategy instances (Gen2 style) populated by core/strategy.initialize or on first update_strategy
+        # self.strategy.append(Strategy(...))  # done post-init to avoid import cycles
+        w = h = 67
+        self.distance_map = [[99 for _ in range(w)] for _ in range(h)]
+        self.min_distance_map_for_targeted_TWs: List = [99] * h
+        self.path_map = [[[] for _ in range(w)] for _ in range(h)]
+        self.pathlength_map = [[99 for _ in range(w)] for _ in range(h)]
+        self.min_pathlength_map_for_targeted_TWs: List = [99] * h
+        self.real_distance_map = [[99 for _ in range(w)] for _ in range(h)]
+        self.min_real_distance_map_for_targeted_TWs: List = [99] * h
+
+I think this will make life for road_optimizer.py easier, perhaps the "show"-button within the PLN2 sub-panel of the overarching Data-panel (Replay n dig mode) and more (performance)
+
+Check out https://github.com/avtnl/Catan_Gen2_v045 to scan how this was implemented. Not code changes yet. Brainstorming only. What do you think, would this add value?
+
+Are we updating the new wired maps timely and correctly? Please check https://github.com/avtnl/Catan_Gen2_v045 once again for inspiration. Just to make sure we didn't miss anything.
+
+Maps | Implementation:
+### WP-R0 — Spec lock
+- Document axes, sentinels, horizon ≥5, settle vs road incremental rules
+- Confirm `real_distance` = remaining roads to build on best path
+- List invalidate call sites in `game.py`
+- Copy this plan → `docs/player_reachability_maps_plan.md`  
+**Exit:** durable normative §; no algorithm code yet (flag stub OK).
+
+### WP-R1 — Rebuild + query API
+- Implement `core/player_reachability.py`: full `rebuild_reachability_maps`
+- Fill path / pathlength / real_distance + min_* vectors
+- Add `REACHABILITY_MAPS` in `core/constants.py` (default **True**)
+- Unit tests: empty board-ish fixture, d=2/3 tips, ≥5 purged; queries match on-demand BFS oracle  
+**Exit:** maps fill; queries match BFS on fixtures.
+
+### WP-R2 — Incremental updates
+- Own road: refresh starts involving new endpoints; cascade path/real
+- Own settle: add start row; clear illegal end columns (site + neighbors)
+- Opponent road/settle: Gen2-style invalidate then cascade
+- Assert incremental == full rebuild on fixtures  
+**Exit:** after build, maps match full rebuild.
+
+### WP-R3 — Wire Tier H producers ✅
+- `_min_empty_roads_to_reach` → `min_real_distance` (fresh maps)
+- `find_reachable_new_settlement_paths` → map-backed (fallback BFS)
+- `strategy_min_road_cover` → map-first first pick + outlook/BFS miss fill
+- `ai_way_portfolio.build_candidate_targets` / soft race threats → `ensure_reachability_maps`
+- `strategy_plan_snapshot._merge_geometry_settles_for_pln2` → S/C hop from `pathlength_map`
+- Tests: `tests/test_player_reachability_tier_h.py` (+ prior reachability suites)  
+**Exit:** same reachable sets / distances on golden cases.
+
+### WP-R4 — Wire Tier M (optimizer / sticky / way_need)
+- `road_optimizer`, `ai_road_planner`, `strategy_sticky`, `way_resource_need`, `first_way_fit`  
+**Exit:** behaviour-preserving tests green.
+
+### WP-R5 — Dig / Show (optional)
+- PLN2 Show: optional dist→radius; document road overlay as future
+- Dig-visible human seat rebuild when scrubbing  
+**Exit:** no regression on Show circles.
+
+### WP-R6 — Docs
+- Finalize `docs/player_reachability_maps_plan.md`
+- MANUAL + AGENTS “Where to change what” row for reachability
+
+=/=

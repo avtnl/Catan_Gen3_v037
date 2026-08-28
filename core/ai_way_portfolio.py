@@ -38,19 +38,21 @@ PORTFOLIO_CACHE_ENABLED = True
 def _resolve_portfolio_top_n(game: Any = None, limit: Optional[int] = None) -> int:
     """Early 3 / Mid 6 / End 9 (policy D); explicit limit wins when provided.
 
-    P4 fast L2: ``game._l2_profile.portfolio_top_n`` (default 3) overrides stage table.
+    If ``game._l2_profile.portfolio_top_n`` is set (int), it overrides the stage
+    table (lab/legacy). Fast profile now leaves it ``None`` so Mid6/End9 apply;
+    cheap AI still uses abstract prefilter K=12 and thin explore kwargs.
     """
     if limit is not None:
         try:
             return max(1, int(limit))
         except Exception:
             pass
-    # P4: fast explore profile caps board audits
+    # Optional profile override (only when portfolio_top_n is explicitly set)
     try:
         from core.l2_profile import profile_from_game
 
         prof = profile_from_game(game)
-        if prof is not None and str(getattr(prof, "name", "") or "") == "fast":
+        if prof is not None:
             pt = getattr(prof, "portfolio_top_n", None)
             if pt is not None:
                 return max(1, int(pt))
@@ -239,25 +241,109 @@ def _num_players(game: Any) -> int:
 
 
 
-def parse_way_requirements(way_id, *, requirements_by_id=None, player_state=None, abstract_expected_turns=INFINITE_TURNS):
+def parse_way_requirements(
+    way_id,
+    *,
+    requirements_by_id=None,
+    player_state=None,
+    abstract_expected_turns=INFINITE_TURNS,
+    game=None,
+    player=None,
+    use_min_road_cover: bool = False,
+):
+    """Build ``WayRequirements`` from CSV ± live residual.
+
+    WP5: prefer ``way_resource_need`` when ``player`` is provided (hand=no).
+    Default ``use_min_road_cover=False`` preserves historic parse numbers
+    (csv_minus_count); geometry/ETA paths that already used min-cover pass True.
+    """
     strategy = None
     if requirements_by_id is not None:
         strategy = requirements_by_id.get(int(way_id))
     if strategy is None:
         return WayRequirements(way_id=int(way_id), required_new_intersections=0, required_cities=0, required_dcards=0, required_roads_min=0, needed_rcards={}, resource_engines_needed=[], abstract_expected_turns=_safe_float(abstract_expected_turns, INFINITE_TURNS))
-    remaining = None
-    if player_state is not None:
+
+    req = None
+    # WP5 façade path (Player One residual)
+    if player is not None:
+        try:
+            from core.way_resource_need import way_resource_need
+
+            board = getattr(game, "board", None) if game is not None else None
+            bag = way_resource_need(
+                game,
+                player,
+                int(way_id),
+                consider_hand=False,
+                use_min_road_cover=bool(use_min_road_cover),
+                apply_tfr_credit=False,
+                board=board,
+            )
+            need_vec = tuple(float(x) for x in bag.need_vector)
+            req = WayRequirements(
+                way_id=int(way_id),
+                required_new_intersections=int(bag.req_settles),
+                required_cities=int(bag.req_cities),
+                required_dcards=int(bag.req_dcards),
+                required_roads_min=int(bag.req_roads),
+                needed_rcards=_named_need(need_vec),
+                resource_engines_needed=[],
+                longest_road=bool(getattr(strategy, "longest_road", False)),
+                biggest_army=bool(getattr(strategy, "biggest_army", False)),
+                abstract_expected_turns=_safe_float(abstract_expected_turns, INFINITE_TURNS),
+                need_vector=need_vec,
+            )
+        except Exception:
+            req = None
+
+    if req is None and player_state is not None:
         try:
             from core.strategy_timing import calculate_remaining_need
+            from core.way_resource_need import WayComponents, need_vector_from_components
+
             remaining = calculate_remaining_need(strategy, player_state)
+            comps = WayComponents(
+                way_id=int(way_id),
+                new_settlements=int(remaining.remaining_new_settlements),
+                city_upgrades=int(remaining.remaining_city_upgrades),
+                roads=int(remaining.remaining_roads_to_build),
+                dev_cards=int(remaining.remaining_dev_cards_to_buy),
+                longest_road=bool(getattr(strategy, "longest_road", False)),
+                largest_army=bool(getattr(strategy, "biggest_army", False)),
+            )
+            need_vec = need_vector_from_components(comps)
+            req = WayRequirements(
+                way_id=int(way_id),
+                required_new_intersections=int(comps.new_settlements),
+                required_cities=int(comps.city_upgrades),
+                required_dcards=int(comps.dev_cards),
+                required_roads_min=int(comps.roads),
+                needed_rcards=_named_need(need_vec),
+                resource_engines_needed=[],
+                longest_road=bool(comps.longest_road),
+                biggest_army=bool(comps.largest_army),
+                abstract_expected_turns=_safe_float(abstract_expected_turns, INFINITE_TURNS),
+                need_vector=need_vec,
+            )
         except Exception:
-            remaining = None
-    if remaining is not None:
-        need_vec = tuple(remaining.need_vector)
-        req = WayRequirements(way_id=int(way_id), required_new_intersections=int(remaining.remaining_new_settlements), required_cities=int(remaining.remaining_city_upgrades), required_dcards=int(remaining.remaining_dev_cards_to_buy), required_roads_min=int(remaining.remaining_roads_to_build), needed_rcards=_named_need(need_vec), resource_engines_needed=[], longest_road=bool(getattr(strategy, "longest_road", False)), biggest_army=bool(getattr(strategy, "biggest_army", False)), abstract_expected_turns=_safe_float(abstract_expected_turns, INFINITE_TURNS), need_vector=need_vec)
-    else:
+            req = None
+
+    if req is None:
         need_vec = tuple(getattr(strategy, "calculated_need", (0, 0, 0, 0, 0)))
-        req = WayRequirements(way_id=int(way_id), required_new_intersections=int(getattr(strategy, "new_settlements_to_build", 0) or 0), required_cities=int(getattr(strategy, "city_upgrades", 0) or 0), required_dcards=int(getattr(strategy, "development_cards_to_buy", 0) or 0), required_roads_min=int(getattr(strategy, "roads_to_build", 0) or 0), needed_rcards=_named_need(need_vec), resource_engines_needed=[], longest_road=bool(getattr(strategy, "longest_road", False)), biggest_army=bool(getattr(strategy, "biggest_army", False)), abstract_expected_turns=_safe_float(abstract_expected_turns, INFINITE_TURNS), need_vector=need_vec)
+        req = WayRequirements(
+            way_id=int(way_id),
+            required_new_intersections=int(getattr(strategy, "new_settlements_to_build", 0) or 0),
+            required_cities=int(getattr(strategy, "city_upgrades", 0) or 0),
+            required_dcards=int(getattr(strategy, "development_cards_to_buy", 0) or 0),
+            required_roads_min=int(getattr(strategy, "roads_to_build", 0) or 0),
+            needed_rcards=_named_need(need_vec),
+            resource_engines_needed=[],
+            longest_road=bool(getattr(strategy, "longest_road", False)),
+            biggest_army=bool(getattr(strategy, "biggest_army", False)),
+            abstract_expected_turns=_safe_float(abstract_expected_turns, INFINITE_TURNS),
+            need_vector=need_vec,
+        )
+
     engines = [name for name, amount in req.needed_rcards.items() if _safe_float(amount) >= 2.0]
     if req.required_cities > 0 or req.required_dcards > 0:
         for name in ("Wheat", "Ore", "Sheep"):
@@ -329,6 +415,15 @@ def build_candidate_targets(game, player, requirements, *, max_targets=MAX_TARGE
     except Exception:
         current_pips_named = {n: 0.0 for n in RESOURCE_ORDER}
     paths = []
+    try:
+        # WP-R3: seed/refresh reachability maps so outlook/risk prefer them
+        from core.constants import REACHABILITY_MAPS
+        from core.player_reachability import ensure_reachability_maps
+
+        if bool(REACHABILITY_MAPS):
+            ensure_reachability_maps(game, player)
+    except Exception:
+        pass
     try:
         from core.outlook_logic import find_reachable_new_settlement_paths, next_settlement_spots
         paths = list(find_reachable_new_settlement_paths(game, player, max_distance=max(1, min(3, int(max_road_distance)))) or [])
@@ -443,11 +538,13 @@ def _estimate_self_eta_own_turns(
     *,
     distance_roads: int,
     target_id: int,
+    current_hand: Optional[Sequence[Any]] = None,
 ) -> Tuple[Optional[float], str]:
     """Expected own turns to build on target if prioritized #1 (PR-B).
 
     Prefers resource_time_estimator (settle + extra roads). Falls back to a
     simple road-count heuristic so UI always has a number when possible.
+    Optional ``current_hand`` is used for opponent belief (RCard memory).
     """
     dist = max(0, int(distance_roads or 0))
     try:
@@ -455,13 +552,13 @@ def _estimate_self_eta_own_turns(
 
         board = getattr(game, "board", None)
         if board is not None and player is not None:
-            est = estimate_action_time(
-                board,
-                player,
-                "settlement",
-                target_id=int(target_id),
-                extra_roads_needed=dist,
-            )
+            kw: Dict[str, Any] = {
+                "target_id": int(target_id),
+                "extra_roads_needed": dist,
+            }
+            if current_hand is not None:
+                kw["current_hand"] = list(current_hand)
+            est = estimate_action_time(board, player, "settlement", **kw)
             turns = None
             if isinstance(est, Mapping):
                 turns = est.get("turns")
@@ -470,7 +567,10 @@ def _estimate_self_eta_own_turns(
             if turns is not None:
                 t = float(turns)
                 if t < 9000:
-                    return round(t, 2), "eh_settle_plus_roads"
+                    src = "eh_settle_plus_roads"
+                    if current_hand is not None:
+                        src = f"{src}_mem"
+                    return round(t, 2), src
     except Exception:
         pass
     # Heuristic: ~1.5 own turns per road + ~2 for the settlement package
@@ -484,8 +584,13 @@ def _estimate_player_eta_to_site(
     *,
     site_id: int,
     roads_needed: Optional[int] = None,
+    viewer: Any = None,
 ) -> Tuple[Optional[float], str]:
-    """EH (or stub) own-turns for *player* to settle site_id if they prioritize it."""
+    """EH (or stub) own-turns for *player* to settle site_id if they prioritize it.
+
+    When ``viewer`` is set and differs from ``player``, opponent hand comes from
+    ``RCARD_MEMORY_OPPONENTS`` belief (not god-view ``Player.rcards``).
+    """
     dist = 0 if roads_needed is None else max(0, int(roads_needed))
     if roads_needed is None:
         try:
@@ -497,8 +602,26 @@ def _estimate_player_eta_to_site(
             dist = int(reached)
         except Exception:
             dist = 2
+    belief_hand = None
+    if viewer is not None:
+        try:
+            vid = int(getattr(viewer, "id", 0) or 0)
+            pid = int(getattr(player, "id", 0) or 0)
+        except Exception:
+            vid, pid = 0, 0
+        if vid and pid and vid != pid:
+            try:
+                from core.rcard_view_memory import opponent_belief_hand5
+
+                belief_hand, _meta = opponent_belief_hand5(game, viewer, player)
+            except Exception:
+                belief_hand = None
     return _estimate_self_eta_own_turns(
-        game, player, distance_roads=dist, target_id=int(site_id)
+        game,
+        player,
+        distance_roads=dist,
+        target_id=int(site_id),
+        current_hand=belief_hand,
     )
 
 
@@ -507,60 +630,26 @@ def _fill_threat_opponent_etas(
     threats: Sequence[Mapping[str, Any]],
     *,
     race_target_id: int,
+    viewer: Any = None,
 ) -> List[Dict[str, Any]]:
-    """Attach eta_own_turns for race (to T) or block (to kill-site)."""
-    out: List[Dict[str, Any]] = []
-    players_by_id: Dict[int, Any] = {}
-    for p in list(getattr(game, "players", []) or []):
-        try:
-            players_by_id[int(getattr(p, "id"))] = p
-        except Exception:
-            continue
+    """Attach eta_own_turns for race/block via EH + RCard memory (viewer belief)."""
+    try:
+        from core.risk_assessment import fill_threat_opponent_etas
 
+        return fill_threat_opponent_etas(
+            game,
+            viewer,
+            threats,
+            race_target_id=int(race_target_id),
+        )
+    except Exception:
+        pass
+    # Fallback: legacy path without memory
+    out: List[Dict[str, Any]] = []
     for raw in threats:
         if not isinstance(raw, Mapping):
             continue
         t = dict(raw)
-        pid = t.get("player_id")
-        opp = None
-        try:
-            if pid is not None:
-                opp = players_by_id.get(int(pid))
-        except Exception:
-            opp = None
-        if opp is None:
-            # Match by color
-            col = str(t.get("color") or "")
-            for p in list(getattr(game, "players", []) or []):
-                if str(getattr(p, "color", "")) == col:
-                    opp = p
-                    break
-        if opp is None:
-            out.append(t)
-            continue
-
-        mode = str(t.get("mode") or "race").lower()
-        roads_needed = t.get("roads_needed")
-        try:
-            roads_needed_i = int(roads_needed) if roads_needed is not None else None
-        except Exception:
-            roads_needed_i = None
-
-        if mode == "block" and t.get("block_site") is not None:
-            site = int(t["block_site"])
-            eta, src = _estimate_player_eta_to_site(
-                game, opp, site_id=site, roads_needed=roads_needed_i
-            )
-            t["eta_own_turns"] = eta
-            t["eta_source"] = src
-            t["eta_site"] = site
-        else:
-            eta, src = _estimate_player_eta_to_site(
-                game, opp, site_id=int(race_target_id), roads_needed=roads_needed_i
-            )
-            t["eta_own_turns"] = eta
-            t["eta_source"] = src
-            t["eta_site"] = int(race_target_id)
         out.append(t)
     return out
 
@@ -584,28 +673,58 @@ def _portfolio_forcing_target(
     return [forced] + pool[: max(0, k - 1)]
 
 
+def _virtual_player_attrs(player: Any) -> Dict[str, Any]:
+    """Attrs needed by way_resource_need / residual (WP5)."""
+    return {
+        "id": getattr(player, "id", None),
+        "color": getattr(player, "color", None),
+        "settlements": list(getattr(player, "settlements", None) or []),
+        "cities": list(getattr(player, "cities", None) or []),
+        "roads": list(getattr(player, "roads", None) or []),
+        "trade_rates": getattr(player, "trade_rates", None),
+        "development_cards": getattr(player, "development_cards", None),
+        "dcard_summary": getattr(player, "dcard_summary", None),
+        "rcards": getattr(player, "rcards", None),
+        "resource_cards": getattr(player, "resource_cards", None),
+        "longest_route_tf": getattr(player, "longest_route_tf", False),
+        "largest_army_tf": getattr(player, "largest_army_tf", False),
+        "size_largest_army": getattr(player, "size_largest_army", 0),
+        "size_longest_route": getattr(player, "size_longest_route", 0),
+    }
+
+
 def _player_with_virtual_settle(player: Any, settle_id: int) -> Any:
     """Shallow copy of player with *settle_id* appended (for post-New road cover)."""
+    attrs = _virtual_player_attrs(player)
     try:
-        settles = [int(x) for x in list(getattr(player, "settlements", []) or [])]
+        settles = [int(x) for x in list(attrs.get("settlements") or [])]
     except Exception:
         settles = []
     if int(settle_id) not in settles:
         settles.append(int(settle_id))
-    return type(
-        "VirtualPlayer",
-        (),
-        {
-            "id": getattr(player, "id", None),
-            "color": getattr(player, "color", None),
-            "settlements": settles,
-            "cities": list(getattr(player, "cities", None) or []),
-            "roads": list(getattr(player, "roads", None) or []),
-            "trade_rates": getattr(player, "trade_rates", None),
-            "development_cards": getattr(player, "development_cards", None),
-            "resource_cards": getattr(player, "resource_cards", None),
-        },
-    )()
+    attrs["settlements"] = settles
+    return type("VirtualPlayer", (), attrs)()
+
+
+def _player_with_virtual_city(player: Any, city_id: int) -> Any:
+    """Shallow copy with *city_id* as a city (post-upgrade residual)."""
+    attrs = _virtual_player_attrs(player)
+    try:
+        cities = [int(x) for x in list(attrs.get("cities") or [])]
+    except Exception:
+        cities = []
+    try:
+        settles = [int(x) for x in list(attrs.get("settlements") or [])]
+    except Exception:
+        settles = []
+    cid = int(city_id)
+    if cid not in cities:
+        cities.append(cid)
+    if cid not in settles:
+        settles.append(cid)
+    attrs["cities"] = cities
+    attrs["settlements"] = settles
+    return type("VirtualPlayer", (), attrs)()
 
 
 def _apply_port_text_to_rates(rates: Sequence[Any], port_text: Any) -> List[int]:
@@ -673,10 +792,7 @@ def estimate_victory_eta_after_acquiring_target(
             get_player_trade_rates,
             trade_rates_after_candidate,
         )
-        from core.strategy_timing import (
-            estimate_resource_requirement_time,
-            strategy_cost_from_components,
-        )
+        from core.strategy_timing import estimate_resource_requirement_time
     except Exception:
         return INFINITE_TURNS
 
@@ -724,7 +840,7 @@ def estimate_victory_eta_after_acquiring_target(
     if port:
         rates = _apply_port_text_to_rates(rates, port)
 
-    # Residual need after New — live board residual (v5)
+    # Residual need after New — live board residual (v5) + WP5 façade costing
     req_s = max(0, int(getattr(requirements, "required_new_intersections", 0) or 0))
     req_c = max(0, int(getattr(requirements, "required_cities", 0) or 0))
     req_r = max(0, int(getattr(requirements, "required_roads_min", 0) or 0))
@@ -733,7 +849,8 @@ def estimate_victory_eta_after_acquiring_target(
         from core.strategy_way_residual import compute_way_residual
 
         wid = int(getattr(requirements, "way_id", 0) or 0)
-        res = compute_way_residual(wid, player, board=board) or {}
+        pref = {"_game": game} if game is not None else {}
+        res = compute_way_residual(wid, player, preferred=pref, board=board) or {}
         req_c = max(req_c, int(res.get("req_cities") or 0))
         req_s = max(req_s, int(res.get("req_settles") or 0))
         req_r = max(req_r, int(res.get("req_roads") or 0))
@@ -746,12 +863,10 @@ def estimate_victory_eta_after_acquiring_target(
     else:
         rem_s, rem_c = max(0, req_s - 1), req_c
     # v5: min legal road cover on current playboard (not CSV Roads_To_Build count).
-    # Do not plan S/C/road sequence or LA/LR — only mass of roads for remaining settles.
     rem_r = req_r
     try:
         from core.strategy_min_road_cover import victory_structure_road_need
 
-        # After a new settle, treat that site as already owned for the cover search
         cover_player = player
         if not is_city:
             try:
@@ -773,13 +888,19 @@ def estimate_victory_eta_after_acquiring_target(
         if not is_city:
             rem_r = max(0, req_r - dist)
     try:
-        need = strategy_cost_from_components(
-            new_settlements=rem_s,
-            city_upgrades=rem_c,
-            roads=rem_r,
-            dev_cards=req_d,
+        from core.way_resource_need import WayComponents, need_vector_from_components
+
+        need_v = list(
+            need_vector_from_components(
+                WayComponents(
+                    way_id=int(getattr(requirements, "way_id", 0) or 0),
+                    new_settlements=int(rem_s),
+                    city_upgrades=int(rem_c),
+                    roads=int(rem_r),
+                    dev_cards=int(req_d),
+                )
+            )
         )
-        need_v = [float(x) for x in need]
     except Exception:
         need_v = [float(x) for x in (getattr(requirements, "need_vector", None) or [0] * 5)]
     while len(need_v) < 5:
@@ -908,6 +1029,17 @@ def _expand_soft_race_threats(
     except Exception:
         opps = []
     for opp in opps:
+        try:
+            from core.constants import REACHABILITY_MAPS
+            from core.player_reachability import (
+                ensure_reachability_maps,
+                should_maintain_maps,
+            )
+
+            if bool(REACHABILITY_MAPS) and should_maintain_maps(opp):
+                ensure_reachability_maps(game, opp)
+        except Exception:
+            pass
         try:
             roads = _min_empty_roads_to_reach(
                 game, opp, tid, max_depth=int(max_depth)
@@ -1062,7 +1194,10 @@ def attach_timing_pack_to_portfolio(
         # Opponent ETAs on geometry + soft race threats
         if t.threat_opponents:
             t.threat_opponents = _fill_threat_opponent_etas(
-                game, t.threat_opponents, race_target_id=int(t.target_id)
+                game,
+                t.threat_opponents,
+                race_target_id=int(t.target_id),
+                viewer=player,
             )
         # Product 1b / PR-C ETA race upgrade (never lowers geometry/spoiler)
         _upgrade_risk_with_race_eta(t)
@@ -1116,15 +1251,32 @@ def _critical_contested(portfolio):
 
 
 def _portfolio_need_vector(requirements, portfolio):
+    """WP5: Player One costing via way_resource_need.need_vector_from_components."""
     try:
-        from core.strategy_timing import strategy_cost_from_components
+        from core.way_resource_need import WayComponents, need_vector_from_components
+
         road_count = sum(max(0, int(t.distance_roads)) for t in portfolio)
         n_settle = len(portfolio) if requirements.required_new_intersections > 0 else requirements.required_new_intersections
         roads = road_count if requirements.required_new_intersections > 0 else requirements.required_roads_min
-        need = strategy_cost_from_components(new_settlements=n_settle, city_upgrades=requirements.required_cities, roads=roads, dev_cards=requirements.required_dcards)
+        need = need_vector_from_components(
+            WayComponents(
+                way_id=int(getattr(requirements, "way_id", 0) or 0),
+                new_settlements=int(n_settle),
+                city_upgrades=int(requirements.required_cities),
+                roads=int(roads),
+                dev_cards=int(requirements.required_dcards),
+            )
+        )
         shortfall = max(0, requirements.required_new_intersections - len(portfolio))
         if shortfall > 0:
-            extra = strategy_cost_from_components(new_settlements=shortfall, city_upgrades=0, roads=shortfall * 2, dev_cards=0)
+            # Historic portfolio shortfall: assume ~2 roads per missing settle (CSV expand)
+            extra = need_vector_from_components(
+                WayComponents(
+                    way_id=0,
+                    new_settlements=int(shortfall),
+                    roads=int(shortfall * 2),
+                )
+            )
             need = tuple(_safe_float(need[i]) + _safe_float(extra[i]) for i in range(5))
         return [float(x) for x in need]
     except Exception:
@@ -1304,9 +1456,10 @@ def apply_priority_scores(portfolio: Sequence[PortfolioTarget]) -> List[Portfoli
     return out
 
 
-def _recommendation_from_portfolio(portfolio):
+def _recommendation_from_portfolio(portfolio, *, allow_empty_hold: bool = True):
     if not portfolio:
-        return "hold / city-dev path", None
+        # Caller may replace hold with a geo settle tip when residual S remains
+        return ("hold / city-dev path", None) if allow_empty_hold else ("", None)
     # PR-F: prefer priority_score when timing pack has filled it
     has_priority = any(
         isinstance(t, PortfolioTarget) and t.priority_score is not None for t in portfolio
@@ -1367,6 +1520,8 @@ def build_way_geo_bundle(
     current player_state so structure counts stay correct. Callers reuse this
     bundle across hand-only rescoring.
     """
+    # WP5: keep player_state path (csv_minus_count) for geometry parity with P2b cache tests.
+    # Full façade + min-cover is used in estimate_victory_eta_after_acquiring_target.
     req = parse_way_requirements(
         way_id,
         requirements_by_id=requirements_by_id,
@@ -1380,12 +1535,41 @@ def build_way_geo_bundle(
         max_targets=max_targets_per_way,
         max_road_distance=max_road_distance,
     )
+    # Phase P: C/S target screen (mark_only keeps pool; prune filters before combo)
+    screen_meta: Dict[str, Any] = {
+        "mode": "off",
+        "applied": False,
+        "inferior": [],
+        "dropped": [],
+    }
+    try:
+        from core.l2_target_screen import screen_portfolio_targets
+
+        screen_meta = screen_portfolio_targets(
+            game,
+            player,
+            candidates,
+            way_id=int(way_id),
+            requirements=req,
+            default_kind="S",
+        )
+        if screen_meta.get("applied") and screen_meta.get("mode") == "prune":
+            candidates = list(screen_meta.get("kept") or candidates)
+    except Exception as _p_exc:
+        screen_meta = {
+            "mode": "off",
+            "applied": False,
+            "inferior": [],
+            "dropped": [],
+            "reason": f"error:{_p_exc}",
+        }
     portfolios = select_portfolios(candidates, req, max_combos=max_combos) or [[]]
     capped = [list(p) for p in list(portfolios)[: min(12, len(portfolios))]]
     return {
         "way_id": int(way_id),
         "candidates": list(candidates),
         "portfolios": capped,
+        "target_screen": dict(screen_meta),
         "req_structure": (
             int(getattr(req, "required_new_intersections", 0) or 0),
             int(getattr(req, "required_cities", 0) or 0),
@@ -1452,8 +1636,15 @@ def score_way_from_geo_bundle(
         except Exception:
             pass
         rec, rec_id = _recommendation_from_portfolio(portfolio)
+        # Empty city-dev portfolio but way still needs new settles → keep tip open for sticky
+        if rec_id is None and int(getattr(req, "required_new_intersections", 0) or 0) > 0:
+            rec = "need_settle_tip"
+            # Leave rec_id None; strategy_sticky.try_commit_settle_tip_before_specials fills it
+            notes_seed = ["need_settle_tip_residual"]
+        else:
+            notes_seed = []
         rk = _rank_key(board_exp, str(scenario["feasibility"]), str(scenario["fragility"]), fall_c)
-        notes: List[str] = []
+        notes: List[str] = list(notes_seed)
         if rec_id is not None:
             try:
                 top = next(
@@ -1691,6 +1882,13 @@ def build_portfolio_geo_cache_key(
         force = bool(getattr(player, "force_strategy_recalc", False))
     except Exception:
         force = False
+    screen_mode = "off"
+    try:
+        from core.l2_target_screen import l2_target_screen_mode
+
+        screen_mode = str(l2_target_screen_mode(game) or "off")
+    except Exception:
+        screen_mode = "off"
     return (
         gen,
         _safe_int(getattr(player, "id", -1), -1),
@@ -1698,6 +1896,7 @@ def build_portfolio_geo_cache_key(
         _portfolio_board_fingerprint(game),
         _portfolio_sticky_fingerprint(player),
         force,
+        screen_mode,
     )
 
 
@@ -1723,6 +1922,152 @@ def build_portfolio_cache_key(
         tuple(abs_t),
         _portfolio_hand_fingerprint(player),
     )
+
+
+def _l2_flag_str(name: str, default: str = "off") -> str:
+    try:
+        from core import constants as C
+
+        return str(getattr(C, name, default) or default).strip().lower()
+    except Exception:
+        return str(default).strip().lower()
+
+
+def _l2_sync_first_enabled(game: Any = None) -> bool:
+    if game is not None:
+        try:
+            raw = getattr(game, "l2_sync_first", None)
+            if raw is not None and str(raw).strip() != "":
+                return str(raw).strip().lower() in ("on", "true", "1", "yes")
+        except Exception:
+            pass
+    return _l2_flag_str("L2_SYNC_FIRST", "on") in ("on", "true", "1", "yes")
+
+
+def _l2_adaptive_k_enabled(game: Any = None) -> bool:
+    if game is not None:
+        try:
+            raw = getattr(game, "l2_adaptive_k", None)
+            if raw is not None and str(raw).strip() != "":
+                return str(raw).strip().lower() in ("on", "true", "1", "yes")
+        except Exception:
+            pass
+    return _l2_flag_str("L2_ADAPTIVE_K", "on") in ("on", "true", "1", "yes")
+
+
+def _apply_l2_sync_first_cap(
+    game: Any,
+    player: Any,
+    *,
+    eval_ids: Sequence[int],
+    way_ids: Sequence[int],
+    abs_map: Mapping[Any, Any],
+    top_cap: int,
+) -> Dict[str, Any]:
+    """Filter/widen candidate ids to sync-fit, then adaptive K' (plan Phase C/F).
+
+    Hot path: sync only the widened pool (not necessarily all 142). Sticky ids in
+    ``eval_ids`` / ``way_ids`` are preferred when still fit.
+    """
+    meta: Dict[str, Any] = {
+        "applied": False,
+        "reason": "off",
+        "top_cap": int(top_cap),
+        "pool_n": 0,
+        "n_fit": 0,
+        "k_prime": int(top_cap),
+        "adaptive": False,
+        "eval_ids": list(eval_ids),
+        "dropped_unfit": [],
+    }
+    if not _l2_sync_first_enabled(game):
+        return meta
+    if player is None:
+        meta["reason"] = "no_player"
+        return meta
+
+    try:
+        from core import constants as C
+
+        score_all_max = int(getattr(C, "L2_SCORE_ALL_FIT_MAX", 12) or 12)
+    except Exception:
+        score_all_max = 12
+
+    # Widen pool: union of incoming way_ids + abs_map keys, sorted by abstract turns
+    pool: List[int] = []
+    seen = set()
+
+    def _add(wid: Any) -> None:
+        try:
+            i = int(wid)
+        except Exception:
+            return
+        if i <= 0 or i in seen:
+            return
+        seen.add(i)
+        pool.append(i)
+
+    for wid in list(way_ids) + list(eval_ids):
+        _add(wid)
+    # Prefer better abstract turns first when widening from abs_map
+    abs_items = []
+    for k, v in dict(abs_map or {}).items():
+        try:
+            abs_items.append((float(v), int(k)))
+        except Exception:
+            continue
+    abs_items.sort(key=lambda t: (t[0], t[1]))
+    for _t, wid in abs_items:
+        _add(wid)
+        if len(pool) >= max(int(top_cap) * 4, score_all_max, 12):
+            break
+
+    meta["pool_n"] = len(pool)
+    from core.strategy_board_fit import select_fit_ways
+
+    fit_bag = select_fit_ways(game, player, way_ids=pool)
+    fit_set = set(int(x) for x in (fit_bag.get("fit_way_ids") or []))
+    meta["n_fit"] = int(fit_bag.get("n_fit") or len(fit_set))
+    meta["giveup_carve_out"] = bool(fit_bag.get("giveup_carve_out"))
+    meta["dropped_unfit"] = [
+        int(x) for x in (fit_bag.get("unfit_way_ids") or []) if int(x) in seen
+    ]
+
+    # Order fit ids by abstract turns (missing → large)
+    def _abs_t(wid: int) -> float:
+        try:
+            return float(abs_map.get(wid, INFINITE_TURNS))
+        except Exception:
+            return float(INFINITE_TURNS)
+
+    fit_ordered = sorted(fit_set, key=lambda w: (_abs_t(w), int(w)))
+    adaptive = _l2_adaptive_k_enabled(game)
+    meta["adaptive"] = bool(adaptive)
+    n_fit = len(fit_ordered)
+    if adaptive and n_fit <= score_all_max:
+        k_prime = n_fit
+        meta["adaptive_rule"] = "score_all_fit"
+    else:
+        k_prime = min(n_fit, max(1, int(top_cap))) if n_fit else 0
+        meta["adaptive_rule"] = "min_n_fit_stage_k"
+    meta["k_prime"] = int(k_prime)
+
+    # Preserve prior eval order for sticky-like ids that remain fit
+    preferred = [int(x) for x in eval_ids if int(x) in fit_set]
+    rest = [w for w in fit_ordered if w not in set(preferred)]
+    merged = preferred + rest
+    new_eval = merged[: max(int(k_prime), len(preferred))] if merged else []
+    # If sync emptied everything, fall back to prior eval_ids (safety)
+    if not new_eval and eval_ids:
+        meta["reason"] = "all_unfit_fallback"
+        meta["applied"] = True
+        meta["eval_ids"] = list(eval_ids)
+        return meta
+
+    meta["applied"] = True
+    meta["reason"] = "ok"
+    meta["eval_ids"] = list(new_eval)
+    return meta
 
 
 def evaluate_top_ways_board_feasibility(
@@ -1779,10 +2124,26 @@ def evaluate_top_ways_board_feasibility(
     # Cap = stage top_n, but never drop S2 extras already merged into way_ids
     eval_cap = max(int(top_cap), len(way_ids))
     eval_ids = list(way_ids[: int(eval_cap)])
+    sync_first_meta: Dict[str, Any] = {"applied": False, "reason": "not_run"}
+    try:
+        sync_first_meta = _apply_l2_sync_first_cap(
+            game,
+            player,
+            eval_ids=eval_ids,
+            way_ids=way_ids,
+            abs_map=abs_map,
+            top_cap=int(top_cap),
+        )
+        if sync_first_meta.get("applied") and sync_first_meta.get("eval_ids") is not None:
+            eval_ids = list(sync_first_meta.get("eval_ids") or eval_ids)
+    except Exception as _sf_exc:
+        sync_first_meta = {"applied": False, "reason": f"error:{_sf_exc}"}
     try:
         # Stash for dig-in on game (report settings filled by caller)
         if game is not None and isinstance(salvage_t1_meta, dict):
             game._last_salvage_t1_expand = dict(salvage_t1_meta)
+        if game is not None and isinstance(sync_first_meta, dict):
+            game._last_l2_sync_first = dict(sync_first_meta)
     except Exception:
         pass
     score_key = None
@@ -1966,6 +2327,81 @@ def evaluate_top_ways_board_feasibility(
         if game is not None:
             try:
                 game._last_victory_cap_portfolio = dict(_vcap_meta)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Phase D: L2 candidate dossier (transparency dig)
+    try:
+        if game is not None and _l2_flag_str("L2_DOSSIER", "cs") not in (
+            "off",
+            "false",
+            "0",
+            "no",
+            "",
+        ):
+            sf = {}
+            try:
+                sf = dict(getattr(game, "_last_l2_sync_first", None) or {})
+            except Exception:
+                sf = {}
+            scored = []
+            for a in list(audits)[:12]:
+                try:
+                    scored.append(
+                        {
+                            "way_id": int(getattr(a, "way_id", 0) or 0),
+                            "abstract_turns": float(
+                                getattr(a, "abstract_expected_turns", INFINITE_TURNS)
+                                or INFINITE_TURNS
+                            ),
+                            "board_turns": float(
+                                getattr(a, "board_expected_turns", INFINITE_TURNS)
+                                or INFINITE_TURNS
+                            ),
+                            "rank_key": float(
+                                getattr(a, "rank_key", INFINITE_TURNS) or INFINITE_TURNS
+                            ),
+                        }
+                    )
+                except Exception:
+                    continue
+            winner = scored[0]["way_id"] if scored else None
+            runner = scored[1]["way_id"] if len(scored) > 1 else None
+            delta = None
+            if len(scored) > 1:
+                try:
+                    delta = float(scored[1]["board_turns"]) - float(scored[0]["board_turns"])
+                except Exception:
+                    delta = None
+            # Phase P: merge target-screen inferior/dropped from last geo screens
+            tgt_inf: List[Any] = []
+            tgt_drop: List[Any] = []
+            try:
+                ts = dict(getattr(game, "_last_l2_target_screen", None) or {})
+                tgt_inf = list(ts.get("inferior") or [])[:24]
+                tgt_drop = list(ts.get("dropped") or [])[:24]
+            except Exception:
+                tgt_inf, tgt_drop = [], []
+            dossier = {
+                "stage_top_n": int(top_cap),
+                "k_prime": int(sf.get("k_prime") or top_cap),
+                "n_fit": int(sf.get("n_fit") or 0),
+                "sync_first": bool(sf.get("applied")),
+                "adaptive_rule": sf.get("adaptive_rule"),
+                "eval_ids": list(eval_ids),
+                "dropped_unfit": list(sf.get("dropped_unfit") or [])[:24],
+                "targets_inferior": tgt_inf,
+                "targets_dropped": tgt_drop,
+                "scored": scored,
+                "winner": winner,
+                "runner_up": runner,
+                "delta_board_turns": delta,
+            }
+            game._last_l2_way_dossier = dossier
+            # D2: mirror onto player for CS enrichment
+            try:
+                setattr(player, "last_l2_way_dossier", dict(dossier))
             except Exception:
                 pass
     except Exception:
@@ -3589,7 +4025,135 @@ def _apply_board_way_portfolio_layer_impl(
                         getattr(match, "board_expected_turns", None), INFINITE_TURNS
                     ),
                 }
+        # Phase E: observe-only shadow — abstract best among all sync-fit vs L2 eval set
+        try:
+            from core.l2_cap_miss import maybe_run_l2_cap_miss_after_portfolio
+
+            shadow_bag = maybe_run_l2_cap_miss_after_portfolio(
+                game, player, hand_only=bool(hand_only)
+            )
+            if isinstance(shadow_bag, dict) and (
+                shadow_bag.get("ok") or shadow_bag.get("skipped")
+            ):
+                report["l2_cap_miss"] = {
+                    "miss": bool(shadow_bag.get("miss")),
+                    "miss_reason": shadow_bag.get("miss_reason"),
+                    "best_fit_way_id": shadow_bag.get("best_fit_way_id"),
+                    "missed_gain": shadow_bag.get("missed_gain"),
+                    "n_fit": shadow_bag.get("n_fit"),
+                    "skipped": bool(shadow_bag.get("skipped")),
+                    "reason": shadow_bag.get("reason"),
+                }
+        except Exception as _shadow_exc:
+            report["l2_cap_miss"] = {"ok": False, "error": str(_shadow_exc)[:120]}
     except Exception as exc:
         report["board_way_audits"] = []
         report["board_way_audit_error"] = str(exc)
     return report
+
+
+def cs_fields_from_l2_dossier(player: Any = None, game: Any = None) -> Dict[str, Any]:
+    """D2: compact CS fields from last L2 candidate dossier.
+
+    Fields: ``l2_eval_way_ids``, ``l2_fit_n``, ``l2_top_n``, ``l2_winner``,
+    ``l2_runner_up``. Empty/None when dossier off or missing.
+    """
+    out: Dict[str, Any] = {
+        "l2_eval_way_ids": None,
+        "l2_fit_n": None,
+        "l2_top_n": None,
+        "l2_winner": None,
+        "l2_winner_id": None,
+        "l2_applied": None,
+        "l2_runner_up": None,
+        "l2_tgt_inf_n": None,
+        "l2_tgt_drop_n": None,
+    }
+    # Gate on L2_DOSSIER flag
+    try:
+        from core import constants as C
+
+        mode = str(getattr(C, "L2_DOSSIER", "cs") or "off").strip().lower()
+        if mode in ("off", "false", "0", "no", ""):
+            return out
+        if game is not None:
+            raw = getattr(game, "l2_dossier", None)
+            if raw is not None and str(raw).strip() != "":
+                mode = str(raw).strip().lower()
+                if mode in ("off", "false", "0", "no"):
+                    return out
+    except Exception:
+        pass
+
+    bag = None
+    if player is not None:
+        bag = getattr(player, "last_l2_way_dossier", None)
+    if not isinstance(bag, Mapping) and game is not None:
+        try:
+            bag = getattr(game, "_last_l2_way_dossier", None)
+        except Exception:
+            bag = None
+    if not isinstance(bag, Mapping):
+        return out
+
+    eval_ids = []
+    for x in list(bag.get("eval_ids") or [])[:24]:
+        try:
+            i = int(x)
+            if i > 0:
+                eval_ids.append(i)
+        except Exception:
+            continue
+    out["l2_eval_way_ids"] = eval_ids or None
+    try:
+        nf = bag.get("n_fit")
+        out["l2_fit_n"] = int(nf) if nf is not None else None
+    except Exception:
+        out["l2_fit_n"] = None
+    try:
+        # Prefer k_prime (adaptive); fall back to stage_top_n
+        kt = bag.get("k_prime")
+        if kt is None:
+            kt = bag.get("stage_top_n")
+        out["l2_top_n"] = int(kt) if kt is not None else None
+    except Exception:
+        out["l2_top_n"] = None
+    try:
+        w = bag.get("winner")
+        out["l2_winner"] = int(w) if w is not None else None
+        out["l2_winner_id"] = out["l2_winner"]
+    except Exception:
+        out["l2_winner"] = None
+        out["l2_winner_id"] = None
+    try:
+        r = bag.get("runner_up")
+        out["l2_runner_up"] = int(r) if r is not None else None
+    except Exception:
+        out["l2_runner_up"] = None
+    try:
+        out["l2_tgt_inf_n"] = len(list(bag.get("targets_inferior") or []))
+    except Exception:
+        out["l2_tgt_inf_n"] = None
+    try:
+        out["l2_tgt_drop_n"] = len(list(bag.get("targets_dropped") or []))
+    except Exception:
+        out["l2_tgt_drop_n"] = None
+    # WP-DIG2: whether sticky/direction adopted the L2 winner
+    try:
+        applied = None
+        if player is not None:
+            applied = getattr(player, "l2_applied", None)
+            if applied is None:
+                sticky = getattr(player, "sticky_commitment", None) or {}
+                locked = None
+                if isinstance(sticky, Mapping):
+                    locked = sticky.get("locked_way_id")
+                d = getattr(player, "strategic_direction", None) or {}
+                if locked is None and isinstance(d, Mapping):
+                    locked = d.get("preferred_way_id") or d.get("way_id")
+                if out["l2_winner"] is not None and locked is not None:
+                    applied = int(locked) == int(out["l2_winner"])
+        out["l2_applied"] = applied
+    except Exception:
+        out["l2_applied"] = None
+    return out

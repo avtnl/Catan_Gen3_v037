@@ -68,10 +68,8 @@ STR_FIELDS: Tuple[Tuple[str, str], ...] = (
     ("Given up", "_given_up"),
     ("Sticky", "_sticky_chip"),  # S62 / C62 combined
     ("Rec tgt", "rec_target_id"),
-    ("ETA", "_eta_hdr"),
-    ("  plan", "_eta_plan"),
-    ("  prev", "_eta_prev"),
-    ("  Dt", "_eta_delta"),
+    # Dig §5: ETA-Table drawn as a block (see draw_str_eta_block) — markers only
+    ("ETA-Table", "_eta_block"),
 )
 
 # Alias: old PLAN_FIELDS name → STR (legacy); PLN2 uses catalog helpers
@@ -378,59 +376,16 @@ def field_raw(row: Mapping[str, Any], key: str) -> str:
         except Exception:
             tid = parse_se_cell(row.get("sticky_target_id", ""))
             return tid or "—"
-    # refinements v1 STR ETA: Type | ETA-old | ETA-update | Dt
-    if key == "_eta_hdr":
-        return "Type     ETA-old  ETA-upd  Dt"
-    if key == "_eta_plan":
-        plan_new = None
+    # WP-J STR ETA-Table: Type | Old | New | △t (static model; rows/cursor filled in display)
+    if key in ("_eta_hdr", "_eta_plan", "_eta_prev", "_eta_delta"):
         try:
-            from core.strategy_plan_snapshot import _plan_eta_from_pln2_sticky
+            from core.strategy_plan_snapshot import format_str_eta_table_line
 
-            plan_new = _plan_eta_from_pln2_sticky(row)
+            return format_str_eta_table_line(key, row) or "—"
         except Exception:
-            plan_new = None
-        old = parse_se_cell(row.get("turns", ""))
-        new_s = f"{plan_new}" if plan_new is not None else old
-        try:
-            old_f = float(old) if old not in ("", "—") else None
-            new_f = float(plan_new) if plan_new is not None else old_f
-            dt = (
-                round(float(new_f) - float(old_f), 1)
-                if old_f is not None and new_f is not None
-                else None
-            )
-        except Exception:
-            dt = None
-        dt_s = "—" if dt is None else f"{dt:+.1f}" if dt != 0 else "0"
-        return f"Plan     {old or '—':<8} {new_s or '—':<8} {dt_s}"
-    if key == "_eta_prev":
-        old = parse_se_cell(row.get("prev_turns", ""))
-        # update: prefer last stored prev; delta_turns vs plan if present
-        new = old
-        stored = parse_se_cell(row.get("delta_turns", ""))
-        dt_s = stored if stored != "" else "—"
-        try:
-            if stored != "":
-                dt_s = f"{float(stored):+.1f}" if float(stored) != 0 else "0"
-        except Exception:
-            pass
-        return f"Previous {old or '—':<8} {new or '—':<8} {dt_s}"
+            return "—"
     if key == "_eta_tgt":
         return ""  # removed from STR (refinements)
-    if key == "_eta_delta":
-        # Summary Dt line: plan update − previous (green/red painted separately)
-        try:
-            from core.strategy_plan_snapshot import _plan_eta_from_pln2_sticky
-
-            plan_v = _plan_eta_from_pln2_sticky(row)
-            prev_v = float(row.get("prev_turns"))
-            if plan_v is not None:
-                d = round(float(plan_v) - float(prev_v), 1)
-                return f"Dt       {d:+.1f}" if d != 0 else "Dt       0"
-        except Exception:
-            pass
-        stored = parse_se_cell(row.get("delta_turns", ""))
-        return f"Dt       {stored}" if stored != "" else "Dt       —"
     if key == "_race_ba_note":
         # Dig-time note from CS risk + sticky roads / target
         risk_raw = str(parse_se_cell(row.get("risk_level", "")) or "").lower()
@@ -588,6 +543,16 @@ def display_field_at_cursor(
     if cursor < 0 or cursor >= len(rows):
         return {"text": "—", "color": COLOR_BLACK, "ref": None, "omitted": True}
     row = value_row if value_row is not None else rows[cursor]
+    # Dig §5: ETA block is drawn by draw_str_eta_block (not label: value)
+    if field_key in ("_eta_block", "_eta_hdr", "_eta_plan", "_eta_prev", "_eta_delta"):
+        return {
+            "text": "",
+            "color": COLOR_BLACK,
+            "ref": None,
+            "change_index": None,
+            "omitted": field_key == "_eta_block",
+            "l2_row": is_l2_refresh_row(row),
+        }
     # WP5 dynamic PLAN/WHY2 lines (not SE field history)
     dyn = dynamic_plan_text(row, field_key)
     if dyn is not None:
@@ -654,8 +619,16 @@ def display_field_at_cursor(
     if field_key in ("_plan_placeholder", "_why2_placeholder"):
         ref = None
 
-    # Refinements v1: STR Dt colours (after nav tint) — green if ≤0 else red
-    if field_key in ("_eta_delta", "_eta_plan", "_eta_prev") and not in_force_empty:
+    # Plan / Previous ETA body: black normally, red only when this row changed
+    # (no green/blue wash from the trailing Dt token).
+    if field_key in ("_eta_plan", "_eta_prev"):
+        if last_nav == NAV_STEP and chg_i is not None and chg_i == cursor:
+            color = COLOR_RED
+        else:
+            color = COLOR_BLACK
+
+    # Dedicated Dt line only: green if ≤0 else red.
+    if field_key == "_eta_delta" and not in_force_empty:
         try:
             from core.strategy_pln_words import dt_color_favourable
 
@@ -971,6 +944,197 @@ def _fit_cell(font: Any, text: str, max_w: int) -> str:
     return s + "…" if s else ""
 
 
+def _blit_eta_line_with_triangle_t(
+    screen: pygame.Surface,
+    font: Any,
+    text: str,
+    color: Tuple[int, int, int],
+    *,
+    x: int,
+    y: int,
+) -> None:
+    """Blit ETA line; draw a real triangle+t where △t would tofu as □t."""
+    # Prefer splitting on △t mark from format_str_eta_table_line
+    mark = "△t"
+    if mark not in text:
+        # Legacy / missing glyph already replaced
+        screen.blit(font.render(str(text)[:78], True, color), (x, y))
+        return
+    left, _, right = str(text).partition(mark)
+    cx = x
+    if left:
+        surf = font.render(left, True, color)
+        screen.blit(surf, (cx, y))
+        cx += surf.get_width()
+    # Upward triangle (Dig §5: triangle+t, not square tofu)
+    tri_h = max(7, int(getattr(font, "get_height", lambda: 12)() * 0.55))
+    tri_w = max(6, int(tri_h * 0.9))
+    # baseline-ish vertical align
+    top = y + max(1, (font.get_height() - tri_h) // 2)
+    pygame.draw.polygon(
+        screen,
+        color,
+        [
+            (cx + tri_w // 2, top),
+            (cx, top + tri_h),
+            (cx + tri_w, top + tri_h),
+        ],
+    )
+    cx += tri_w + 1
+    screen.blit(font.render("t" + right, True, color), (cx, y))
+
+
+def _blit_dt_value_with_tone_dot(
+    screen: pygame.Surface,
+    font: Any,
+    text: str,
+    *,
+    x: int,
+    y: int,
+    max_w: int,
+    tone: str = "",
+) -> None:
+    """Black △t/Dt number with a small green/red circle behind it (STR + PLN2)."""
+    black = COLORS.get("BLACK", (0, 0, 0))
+    green = COLORS.get("GREEN", (0, 160, 0))
+    txt = _fit_cell(font, str(text or ""), max(8, int(max_w) - 2))
+    surf = font.render(txt, True, black)
+    tw, th = surf.get_width(), surf.get_height()
+    # Dot sits behind the number (slightly larger than text height)
+    radius = max(5, min(9, th // 2 + 2))
+    cx = x + max(radius, tw // 2)
+    cy = y + max(radius, th // 2)
+    if tone == "green":
+        pygame.draw.circle(screen, green, (cx, cy), radius)
+    elif tone == "red":
+        pygame.draw.circle(screen, COLOR_RED, (cx, cy), radius)
+    # Center black text over the dot
+    tx = cx - tw // 2
+    ty = cy - th // 2
+    screen.blit(surf, (tx, ty))
+
+
+def draw_str_eta_block(
+    screen: pygame.Surface,
+    row: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+    cursor: int,
+    *,
+    x: int,
+    y: int,
+    width: int,
+    body_bottom: int,
+    small: Any,
+    bold: Any,
+    last_nav: str = "",
+) -> int:
+    """Dig §5 STR ETA-Table — same Dig font + column layout style as PLN2."""
+    black = COLORS.get("BLACK", (0, 0, 0))
+    dgray = COLORS.get("DGRAY", (80, 80, 80))
+    line_h = 14
+    try:
+        from core.strategy_plan_snapshot import str_eta_table_model
+        from core.strategy_pln_words import dt_color_favourable
+    except Exception as exc:
+        screen.blit(small.render(f"ETA-Table error: {exc}"[:60], True, COLOR_RED), (x, y))
+        return y + line_h
+
+    if y + line_h <= body_bottom:
+        screen.blit(bold.render("ETA-Table", True, black), (x, y))
+        y += line_h
+
+    # Match PLN1/PLN2 density: compact fixed-ish columns (don't stretch across panel).
+    # PLN2 uses ~0.10–0.14 fractions over full width (~7 cols); 4 stretched cols look sparse.
+    panel_usable = max(80, int(width) - 4)
+    # Target ~PLN2 column pixel width (~48–56px for short numeric headers)
+    col_w = [52, 56, 56, 52]
+    table_w = sum(col_w)
+    if table_w > panel_usable:
+        scale = panel_usable / float(table_w)
+        col_w = [max(28, int(w * scale)) for w in col_w]
+        col_w[-1] = max(36, panel_usable - sum(col_w[:-1]))
+
+    model = str_eta_table_model(row, rows=rows, cursor=cursor)
+    table_rows: List[Tuple[Sequence[str], bool, Optional[str]]] = [
+        (("Type", "Old", "New", "△t"), True, None),
+        (
+            (
+                "Plan",
+                _fmt_eta_cell(model.get("plan_old")),
+                _fmt_eta_cell(model.get("plan_new")),
+                _fmt_eta_dt_cell(model.get("plan_dt")),
+            ),
+            False,
+            _fmt_eta_dt_cell(model.get("plan_dt")),
+        ),
+        (
+            (
+                "Prev",
+                _fmt_eta_cell(model.get("prev_old")),
+                _fmt_eta_cell(model.get("prev_new")),
+                _fmt_eta_dt_cell(model.get("prev_dt")),
+            ),
+            False,
+            _fmt_eta_dt_cell(model.get("prev_dt")),
+        ),
+    ]
+
+    for cells, is_hdr, dt_for_color in table_rows:
+        if y + line_h > body_bottom:
+            break
+        font = bold if is_hdr else small
+        cx = x
+        for i, cell in enumerate(cells):
+            w = col_w[i] if i < len(col_w) else 40
+            col = dgray if is_hdr else black
+            cell_s = str(cell or "")
+            if is_hdr and i == 3:
+                _blit_eta_line_with_triangle_t(
+                    screen, font, "△t", col, x=cx, y=y
+                )
+            elif not is_hdr and i == 3:
+                tone = ""
+                try:
+                    tone = dt_color_favourable(dt_for_color) if dt_for_color is not None else ""
+                except Exception:
+                    tone = ""
+                _blit_dt_value_with_tone_dot(
+                    screen,
+                    font,
+                    cell_s,
+                    x=cx,
+                    y=y,
+                    max_w=w,
+                    tone=tone,
+                )
+            else:
+                screen.blit(
+                    font.render(_fit_cell(font, cell_s, w - 2), True, col),
+                    (cx, y),
+                )
+            cx += w
+        y += line_h
+    return y
+
+
+def _fmt_eta_cell(v: Any) -> str:
+    try:
+        from core.strategy_plan_snapshot import _fmt_eta_num
+
+        return _fmt_eta_num(v)
+    except Exception:
+        return "—" if v is None else str(v)
+
+
+def _fmt_eta_dt_cell(v: Any) -> str:
+    try:
+        from core.strategy_plan_snapshot import _fmt_eta_dt
+
+        return _fmt_eta_dt(v)
+    except Exception:
+        return "—" if v is None else str(v)
+
+
 def draw_pln1_panel(
     screen: pygame.Surface,
     row: Mapping[str, Any],
@@ -1015,12 +1179,21 @@ def draw_pln1_panel(
     col_w[-1] = max(40, usable - sum(col_w[:-1]))
     headers = tbl.get("headers") or ("Comp", "Tag", "Need", "Why", "Target")
 
-    def _blit_row(cells: Sequence[str], yy: int, *, header: bool = False):
+    def _blit_row(
+        cells: Sequence[str],
+        yy: int,
+        *,
+        header: bool = False,
+        row_red: bool = False,
+    ):
         font = bold if header else small
         cx = x
         for i, cell in enumerate(cells):
             w = col_w[i] if i < len(col_w) else 40
             col = dgray if header else black
+            # Dig §6: priority Buy/Build component row(s) entirely in red
+            if row_red and not header:
+                col = COLOR_RED
             txt = _fit_cell(font, str(cell), w - 2)
             screen.blit(font.render(txt, True, col), (cx, yy))
             cx += w
@@ -1028,43 +1201,28 @@ def draw_pln1_panel(
     if y + line_h <= body_bottom:
         _blit_row(list(headers), y, header=True)
         y += line_h
+    # Dig §6: component rows only through R/DC — never Now/Also/Parked/New,
+    # and never a prose banner below R/DC.
     for r in tbl.get("rows") or []:
         if y + line_h > body_bottom:
             break
         if r.get("spacer"):
-            y += line_h // 2
+            continue
+        comp = str(r.get("comp") or "").strip()
+        # Skip legacy Comp=New rows if any still appear in older table builders
+        if not comp or comp.lower() == "new":
             continue
         cells = [
-            str(r.get("comp") or ""),
+            comp,
             str(r.get("tag") or ""),
             str(r.get("need") or ""),
             str(r.get("why") or ""),
             str(r.get("target") or ""),
         ]
-        # Red next-buy/build line (refinements): put label in Need column span
-        if r.get("red") and r.get("need"):
-            font = bold
-            screen.blit(
-                font.render(_fit_cell(font, str(r.get("need")), max(40, usable - 4)), True, COLOR_RED),
-                (x, y),
-            )
-            y += line_h
-            continue
-        _blit_row(cells, y)
+        # Dig §6: paint priority Buy/Build component row(s) red (not a banner)
+        row_red = str(r.get("prio") or "").strip().lower() in ("1", "true", "yes")
+        _blit_row(cells, y, row_red=row_red)
         y += line_h
-    # Now / Also after table — skip redundant DC focus line (table covers it)
-    try:
-        from core.strategy_pln1 import pln1_lines_for_dig
-
-        for lab, txt in pln1_lines_for_dig(row):
-            if lab in ("Way", "DC"):
-                continue
-            if y + line_h > body_bottom:
-                break
-            screen.blit(small.render(f"{lab}: {txt}", True, black), (x, y))
-            y += line_h
-    except Exception:
-        pass
     return y
 
 
@@ -1119,12 +1277,11 @@ def draw_pln2_table(
     col_w = [max(28, int(usable * f)) for f in fracs]
     # Fix rounding drift on last column
     col_w[-1] = max(40, usable - sum(col_w[:-1]))
-    headers = tbl.get("headers") or ("New", "Tgt", "ETA", "Dist", "Risk", "Δt", "Why")
+    headers = tbl.get("headers") or ("New", "Tgt", "ETA", "Dist", "Risk", "△t", "Why")
 
     def _blit_row(cells: Sequence[str], yy: int, *, se: bool = False, header: bool = False):
         font = bold if header or se else small
         cx = x
-        green = COLORS.get("GREEN", (0, 160, 0))
         for i, cell in enumerate(cells):
             w = col_w[i] if i < len(col_w) else 40
             # SE pick: red on New (col 0) and Why (col 6)
@@ -1132,23 +1289,34 @@ def draw_pln2_table(
                 col = COLOR_RED
             elif header:
                 col = dgray
-            elif i == 5 and not header:  # Δt / Dt column
+            else:
+                col = black
+            # Header △t: drawn triangle+t; value: black text + green/red dot behind
+            cell_s = str(cell or "")
+            if header and i == 5 and ("△" in cell_s or cell_s.strip() in ("△t", "Δt", "Dt")):
+                _blit_eta_line_with_triangle_t(
+                    screen, font, "△t", col, x=cx, y=yy
+                )
+            elif not header and i == 5:
+                tone = ""
                 try:
                     from core.strategy_pln_words import dt_color_favourable
 
-                    tone = dt_color_favourable(cell)
-                    if tone == "green":
-                        col = green
-                    elif tone == "red":
-                        col = COLOR_RED
-                    else:
-                        col = black
+                    tone = dt_color_favourable(cell_s, invert=False)
                 except Exception:
-                    col = black
+                    tone = ""
+                _blit_dt_value_with_tone_dot(
+                    screen,
+                    font,
+                    cell_s,
+                    x=cx,
+                    y=yy,
+                    max_w=w,
+                    tone=tone,
+                )
             else:
-                col = black
-            txt = _fit_cell(font, cell, w - 2)
-            screen.blit(font.render(txt, True, col), (cx, yy))
+                txt = _fit_cell(font, cell_s, w - 2)
+                screen.blit(font.render(txt, True, col), (cx, yy))
             cx += w
 
     if y + line_h <= body_bottom:
@@ -1281,6 +1449,22 @@ def draw_se_dig_panel(
         for label, key in fields_for_tab(cur_tab, row):
             if y + line_h > body_bottom:
                 break
+            # Dig §5: ETA-Table is a dedicated block (no "Plan: Plan …" duplication)
+            if key == "_eta_block":
+                y = draw_str_eta_block(
+                    screen,
+                    row,
+                    rows,
+                    cursor,
+                    x=x,
+                    y=y,
+                    width=rect.width - 16,
+                    body_bottom=body_bottom,
+                    small=small,
+                    bold=bold,
+                    last_nav=str(dig.last_nav or ""),
+                )
+                continue
             info = display_field_at_cursor(
                 rows, cursor, key, last_nav=dig.last_nav, value_row=row
             )
@@ -1296,7 +1480,10 @@ def draw_se_dig_panel(
                     star = " (*)" if refs.index(ref) == 0 else " (**)"
                 else:
                     star = f" ({ref})"
-            line = f"{label}: {text}{star}"
+            if str(label or "").strip():
+                line = f"{label}: {text}{star}"
+            else:
+                line = f"{text}{star}"
             screen.blit(small.render(line[:78], True, col), (x, y))
             y += line_h
         if refs:
@@ -1452,6 +1639,40 @@ def mark_jump_nav(dig: DigUiState) -> None:
     dig.last_nav = NAV_JUMP
 
 
+def _player_for_row(game: Any, row: Mapping[str, Any]) -> Any:
+    """Resolve Dig row seat on *game* (for map rebuild / live Show)."""
+    if game is None or not row:
+        return None
+    try:
+        pid = int(float(row.get("player_id")))
+    except Exception:
+        return None
+    for p in list(getattr(game, "players", []) or []):
+        if p is None:
+            continue
+        try:
+            if int(getattr(p, "id", -1) or -1) == int(pid):
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def ensure_dig_row_reachability(game: Any, row: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """WP-R5: rebuild reachability maps for the Dig-visible seat (incl. humans)."""
+    if game is None or not row:
+        return {"ok": False, "reason": "no_game_or_row"}
+    player = _player_for_row(game, row)
+    if player is None:
+        return {"ok": False, "reason": "no_player"}
+    try:
+        from core.player_reachability import ensure_dig_seat_maps
+
+        return ensure_dig_seat_maps(game, player)
+    except Exception as exc:
+        return {"ok": False, "reason": str(exc)}
+
+
 def plan_show_circles_from_row(
     row: Optional[Mapping[str, Any]],
     *,
@@ -1462,9 +1683,19 @@ def plan_show_circles_from_row(
 
     Refinements v1 Q6: **no circles on occupied** intersections (already
     settled/citied on the replay board).
+
+    WP-R5: when a live ``game`` is present, rebuild Dig-seat reachability maps
+    and stamp ``map_dist`` / ``dist`` from maps onto settle circles (radius is
+    still applied at draw via ``radius_for_show(..., path_distance=)``).
+    Road overlays remain future — circles only.
     """
     if not row:
         return []
+    # Dig scrub: freshen maps for this seat (AI + human)
+    try:
+        ensure_dig_row_reachability(game, row)
+    except Exception:
+        pass
     try:
         from core.strategy_plan_snapshot import parse_plan_show
 
@@ -1486,6 +1717,7 @@ def plan_show_circles_from_row(
     except Exception:
         occupied = set()
     out: List[Dict[str, Any]] = []
+    player = _player_for_row(game, row) if game is not None else None
     for c in raw:
         kind = str(c.get("kind") or "settle").lower()
         if kind in ("city", "road", "next_road", "tfr", "c"):
@@ -1497,10 +1729,27 @@ def plan_show_circles_from_row(
                 tid = None
             if tid is not None and tid in occupied:
                 continue
+            entry = dict(c)
             if kind == "s":
-                c = dict(c)
-                c["kind"] = "settle"
-            out.append(c)
+                entry["kind"] = "settle"
+            # Stamp map hop dist for settle circles when maps are fresh
+            if (
+                player is not None
+                and tid is not None
+                and str(entry.get("kind") or "").lower() in ("settle", "s")
+            ):
+                try:
+                    from core.player_reachability import maps_are_fresh, sc_hop_distance
+
+                    if maps_are_fresh(player):
+                        hop = sc_hop_distance(player, int(tid))
+                        if hop is not None:
+                            entry["map_dist"] = int(hop)
+                            if hop in (2, 3):
+                                entry["dist"] = int(hop)
+                except Exception:
+                    pass
+            out.append(entry)
     return out
 
 
@@ -1517,6 +1766,8 @@ def draw_plan_show_circles(
 
     P1: radius from ``radius_for_show(turn_color, owner_color)`` matrix —
     **ignores** any baked radius in ``plan_show`` CS (stops same-color drift).
+    WP-R5: optional ``path_distance`` (``map_dist`` / ``dist`` / ``roads_needed``)
+    soft-modulates seat rings (d=3 → +2px). No road overlays yet.
     Own sites use turn-player color; ``opp`` rings when encoded (risk M/H).
     """
     if not circles:
@@ -1524,7 +1775,9 @@ def draw_plan_show_circles(
     try:
         from core.strategy_plan_snapshot import radius_for_show
     except Exception:
-        def radius_for_show(turn_color: Any, owner_color: Any) -> int:  # type: ignore
+        def radius_for_show(  # type: ignore
+            turn_color: Any, owner_color: Any, *, path_distance: Any = None
+        ) -> int:
             return 5
 
     pos_map = positions
@@ -1592,8 +1845,19 @@ def draw_plan_show_circles(
                 color_name = ""
         if kind != "opp" and not color_name:
             color_name = turn_color
-        # P1: never trust CS baked radius — matrix only
-        rad = int(radius_for_show(turn_color, color_name or turn_color))
+        # P1: never trust CS baked radius — matrix (+ optional WP-R5 dist)
+        path_d = (
+            c.get("map_dist")
+            if c.get("map_dist") is not None
+            else c.get("dist")
+            if c.get("dist") is not None
+            else c.get("roads_needed")
+        )
+        rad = int(
+            radius_for_show(
+                turn_color, color_name or turn_color, path_distance=path_d
+            )
+        )
         rgb = _rgb(color_name or turn_color)
         try:
             pygame.draw.circle(screen, rgb, (cx, cy), rad, 2)
@@ -1632,6 +1896,7 @@ __all__ = [
     "dynamic_plan_text",
     "plan_show_circles_from_row",
     "draw_plan_show_circles",
+    "ensure_dig_row_reachability",
     "dig_panel_rect",
     "dig_nav_rects",
     "cat_field_rects",

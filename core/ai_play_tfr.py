@@ -1122,17 +1122,76 @@ def attach_free_road_path(
 
     road_ids: List[List[int]] = []
     seen = set()
-    for raw in roads_raw:
+
+    def _push(raw: Any) -> bool:
         if len(road_ids) >= free_n:
-            break
+            return False
         rid = _normalize_road_id(raw)
         if rid is None:
-            continue
+            return False
         key = tuple(rid)
         if key in seen:
-            continue
+            return False
         seen.add(key)
         road_ids.append(rid)
+        return True
+
+    for raw in roads_raw:
+        if not _push(raw):
+            if len(road_ids) >= free_n:
+                break
+
+    # WP-TFR1: fill both free-road slots when the *same* path family has more
+    # tips. Never pad an explicit features_override. Never mix LR-project tips
+    # with unrelated strategic_direction noise (S-LR-B contract).
+    allow_pad = source not in ("features_override",) and len(road_ids) < free_n
+    if allow_pad and source == "slr_lr_project":
+        try:
+            from core.ai_lr_project import remaining_lr_project_roads
+
+            before = len(road_ids)
+            for raw in remaining_lr_project_roads(game, player) or []:
+                _push(raw)
+                if len(road_ids) >= free_n:
+                    break
+            if len(road_ids) > before:
+                source = "slr_lr_project+pad"
+        except Exception as exc:
+            warnings.append(f"tfr_lr_pad_error: {exc}")
+    elif allow_pad and not str(source).startswith("slr_lr_project"):
+        # Settle / direction / planner family: pad within that family
+        before = len(road_ids)
+        for raw in _roads_from_direction(player):
+            _push(raw)
+            if len(road_ids) >= free_n:
+                break
+        if len(road_ids) < free_n:
+            try:
+                from core.ai_road_planner import build_ai_road_plan
+
+                candidates = _legal_road_candidates(game, player)
+                pad_plan = build_ai_road_plan(game, player, candidates) or {}
+                for raw in list(pad_plan.get("roads_to_build") or []):
+                    _push(raw)
+                    if len(road_ids) >= free_n:
+                        break
+                if pad_plan.get("next_road") is not None:
+                    _push(pad_plan.get("next_road"))
+            except Exception as exc:
+                warnings.append(f"tfr_pad_planner_error: {exc}")
+        if len(road_ids) < free_n:
+            try:
+                for cand in _legal_road_candidates(game, player):
+                    raw = None
+                    if isinstance(cand, Mapping):
+                        raw = cand.get("road") or cand.get("road_id") or cand.get("edge")
+                    _push(raw if raw is not None else cand)
+                    if len(road_ids) >= free_n:
+                        break
+            except Exception as exc:
+                warnings.append(f"tfr_legal_pad_error: {exc}")
+        if len(road_ids) > before:
+            source = f"{source}+pad"
 
     target_id = None
     try:
@@ -1149,6 +1208,8 @@ def attach_free_road_path(
     plan["road_path_ok"] = bool(road_ids)
     plan["target_settlement_id"] = target_id
     plan["play"] = True  # never cancel on weak path
+    if free_n >= 2 and len(road_ids) < free_n:
+        warnings.append(f"tfr_underfilled:{len(road_ids)}/{free_n}")
 
     if not road_ids:
         warnings.append("play_without_perfect_path")

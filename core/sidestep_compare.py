@@ -15,12 +15,13 @@ from core.sidestep_eta_matrix import (
     side_with_confidence,
 )
 
-# Dig cadence ≈ L2 product ``EXPLICIT_142_RECALC_PRODUCT_AI = [2, [4, 4]]``
+# Dig cadence ≈ opt-in schedule ``EXPLICIT_142_RECALC_SCHEDULE_SETBACK_EVERY4``
 # code-4 grid **plus R1 baseline**: own turns 1,4,8,12,… ≈ R1/R4/R8/R12/…
 # (R1 is dig-only; code 4 alone would skip turn 1. Code 2 setback not mirrored.)
+# Product L2 default is now [0] (a/b/c only); Sidestep dig still uses every-4.
 # Sidestep runs for the **seat to move only** (never a 4-seat matrix fan-out).
 
-SIDESTEP_EVERY_N_OWN_TURNS: int = 4  # matches PRODUCT_AI [4, 4]
+SIDESTEP_EVERY_N_OWN_TURNS: int = 4  # matches schedule [4, 4]
 SIDESTEP_INCLUDE_OWN_TURN_1: bool = True  # R1 baseline → R1/R4/R8/R12/…
 
 CHECKPOINT_PHASE = {
@@ -38,11 +39,14 @@ CHECKPOINT_LABEL = {
 
 def sidestep_every_n_own_turns() -> int:
     try:
-        from core.explicit_142_recalc import EXPLICIT_142_RECALC_PRODUCT_AI
-        from core.explicit_142_recalc import every_n_periods, normalize_explicit_142_recalc
+        from core.explicit_142_recalc import (
+            EXPLICIT_142_RECALC_SCHEDULE_SETBACK_EVERY4,
+            every_n_periods,
+            normalize_explicit_142_recalc,
+        )
 
         periods = every_n_periods(
-            normalize_explicit_142_recalc(EXPLICIT_142_RECALC_PRODUCT_AI)
+            normalize_explicit_142_recalc(EXPLICIT_142_RECALC_SCHEDULE_SETBACK_EVERY4)
         )
         if periods:
             return max(1, int(periods[0]))

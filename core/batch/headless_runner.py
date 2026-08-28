@@ -127,6 +127,7 @@ class HeadlessGameRunner:
         arm_name: Optional[str] = None,
         la_soft_bias: Optional[str] = None,
         sidestep_s142_drive: Optional[bool] = None,
+        perf_mode: Optional[str] = None,
     ) -> None:
         self.sequence_number = int(sequence_number)
         self.max_round_override = max_round
@@ -156,6 +157,7 @@ class HeadlessGameRunner:
         self.sidestep_s142_drive = (
             bool(sidestep_s142_drive) if sidestep_s142_drive is not None else None
         )
+        self.perf_mode = str(perf_mode).strip() if perf_mode else None
         # Backward-compatible: verbose=False ≈ quieter (WARN) if log_level unset
         # and process threshold was not already configured by CLI.
         self.verbose = bool(verbose)
@@ -361,6 +363,18 @@ class HeadlessGameRunner:
                 self._log("headless: SIDESTEP_S142_DRIVE on", level=console.INFO)
         except Exception:
             pass
+        # Performance dig pack (lean vs full) — stamp game attrs
+        try:
+            if self.perf_mode:
+                from core.batch.perf_mode import apply_perf_mode_to_game
+
+                apply_perf_mode_to_game(game, self.perf_mode)
+                self._log(
+                    f"headless: perf_mode={self.perf_mode}",
+                    level=console.INFO,
+                )
+        except Exception as exc:
+            self._log(f"headless: perf_mode apply failed: {exc}", level=console.WARN)
         # WP-R6: override per-seat explicit_142_recalc (CLI / arm) after Game defaults
         if self.explicit_142_recalc_by_seat is not None:
             try:

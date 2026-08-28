@@ -79,70 +79,13 @@ def select_sync_fit_ways(
 ) -> Dict[str, Any]:
     """Return sync-fit way ids under the normative board-sync model.
 
-    1. Strict ``can_realize_way`` (buildings, held LA/LR, VP, LA/LR feasibility).
-    2. If **no** strict fits and seat has give-up LA/LR → carve-out re-score
-       (same rule as live portfolio filter; buildings+VP never waived).
-    3. Soft/unknown ways count as fit (predicate contract).
+    Thin wrapper over ``strategy_board_fit.select_fit_ways`` (shared with L2
+    sync-first). Default ``way_ids`` = full catalog via ``all_way_ids``.
     """
-    from core.strategy_board_fit import ignored_specials_from_player
+    from core.strategy_board_fit import select_fit_ways
 
-    ids = [int(x) for x in (way_ids if way_ids is not None else all_way_ids())]
-    out: Dict[str, Any] = {
-        "ok": True,
-        "n_total": len(ids),
-        "fit_way_ids": [],
-        "unfit_way_ids": [],
-        "n_fit": 0,
-        "n_unfit": 0,
-        "giveup_carve_out": False,
-        "ignored_specials": [],
-        "all_unfit": False,
-        "by_way": {},
-    }
-    if player is None:
-        out["ok"] = False
-        out["error"] = "no_player"
-        return out
-
-    strict_fit: List[int] = []
-    strict_unfit: List[int] = []
-    by_way: Dict[int, Dict[str, Any]] = {}
-    for wid in ids:
-        r = evaluate_sidestep_way_sync(wid, player, game, allow_ignored_specials=None)
-        by_way[wid] = dict(r)
-        if _way_passes(r):
-            strict_fit.append(wid)
-        else:
-            strict_unfit.append(wid)
-
-    fit_ids = list(strict_fit)
-    unfit_ids = list(strict_unfit)
-    carve = ignored_specials_from_player(player)
-    if unfit_ids and not fit_ids and carve:
-        out["giveup_carve_out"] = True
-        out["ignored_specials"] = sorted(carve)
-        fit_ids = []
-        unfit_ids = []
-        by_way = {}
-        for wid in ids:
-            r = evaluate_sidestep_way_sync(
-                wid, player, game, allow_ignored_specials=carve
-            )
-            r = dict(r)
-            r["giveup_carve_out"] = True
-            by_way[wid] = r
-            if _way_passes(r):
-                fit_ids.append(wid)
-            else:
-                unfit_ids.append(wid)
-
-    out["fit_way_ids"] = fit_ids
-    out["unfit_way_ids"] = unfit_ids
-    out["n_fit"] = len(fit_ids)
-    out["n_unfit"] = len(unfit_ids)
-    out["all_unfit"] = bool(unfit_ids and not fit_ids)
-    out["by_way"] = by_way
-    return out
+    ids = way_ids if way_ids is not None else all_way_ids()
+    return select_fit_ways(game, player, way_ids=ids)
 
 
 def sticky_way_sync_status(
