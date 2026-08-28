@@ -10,6 +10,8 @@ saved_phase0_files/
 saved_games/
 batch_runs/
 Playboard*
+PlayBoard*
+!PlayBoard 08_Apr_2026_13_33_06.txt
 
 # Screenshots
 saved_screenshots/
