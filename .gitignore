@@ -2,10 +2,17 @@
 .mypy_cache/
 .pytest_cache/
 
+# Reports
+reports/
+
 # Saved games
-Saved_Game_*
-Playboard_30*
-Playboard_31*
+saved_phase0_files/
+saved_games/
+batch_runs/
+Playboard*
+
+# Screenshots
+saved_screenshots/
 
 # Test files
 tests/
@@ -15,21 +22,25 @@ tmp/
 _tmp_*
 _tmp_*.py
 
-# Documents
-docs/tests/
-docs/grok/
-docs/info/
-docs/screenshots/
+# Documents — ignore all under docs/ except the allowlist below
+docs/*
+!docs/The 143 ways to win at Catan – Part III.docx
+!docs/The 143 ways to win at Catan – Part II.docx
+!docs/The 102 ways to win at Catan – Part I.docx
+!docs/Paper leading to Expected-Hand Feasibility Estimation.docx
+!docs/Overview modules v037_v3.docx
+!docs/Overview_v037_added_functionality_take2.md
 
-# Grok (both spellings)
+# Grok
 Grok_Interaction_*
-Gork_Interaction_*
 
 # Logfiles
-Phase0_*
-Catan01Aug*
-Catan16Mar*
+Catan*
+TO_*
+Sidestep_*
+Reports_*
 
 # Python
 __pycache__/
 _ref_Catan_Gen2_v045/
+test_with_action_planner_stage3and4.py

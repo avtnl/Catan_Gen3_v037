@@ -311,7 +311,7 @@ py -3.13 run_headless.py --games 3 --batch-dir batch_runs/my_experiment
 **Re-play a batch game** (e.g. game 3) after a headless run:
 
 ```text
-py -3.13 scripts/replay_catan_game.py --game-dir batch_runs/<run>/g003
+py -3.13 replay_catan_game.py --game-dir batch_runs/<run>/g003
 ```
 
 `--game-dir` resolves **`mglog.csv`** and **`Playboard_g003.txt`** (or `playboard_path` / `mglog_path` from `result.json`).
@@ -439,11 +439,11 @@ After annotate (`cs_annot/g00N/mglog_cs.csv` dense). Attach prefers CS `reason`�
 
 
 ```bash
-py -3.13 scripts/replay_catan_game.py --playboard <PlayBoard.txt> --dig \
+py -3.13 replay_catan_game.py --playboard <PlayBoard.txt> --dig \
   --mglog-cs batch_runs/<batch>/cs_annot/g001/mglog_cs.csv --cat2 311,312
 
 # Or with game-dir (prefers cs_annot when --dig):
-py -3.13 scripts/replay_catan_game.py --dig --game-dir batch_runs/<batch>/g001 --cat1 2,3
+py -3.13 replay_catan_game.py --dig --game-dir batch_runs/<batch>/g001 --cat1 2,3
 ```
 
 | Control | Role |
@@ -467,7 +467,7 @@ py -3.13 -m pytest tests/test_pln1_pln2_dig.py tests/test_pln1_p5.py tests/test_
 py -3.13 run_headless.py --games 5 --batch-dir batch_runs/mglog_replay_n5_pln --arm product
 py -3.13 scripts/annotate_mglog_cs.py --batch-dir batch_runs/mglog_replay_n5_pln
 # Then set NO_GUI_AT_ALL_TF=False in core/constants.py before dig GUI:
-py -3.13 scripts/replay_catan_game.py --dig --game-dir batch_runs/mglog_replay_n5_pln/g001
+py -3.13 replay_catan_game.py --dig --game-dir batch_runs/mglog_replay_n5_pln/g001
 ```
 
 Design: `docs/changes_PLAN_v1_impl.md` · coding: `docs/changes_PLAN_v2_coding.md`.
@@ -783,7 +783,7 @@ Also use **`False`** when running **`py -3.13 main.py`** if you want game audio.
 | UX v1 (nav/layout) | `docs/MGlog_replay_gui_v1_plan.md` |
 | Continue live-feel | `docs/MGlog_replay_continue_parity_plan.md` (C1–C8) |
 | Logging parent | `docs/MGlog_implementation_plan.md` §5 |
-| Entry | `scripts/replay_catan_game.py` |
+| Entry | `replay_catan_game.py` |
 | Core apply | `core/mglog_replay.py` |
 | Paint / nav / GO / Events / FX | `gui/gui_replay_*.py` |
 | Offline stats (GO view) | `core/mglog_statistics.py`, `scripts/mglog_stats.py` |
@@ -802,16 +802,16 @@ Also use **`False`** when running **`py -3.13 main.py`** if you want game audio.
 
 ```text
 # Explicit paths
-py -3.13 scripts/replay_catan_game.py --playboard "PlayBoard ….txt" --mglog path/to/mglog.csv
+py -3.13 replay_catan_game.py --playboard "PlayBoard ….txt" --mglog path/to/mglog.csv
 
 # Batch game folder (resolves mglog.csv + Playboard_gNNN.txt from that folder)
-py -3.13 scripts/replay_catan_game.py --game-dir batch_runs/<run>/g001
+py -3.13 replay_catan_game.py --game-dir batch_runs/<run>/g001
 
 # Validate only (no window): exit 0 complete, 1 incomplete, 2 missing/invalid
-py -3.13 scripts/replay_catan_game.py --playboard "…" --mglog "…" --check-only
+py -3.13 replay_catan_game.py --playboard "…" --mglog "…" --check-only
 
 # Jump cursor to last event after load
-py -3.13 scripts/replay_catan_game.py --playboard "…" --mglog "…" --start-at-end
+py -3.13 replay_catan_game.py --playboard "…" --mglog "…" --start-at-end
 ```
 
 If `--playboard` is omitted, the script may fall back to **`constants.SAVED_PLAYBOARD`** when that file exists. Both playboard and mglog must resolve or the tool **exits with code 2** (no re-play window).
@@ -961,5 +961,5 @@ ReplayShot_<playboard_stem>__<mglog_stem>__statistics_<ts>.png
 | Victory points | `core/victory.py` |
 | **MGlog** (event timeline) | `core/mglog.py`; plan `docs/MGlog_implementation_plan.md`; smoke `scripts/smoke_mglog_m8.py` |
 | **MGlog offline stats** | `core/mglog_statistics.py`; plan `docs/MGlog_statistics_plan.md`; CLI `scripts/mglog_stats.py` |
-| **MGlog re-play GUI** | `scripts/replay_catan_game.py`; plans `docs/MGlog_replay_gui_plan.md`, `MGlog_replay_gui_v1_plan.md` (R10 MANUAL), `MGlog_replay_continue_parity_plan.md`; core `core/mglog_replay.py`; FX `gui/gui_replay_fx.py`; this MANUAL § sound/anim three-mode table |
+| **MGlog re-play GUI** | `replay_catan_game.py`; plans `docs/MGlog_replay_gui_plan.md`, `MGlog_replay_gui_v1_plan.md` (R10 MANUAL), `MGlog_replay_continue_parity_plan.md`; core `core/mglog_replay.py`; FX `gui/gui_replay_fx.py`; this MANUAL § sound/anim three-mode table |
 | Project overview | `README.md` / `README_NEW.md` |
