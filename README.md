@@ -1,109 +1,126 @@
-![Catan Game Screenshot](docs/screenshot.png)
-
-# Catan Game Project (Gen3_v035)
+# Catan Game Project (Gen3 v037)
 
 Python/Pygame implementation of a **Catan-style board game**, developed as an educational AI and game-engine project.
 
-**Repository:** https://github.com/avtnl/Catan_Gen3_v035
+**Repository:** https://github.com/avtnl/Catan_Gen3_v037
 
 > Not affiliated with official Catan products.
 
-**[📄 Project Status, Acknowledgements, and Technical Overview (PDF)](docs/Overview_v6.pdf)**
+**Gen3 v037** continues from the **v035** end state (published as [Catan_Gen3_v035](https://github.com/avtnl/Catan_Gen3_v035)). The playable base from Technical Overview **v6** is still here; v037 adds lab batching, Strategy-Engine quality/performance, Replay, and several geometry/belief façades.
 
-**Gen3 v035** is a modular rewrite/evolution of earlier Gen3 builds. Gameplay is split into:
+| Doc (published in this repo) | Role |
+|------------------------------|------|
+| **[MANUAL.md](MANUAL.md)** | Flags, seats, headless / Replay / lab recipes |
+| **[Overview_v037_added_functionality_take2.md](docs/Overview_v037_added_functionality_take2.md)** | What changed in the v037 cycle |
+| **[Overview modules v037_v3.docx](docs/Overview%20modules%20v037_v3.docx)** | Module map by product mode (GUI / headless / Replay / probes) |
+| *The 102 / 143 ways to win* (Parts I–III) + Expected-Hand paper | Strategy inspiration sources under `docs/` |
 
-1. **Initial Placement** — human guidance + several AI placement algorithms
-2. **Execution** — full turn loop for human and AI players
+*(Hero screenshot intentionally omitted for now — drop one in later if you like.)*
 
-This project covers most Catan features and is playable. It is not a finished product; new releases will follow as development continues.
+---
 
-## Features
+## What you can run
+
+| Entry | Role |
+|-------|------|
+| **`main.py`** | Interactive mixed human/AI game (default: human White / P3) |
+| **`run_headless.py`** | All-AI lab batches (no play window; needs `NO_GUI_AT_ALL_TF=True`) |
+| **`replay_catan_game.py`** | Step a finished game from playboard + MGlog (**no** Strategy-Engine re-plan) |
+
+Flip `NO_GUI_AT_ALL_TF` in `core/constants.py` when switching interactive ↔ headless / Replay GUI. Details: **[MANUAL.md](MANUAL.md)**.
+
+This project covers most base-set Catan features and is playable. It is **not** a finished commercial product; educational / experimental under MIT.
+
+---
+
+## Features (playable base)
 
 - Hexagonal board (19 land + 26 sea tiles)
-- Dynamic scoreboard and action buttons
-- Pulsing highlights, animations, and confirmation system
-- Events feed
-- Development and debug support
-- Board Settings: random playboard generation, load/edit playboards, CIBI balance metrics
-- Code split into core/ (rules/AI) and gui/ (Pygame UI)
+- Dynamic scoreboard and action buttons; events feed
+- Board Settings: random playboards, load/edit, **CIBI** balance metrics
+- Code split: `core/` (rules / AI / strategy) and `gui/` (Pygame UI)
 
-## Initial Placement Phase Features
+### Initial Placement
 
-- Fully interactive **human Initial Placement** with visual guidance
-- Multiple advanced AI placement algorithms
+- Interactive human placement with visual guidance
+- AI algorithms: Max Pips, Max Pips + Ports, weighted strategic styles, Markov-style evaluator (inspired by Lauren Nagel’s work)
 
-## Placement Algorithms
+### Execution
 
-The project includes several sophisticated Initial Placement strategies:
+- Human and AI turns; Trade with Bank / Trade with Player
+- Build road / settlement / city; buy and play development cards
+- Robber / discard / steal flows
+- Mid-game **Saved_Game** load at boot; Game Over + statistics
+- **Strategy-Engine** guidance for AI (Victory-Ways, sticky targets, Expected-Hand timing, Best-Action)
 
-- **Max Pips** — highest probability intersections
-- **Max Pips + Ports** — considers both resources and port access
-- **5 Weighted Strategic Strategies** — balanced, Wood/Brick, Wheat/Ore, etc.
-- **Markov Chain Evaluator** — advanced probability-based evaluator inspired by academic research
+---
 
-## Execution Phase Features
+## How the AI decides (Strategy-Engine)
 
-- Human Execution-phase interaction
-- Trade with Bank
-- Trade with Player and TwP Mode
-- Buy Development Card
-- Build Road / Settlement / City
-- Robber movement and steal flow
-- Strategy-Engine which provides "Intelligence" to AI players (IMPROVED)
-- Expected-Hand timing and strategy continuation analysis
-- Playing Development Cards (NEW)
-- Load/ resume a full **Saved_Game** at startup (NEW)
-- Game Over and Statistics surfaces (NEW)
+The AI follows a long-term plan chosen from ~**142 Victory-Ways** to ~10 VP (cities + army, expand + road, …), using a requirements table inspired by Player One’s *102/143 Ways to Win* series.
 
-## How the AI decides what to do (Strategy-Engine)
+For the plan it picks, it looks at the live board (open tips, roads, races) and estimates how many **own turns** that plan might take (**Turns-Estimator** / Expected-Hand).
 
-The AI follows a long-term plan chosen from a big list of possible win strategies (about 142 different “ways” to get to 10 victory points — for example “build cities and get Largest Army,” or “expand for Longest Road”).
+It **sticks** to a concrete next target (e.g. directed road path toward a settle tip) so it does not flip plans every click. Paths keep **direction** (network → tip, e.g. `[15,14]` then `[14,13]`); undirected **road_ids** (`[14,15]`) are for ownership / legal sets only.
 
-For the plan it picks, it looks at what is actually on the board (open spots, roads, who is racing for the same places) and estimates how many turns that plan might take.
+It does a fuller rethink when something important changes (blocked tip, LA/LR shock, target finished, …). Hand-only changes usually update timing without a full re-plan.
 
-It then sticks with a concrete next target — like “road toward this intersection, then settle there” — so it doesn’t flip plans every single click.
+**v037 product defaults (high level):** AI seats use scheduled way reassess (`explicit_142_recalc` style `[2,[4,4]]`); humans typically `[0]`. Check-Mode / dig chrome stay off for fair play (`CHECK_MODE=False`).
 
-It only does a full rethink of its plan when something important changes, for example:
+---
 
-- an opponent blocks its spot or makes a race much harder
-- someone takes (or is close to) Longest Road or Largest Army
-- it finishes its current target and needs a new one
-- it can suddenly build something useful that wasn’t part of the targeted plan
+## What v037 adds (lab + SE quality)
 
-If only its hand of cards changed (for example after a player trade), it usually doesn’t redo the whole plan. It just updates the timing estimate for the plan it already has. That keeps the game from freezing for a long time after small moves.
+See **[Overview take 2](docs/Overview_v037_added_functionality_take2.md)** for the full addendum. In short:
 
-## Project layout
+| Theme | Plain English |
+|-------|----------------|
+| **Headless batches** | Run N all-AI games; `batch_runs/…` results locally (gitignored) |
+| **Refresh policy** | Heavy L2 / EH work when the *plan* needs it—not on every card draw |
+| **CS / way-reassess probes** | Offline analyzers over strategy samples; matched dice labs |
+| **LA/LR give-up & salvage** | Abandon dead specials; escape + partial Victory-Way salvage (flagged) |
+| **MGlog + Replay** | Event CSV per game; `replay_catan_game.py` steps without re-planning |
+| **Sidestep / S142** | Research timing / way-pick arms; product drive default **off** |
+| **L2 sync-first / adaptive K** | Prefer board-fit before spending scarce top-K slots |
+| **Opponent RCard memory** | Limited public belief window (`RCARD_MEMORY_OPPONENTS`) |
+| **Way resource need** | Shared mid-game RCard residual façade (`way_resource_need`) |
+| **Reachability maps** | Per-seat `path_map` / distances (`REACHABILITY_MAPS`; Gen2-style) |
+
+Architecture layers must not blur: **core mutations** → **scan** → **strategy** → **GUI / Replay**.
+
+---
+
+## Project layout (published)
 
 ```text
-main.py                 # Entry: pygame loop, hotkeys, phase managers
-run_headless.py         # Lab: all-AI headless / multi-game batch (Phase A/B/C2)
-scripts/analyze_cs_setbacks.py      # Lab: Phase C CS strategy probe (offline)
-scripts/analyze_way_reassess.py     # Lab: Phase C2 matched control vs treat
-scripts/run_phase_c2_tests.py       # Lab: Phase C2 unit suite (R0–R8)
-core/                   # Rules, AI, strategy, TwP, Phase0, batch, logging
-gui/                    # Pygame UI, panels (TwB/TwP/DCard/discard/…)
+main.py                 # Interactive pygame entry
+run_headless.py         # Lab: multi-game batch
+replay_catan_game.py    # Re-play / dig GUI (root entry)
+core/                   # Rules, AI, strategy, TwP, batch, MGlog, …
+gui/                    # Pygame UI + Replay painters/panels
 assets/                 # Images & sounds
-catan_142_ways_…csv     # Victory-Way / resource requirement table
-MANUAL.md               # Configuration: constants, headless, Phase C / C2 lab
-docs/                   # Notes & design docs (incl. PhaseC2 plan)
+catan_142_ways_…csv     # Victory-Way requirements table
+MANUAL.md               # Operator flags & recipes
+docs/                   # Published allowlist only (see table above)
+README.md / LICENSE
 ```
 
-Local-only reference (not required to run Gen3): `_ref_Catan_Gen2_v045/` — ignore / do not treat as part of the published Gen3 source.
+**Local-only (gitignored — not on GitHub):** `scripts/` (lab CLIs), `AGENTS.md`, `tests/`, `batch_runs/`, most other `docs/` plans, `Playboard_*` dumps (except `PlayBoard 08_Apr_2026_13_33_06.txt`), `_ref_Catan_Gen2_v045/`, logs (`TO_*`, `Catan*`, …).
+
+---
 
 ## Requirements
 
-- **Python 3.10+** (3.12 or 3.13 recommended)
-- **pygame** (game UI)
+- **Python 3.10+** (3.12 or **3.13** recommended)
+- **pygame**
 
-Optional for development:
-
-- `pytest` (unit tests under `tests/`)
+Optional locally: `pytest` (tests are gitignored in this publish layout).
 
 ## Install & run
 
 ```bash
-git clone https://github.com/avtnl/Catan_Gen3_v035.git
-cd Catan_Gen3_v035
+git clone https://github.com/avtnl/Catan_Gen3_v037.git
+cd Catan_Gen3_v037
 
 python -m venv venv
 # Windows:
@@ -112,22 +129,31 @@ venv\Scripts\activate
 # source venv/bin/activate
 
 pip install pygame
-python main.py
+py -3.13 main.py
 ```
 
-On first run, focus the **game window** (not only the terminal/IDE) so keyboard shortcuts work.
+Focus the **game window** (not only the terminal) so keyboard shortcuts work.
+
+### Headless / Replay (see MANUAL)
+
+```bash
+# Lab batch (set NO_GUI_AT_ALL_TF=True first)
+py -3.13 run_headless.py --games 3 --batch-dir batch_runs/my_smoke
+
+# Re-play a finished game (set NO_GUI_AT_ALL_TF=False)
+py -3.13 replay_catan_game.py --game-dir batch_runs/<run>/g001
+py -3.13 replay_catan_game.py --dig --game-dir batch_runs/<run>/g001
+```
+
+---
 
 ## Configuration
 
-Tunable flags live in [`core/constants.py`](core/constants.py) (load save/map, human seats, victory points, `CHECK_MODE`, …).
+Tunable flags: [`core/constants.py`](core/constants.py) (load save/map, human seats, victory points, `CHECK_MODE`, `REACHABILITY_MAPS`, `RCARD_MEMORY_OPPONENTS`, `NO_GUI_AT_ALL_TF`, …).
 
-Player seats and each AI’s **initial placement algorithm** are set in [`core/game.py`](core/game.py) inside `_initialize_players()`.
+Seats and Initial Placement algorithm ids: `Game._initialize_players()` in [`core/game.py`](core/game.py).
 
-**Full explanations** (what each flag does, reserved/future flags, seat `id_` / color / `sequence` notes):
-
-→ **[MANUAL.md](MANUAL.md)**
-
-Quick examples:
+**Full explanations:** **[MANUAL.md](MANUAL.md)**.
 
 | Goal | Setting |
 |------|---------|
@@ -135,43 +161,38 @@ Quick examples:
 | Resume a save | `LOAD_GAME = True` + `SAVED_GAME = "…"` |
 | Fair play UI | `CHECK_MODE = False` |
 | Human on White (seat 3) | `HUMAN_PLAYER = True`, `HP_ID = [3]` |
+| Headless lab | `NO_GUI_AT_ALL_TF = True`, `HUMAN_PLAYER = False` |
 
-Restart the app after changing constants or `_initialize_players()`.
+Restart after changing constants or `_initialize_players()`.
 
-## Useful controls / debugging
+### Useful controls
 
 | Input | Role |
 |--------|------|
-| Mouse | Board, buttons, TwB / TwP / DCard / discard panels |
-| **F9** | Save Phase0 AI baseline for the **current** player (if hooks installed) |
-| **F8** | Same as F9 (fallback when the IDE steals F9) |
+| Mouse | Board, buttons, TwB / TwP / DCard / discard |
+| **F9** / **F8** | Phase0 AI baseline capture (dig / Check-Mode workflows) |
 
-CHECK_MODE, which is an Analysis-oriented UI: extra strategy/card detail and debug chrome (e.g. Execution Debug). Off = normal play privacy. Controlled by the master flag (in `core/constants.py`).
+With `CHECK_MODE=False` you only need the mouse for normal play. Saves: `saved_games/`; Phase0 dig dumps: `saved_phase0_files/` (local).
 
-For normal play: Set CHECK_MODE=False and you only need the mouse. F8/F9 are for developers capturing AI diagnostics.
-
-Strategy / log basenames are configured in `core/constants.py` (see [MANUAL.md](MANUAL.md)).
-
-Slow performance (pipeline) steps can auto-write `Phase0_AI_Baseline_auto_slow_*.json` under **`saved_phase0_files/`** (often gitignored). Full session saves go to **`saved_games/`**.
+---
 
 ## Tools
 
-This Gen3 codebase was developed and refactored with help from AI coding assistants:
+Developed with help from AI coding assistants (ChatGPT early; **xAI Grok** later). Runtime: **Python** + **Pygame**.
 
-- Early porting and design discussions: **OpenAI ChatGPT**
-- Later implementation and dig-in work: **xAI Grok** — Grok Build (4.5)
-
-The game itself runs on **Python** and **Pygame**. Optional developer tooling includes **pytest** (local tests) and in-game diagnostics (F8/F9 Phase0 captures).
+---
 
 ## Acknowledgements and external inspiration
 
-This project was developed as an educational AI/game-engine project and builds on several sources of inspiration.
+Educational project; builds on several sources of inspiration.
 
-First, I would like to acknowledge Lauren Nagel’s work, *Analysis of “The Settlers of Catan” Using Markov Chains*. That paper helped inspire the project’s early exploration of Markov-style evaluation for Initial Placement. In this project, that idea was adapted into a practical placement-evaluation approach suitable for a Python/Pygame implementation.
+**Lauren Nagel** — *Analysis of “The Settlers of Catan” Using Markov Chains* — inspired Markov-style evaluation adapted for Initial Placement in this Python/Pygame codebase.
 
-Second, I would like to acknowledge the strategy articles published by Player One on BoardGameAnalysis.com, especially the series *The 102/143 Ways to Win at Catan*, Parts I, II and III. This project uses a 142-way requirements table based on that work. Player One also wrote *What is a balanced Catan board*, which describes the CIBI index, also implemented in the code.
+**Player One** (BoardGameAnalysis.com) — *The 102/143 Ways to Win at Catan* (Parts I–III) and *What is a balanced Catan board* (CIBI). Gen3 uses a **142-way** requirements table and CIBI-style board balance ideas. Published copies of the ways papers (and the Expected-Hand feasibility paper) live under `docs/` in this repo.
 
-The implementation in this repository is my own educational adaptation. The referenced works served as inspiration for strategic thinking, probability-based evaluation, and the organization of possible paths to victory; they are not copied code or direct implementations.
+The implementation here is an independent educational adaptation—not copied code from those works, and **not** an official Catan product.
+
+---
 
 ## License
 
