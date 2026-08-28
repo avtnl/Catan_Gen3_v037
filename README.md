@@ -1,3 +1,5 @@
+![Catan Gen3 gameplay](docs/screenshot.png)
+
 # Catan Game Project (Gen3 v037)
 
 Python/Pygame implementation of a **Catan-style board game**, developed as an educational AI and game-engine project.
@@ -14,8 +16,7 @@ Python/Pygame implementation of a **Catan-style board game**, developed as an ed
 | **[Overview_v037_added_functionality_take2.md](docs/Overview_v037_added_functionality_take2.md)** | What changed in the v037 cycle |
 | **[Overview modules v037_v3.docx](docs/Overview%20modules%20v037_v3.docx)** | Module map by product mode (GUI / headless / Replay / probes) |
 | *The 102 / 143 ways to win* (Parts I–III) + Expected-Hand paper | Strategy inspiration sources under `docs/` |
-
-*(Hero screenshot intentionally omitted for now — drop one in later if you like.)*
+| [`docs/screenshot.png`](docs/screenshot.png) | README hero shot (gameplay) |
 
 ---
 
